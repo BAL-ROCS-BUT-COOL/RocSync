@@ -31,9 +31,9 @@ class NpEncoder(json.JSONEncoder):
         return super().default(o)
 
 
-def process_image(path, camera_type, debug_dir=None, board=None):
+def process_image(path, camera_type, debug_dir=None, board=None, try_hard=False):
     image = cv2.imread(path)
-    _, timestamp = process_frame(image, camera_type, 0, board, debug_dir)
+    _, timestamp = process_frame(image, camera_type, 0, board, debug_dir, try_hard=try_hard)
     if timestamp is not None:
         succprint(f"first frame: {timestamp[0]} ms, last frame: {timestamp[1]} ms")
         # Interpret an image as a single-frame recording: its exposure window is its board-time span
@@ -153,6 +153,11 @@ def main():
         action="store_true",
         help="recursively search for videos and images in directories",
     )
+    parser.add_argument(
+        "--try-hard",
+        action="store_true",
+        help="relaxed mode: refine the homography from partial corner LED detections",
+    )
 
     args = parser.parse_args()
 
@@ -256,13 +261,16 @@ def main():
                 debug_dir=debug_dir,
                 windows=windows,
                 board=board,
+                try_hard=args.try_hard,
             )
             if statistics is not None:
                 ret = statistics.to_dict()
 
         elif file in images:
             entry_type = "image"
-            ret = process_image(file, CameraType(args.camera_type), debug_dir, board)
+            ret = process_image(
+                file, CameraType(args.camera_type), debug_dir, board, try_hard=args.try_hard
+            )
         elif file in ftk_recordings:
             entry_type = "ftk"
             ret = process_ftk_recording(file, debug_dir)

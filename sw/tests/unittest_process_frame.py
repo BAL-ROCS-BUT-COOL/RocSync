@@ -74,9 +74,7 @@ def test_full():
     TEST_DIR = Path(__file__).resolve().parents[0]
 
     # prepare the pcb ----------------------------------------------------------
-    image = cv.imread(
-        "C:/Users/steie/code/calibration/RocSync/sw/rocsync/tests/img1.jpg"
-    )
+    image = cv.imread(TEST_DIR / "img1.jpg")
 
     out = process_frame(
         image,
@@ -89,4 +87,5 @@ def test_full():
 
 if __name__ == "__main__":
     os.system("cls" if os.name == "nt" else "clear")
+    test_piecewise()
     test_full()

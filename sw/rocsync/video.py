@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from rocsync.printer import *
 from rocsync.video_statistics import VideoStatistics
-from rocsync.vision import CameraType, process_frame
+from rocsync.vision import CameraType, aruco_detector, aruco_marker_id, process_frame
 
 
 def read_frames_async(cap, frame_queue, start_frame=0, end_frame=None):
@@ -68,6 +68,73 @@ def export_frames(video_path, output_path, y_pred):
     cap.release()
 
 
+def probe_frame(cap, frame_number):
+    """Seek to a frame and run ArUco detection only. Returns True if the board is detected."""
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+    ret, frame = cap.read()
+    if not ret:
+        return False
+    clahe = cv2.createCLAHE(tileGridSize=(8, 8))
+    gray = clahe.apply(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+    _, marker_ids, _ = aruco_detector.detectMarkers(gray)
+    if marker_ids is None:
+        return False
+    return aruco_marker_id in marker_ids.flatten()
+
+
+def expand_window(cap, hit_frame, fps, n_frames, cooldown_s=0.5):
+    """Expand from a hit frame forward and backward until the board disappears for cooldown_s."""
+    cooldown_frames = int(cooldown_s * fps)
+
+    # Expand forward
+    last_hit = hit_frame
+    frame_num = hit_frame + 1
+    while frame_num < n_frames and (frame_num - last_hit) <= cooldown_frames:
+        if probe_frame(cap, frame_num):
+            last_hit = frame_num
+        frame_num += 1
+    end_frame = last_hit
+
+    # Expand backward
+    last_hit = hit_frame
+    frame_num = hit_frame - 1
+    while frame_num >= 0 and (last_hit - frame_num) <= cooldown_frames:
+        if probe_frame(cap, frame_num):
+            last_hit = frame_num
+        frame_num -= 1
+    start_frame = last_hit
+
+    return start_frame, end_frame
+
+
+def find_windows(cap, fps, n_frames, expected_windows=2, granularity_s=1.0):
+    """Binary temporal search for windows where the RocSync board is visible."""
+    granularity_frames = max(1, int(granularity_s * fps))
+    windows = []
+
+    def search(start, end):
+        if len(windows) >= expected_windows:
+            return
+        if end - start < granularity_frames:
+            return
+        mid = (start + end) // 2
+        if probe_frame(cap, mid):
+            # Found the board — expand to find full window
+            w_start, w_end = expand_window(cap, mid, fps, n_frames)
+            windows.append((w_start, w_end))
+            # Recurse into regions outside the found window
+            search(start, w_start - 1)
+            search(w_end + 1, end)
+        else:
+            # Not found — split and search both halves
+            search(start, mid)
+            search(mid + 1, end)
+
+    search(0, n_frames - 1)
+    windows.sort()
+    return windows
+
+
 def process_video_window(video_path: str, camera_type: CameraType, window_start: int, window_end: int, stride=None, debug_dir: str = None, brightness_boost: int = None, try_hard: bool = False):
     cap = cv2.VideoCapture(video_path)
 
@@ -109,7 +176,7 @@ def process_video_window(video_path: str, camera_type: CameraType, window_start:
     return timestamps
 
 
-def process_video(video_path, camera_type, export_dir=None, stride=None, debug_dir=None, window1_start=None, window1_end=None, window2_start=None, window2_end=None, brightness_boost=None, try_hard=False):
+def process_video(video_path, camera_type, export_dir=None, stride=None, debug_dir=None, window1_start=None, window1_end=None, window2_start=None, window2_end=None, brightness_boost=None, try_hard=False, search_windows=False, expected_windows=2, search_granularity=1.0):
     # Get video metadata
     cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
     # cap.set(cv2.CAP_PROP_FFMPEG_HWACCEL, cv2.CAP_FFMPEG_HWACCEL_NVDEC)  # try to use
@@ -123,33 +190,54 @@ def process_video(video_path, camera_type, export_dir=None, stride=None, debug_d
     expected_duration = (n_frames - 1) / fps * 1000
     cap.release()
 
-    if window1_start is None:
-        window1_start = 0
-    elif window1_start < 0:
-        window1_start = max(0, (expected_duration / 1000) + window1_start)
+    if not search_windows:
+        # Use manually specified windows
+        if window1_start is None:
+            window1_start = 0
+        elif window1_start < 0:
+            window1_start = max(0, (expected_duration / 1000) + window1_start)
 
-    if window1_end is None:
-        window1_end = expected_duration / 1000
-    elif window1_end < 0:
-        window1_end = max(0, (expected_duration / 1000) + window1_end)
+        if window1_end is None:
+            window1_end = expected_duration / 1000
+        elif window1_end < 0:
+            window1_end = max(0, (expected_duration / 1000) + window1_end)
 
-    if window2_start is None:
-        window2_start = 0
-    elif window2_start < 0:
-        window2_start = max(0, (expected_duration / 1000) + window2_start)
+        if window2_start is None:
+            window2_start = 0
+        elif window2_start < 0:
+            window2_start = max(0, (expected_duration / 1000) + window2_start)
 
-    if window2_end is None:
-        window2_end = expected_duration / 1000
-    elif window2_end < 0:
-        window2_end = max(0, (expected_duration / 1000) + window2_end)
+        if window2_end is None:
+            window2_end = expected_duration / 1000
+        elif window2_end < 0:
+            window2_end = max(0, (expected_duration / 1000) + window2_end)
 
-    # Analyze frames
-    timestamps = process_video_window(video_path, camera_type, window1_start, window1_end, stride, debug_dir, brightness_boost, try_hard)
+        timestamps = process_video_window(video_path, camera_type, window1_start, window1_end, stride, debug_dir, brightness_boost, try_hard)
 
-    if window2_start > window1_end or window2_end < window1_start: # check if window2 is not overlapping with window1
-        # TODO: better window checking
-        timestamps2 = process_video_window(video_path, camera_type, window2_start, window2_end, stride, debug_dir, brightness_boost, try_hard)
-        timestamps = {**timestamps, **timestamps2}
+        if window2_start > window1_end or window2_end < window1_start:
+            timestamps2 = process_video_window(video_path, camera_type, window2_start, window2_end, stride, debug_dir, brightness_boost, try_hard)
+            timestamps = {**timestamps, **timestamps2}
+    else:
+        # Auto-discover windows via binary temporal search
+        cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            errprint(f"Error: Could not open video: {video_path}")
+            return
+        print(f"Searching for temporal windows (expected: {expected_windows}, granularity: {search_granularity}s)...")
+        windows = find_windows(cap, fps, n_frames, expected_windows, search_granularity)
+        cap.release()
+
+        if not windows:
+            errprint("Error: Could not find the RocSync board in any frame.")
+            return
+
+        for w_start, w_end in windows:
+            print(f"  Found window: [{w_start / fps:.3f}s, {w_end / fps:.3f}s]")
+
+        timestamps = {}
+        for w_start, w_end in windows:
+            window_timestamps = process_video_window(video_path, camera_type, w_start / fps, w_end / fps, stride, debug_dir, brightness_boost, try_hard)
+            timestamps = {**timestamps, **window_timestamps}
     
 
     if len(timestamps) < 2:

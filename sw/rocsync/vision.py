@@ -1,10 +1,23 @@
 import math
+import time
 from enum import Enum
 
 import cv2
 import numpy as np
 
-from rocsync.printer import *
+
+def _record_step(stats, name, t0, **kwargs):
+    """Record a pipeline step's timing and metadata into the stats dict."""
+    if stats is not None:
+        stats["steps"][name] = {"time_ms": (time.perf_counter() - t0) * 1000, **kwargs}
+
+
+def _finalize_stats(stats, total_start, success, timestamp):
+    """Finalize the stats dict with total timing and result."""
+    if stats is not None:
+        stats["total_time_ms"] = (time.perf_counter() - total_start) * 1000
+        stats["success"] = success
+        stats["timestamp"] = list(timestamp) if timestamp else None
 
 
 class CameraType(Enum):
@@ -333,14 +346,24 @@ def find_corners_aruco(mask, frame_number, debug_dir=None, brightness_boost=None
         return marker_dict[aruco_marker_id]
 
 
-def process_frame(image, camera_type, frame_number, debug_dir=None, brightness_boost=None, try_hard=False):
+def process_frame(image, camera_type, frame_number, debug_dir=None, brightness_boost=None, try_hard=False, stats=None):
+    total_start = time.perf_counter()
+    if stats is not None:
+        stats["steps"] = {}
+
+    clahe = cv2.createCLAHE(tileGridSize=(8, 8))
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
     match camera_type:
         case CameraType.RGB:
             # First extract course PCB using ArUco marker
-            aruco_corners = find_corners_aruco(image, frame_number, debug_dir, brightness_boost)
+            t0 = time.perf_counter()
+            gray_img_clahe = clahe.apply(gray_image)
+            aruco_corners = find_corners_aruco(gray_img_clahe, frame_number, debug_dir, brightness_boost)
+            _record_step(stats, "aruco_detection", t0, success=aruco_corners is not None, count=1 if aruco_corners is not None else 0)
 
             if aruco_corners is None:
+                _finalize_stats(stats, total_start, False, None)
                 return False, None
 
             red_channel = image[:, :, 2]
@@ -354,13 +377,16 @@ def process_frame(image, camera_type, frame_number, debug_dir=None, brightness_b
                 mask, rough_transformation_matrix, (board_size, board_size)
             )
 
+            t0 = time.perf_counter()
             if try_hard:
                 corners_result = find_corners_dots(rough_pcb, frame_number, debug_dir, try_hard=True)
+                corner_count = 0
                 if corners_result is None:
                     # 0 corner LEDs found — use coarse ArUco homography as-is
                     transformation_matrix = rough_transformation_matrix
                 else:
                     detected_pts, expected_pts = corners_result
+                    corner_count = len(detected_pts)
                     # Back-project detected corner LEDs from rough-rectified → original image space
                     inv_rough = np.linalg.inv(rough_transformation_matrix)
                     src_corners = cv2.perspectiveTransform(
@@ -372,25 +398,32 @@ def process_frame(image, camera_type, frame_number, debug_dir=None, brightness_b
                     dst_all = np.vstack([aruco_corners_coords, expected_pts]).astype(np.float64)
 
                     transformation_matrix, _ = cv2.findHomography(src_all, dst_all)
+                _record_step(stats, "corner_detection", t0, success=corners_result is not None, count=corner_count)
             else:
                 corners = find_corners_dots(rough_pcb, frame_number, debug_dir)
+                _record_step(stats, "corner_detection", t0, success=corners is not None, count=len(corners) if corners is not None else 0)
                 if corners is None:
+                    _finalize_stats(stats, total_start, True, None)
                     return True, None
 
                 # NOTE: only four points are needed/allowed to calculate the perspective transform. removing the one that doesn't for a perfect square.
                 transformation_matrix = np.dot(
-                    cv2.getPerspectiveTransform(corners[1:, :], corner_dots[1:, :]),
+                    cv2.getPerspectiveTransform(corners, corner_dots),
                     rough_transformation_matrix,
                 )
 
+            t0 = time.perf_counter()
             pcb = cv2.warpPerspective(mask, transformation_matrix, (board_size, board_size))
-            cv2.imwrite(f"{debug_dir}/rectified_pcb_{frame_number}.png", pcb)
+            _record_step(stats, "fine_rectification", t0)
+
+            if debug_dir:
+                cv2.imwrite(f"{debug_dir}/rectified_pcb_{frame_number}.png", pcb)
         case CameraType.INFRARED:
-            gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             _, mask = cv2.threshold(gray_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
             corners = find_corners_convexhull(mask, frame_number, debug_dir)
             if corners is None:
+                _finalize_stats(stats, total_start, False, None)
                 return False, None
             transformation_matrix = cv2.getPerspectiveTransform(corners, ir_corners)
             pcb = cv2.warpPerspective(mask, transformation_matrix, (board_size, board_size))
@@ -400,13 +433,19 @@ def process_frame(image, camera_type, frame_number, debug_dir=None, brightness_b
                 if read_counter(pcb, CameraType.INFRARED) == 0:
                     pcb = cv2.rotate(pcb, cv2.ROTATE_90_CLOCKWISE)
             if read_counter(pcb, CameraType.INFRARED) == 0:
+                _finalize_stats(stats, total_start, True, None)
                 return True, None  # Counter was actually 0, can't determine orientation
 
     if debug_dir:  # For RGB debug output
         pcb = cv2.cvtColor(pcb, cv2.COLOR_GRAY2BGR)
 
+    t0 = time.perf_counter()
     counter = read_counter(pcb, camera_type, draw_result=True)
+    _record_step(stats, "counter_reading", t0, value=int(counter))
+
+    t0 = time.perf_counter()
     ring = read_ring(pcb, camera_type, draw_result=True)
+    _record_step(stats, "ring_reading", t0, success=ring is not None)
 
     if debug_dir:
         cv2.imwrite(f"{debug_dir}/leds_{frame_number}.png", pcb)
@@ -414,10 +453,13 @@ def process_frame(image, camera_type, frame_number, debug_dir=None, brightness_b
     if ring is not None:
         start, end = ring
         if start > end or start <= 1 or period - end <= 1:
+            _finalize_stats(stats, total_start, True, None)
             return True, None # Counter increment during exposure
 
         start += counter * period
         end += counter * period
+        _finalize_stats(stats, total_start, True, (start, end))
         return True, (start, end)
 
+    _finalize_stats(stats, total_start, True, None)
     return True, None

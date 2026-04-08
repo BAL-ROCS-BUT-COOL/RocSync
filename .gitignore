@@ -1,5 +1,6 @@
-./output
-./conda
+output
+conda
 *.mp4
 experiments
+validation_data
 .*

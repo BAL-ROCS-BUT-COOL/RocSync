@@ -6,7 +6,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from tqdm import tqdm
 
 from rocsync.printer import *
 from rocsync.video import process_video
@@ -247,6 +246,23 @@ def main():
         action="store_true",
         help="relaxed mode: retry ArUco with brightness boost, refine homography with partial corner LED detections",
     )
+    parser.add_argument(
+        "--search-windows",
+        action="store_true",
+        help="automatically find temporal windows where the board is visible using binary search",
+    )
+    parser.add_argument(
+        "--expected-windows",
+        type=int,
+        default=2,
+        help="expected number of temporal windows for --search-windows (default: 2)",
+    )
+    parser.add_argument(
+        "--search-granularity",
+        type=float,
+        default=1.0,
+        help="minimum search region duration in seconds for --search-windows (default: 1.0)",
+    )
 
     args = parser.parse_args()
 
@@ -335,6 +351,9 @@ def main():
                 start_time2,
                 end_time2,
                 try_hard=args.try_hard,
+                search_windows=args.search_windows,
+                expected_windows=args.expected_windows,
+                search_granularity=args.search_granularity,
             )
             if ret is not None:
                 result[str(file)] = ret.to_dict()

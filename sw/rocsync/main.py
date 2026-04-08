@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import pathlib
+import subprocess
 from pathlib import Path
 
 import cv2
@@ -11,8 +12,6 @@ from tqdm import tqdm
 from rocsync.printer import *
 from rocsync.video import process_video
 from rocsync.vision import CameraType, process_frame
-
-import subprocess
 
 
 class NpEncoder(json.JSONEncoder):

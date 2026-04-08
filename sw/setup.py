@@ -21,6 +21,7 @@ setup(
     entry_points={
         "console_scripts": [
             "rocsync=rocsync.main:main",
+            "rocsync-align=rocsync.helpers.align:main",
         ],
     },
 )

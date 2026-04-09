@@ -183,7 +183,7 @@ def find_optimal_ring_start_end(leds):
     return final_window, final_score
 
 
-def read_ring(extracted_board, camera_type, draw_result=False):
+def read_ring(extracted_board, camera_type, draw_result=False, return_leds=False):
     radius = visible_radius if camera_type == CameraType.RGB else ir_radius
 
     # Collect mean LED intensities relative to local background
@@ -210,6 +210,8 @@ def read_ring(extracted_board, camera_type, draw_result=False):
 
     if start == end:
         # no segment found
+        if return_leds:
+            return None, leds
         return None
 
     if draw_result:
@@ -220,10 +222,13 @@ def read_ring(extracted_board, camera_type, draw_result=False):
             color = (0, 0, 255) if leds[i] else (255, 0, 0)
             cv2.circle(extracted_board, (x, y), led_size, color, 1)
     # return inclusive bounds (i.e. start is the first led ON, end -1 is the last led ON)
-    return start, (end - 1) % period
+    result = (start, (end - 1) % period)
+    if return_leds:
+        return result, leds
+    return result
 
 
-def read_counter(extracted_board, camera_type, draw_result=False):
+def read_counter(extracted_board, camera_type, draw_result=False, return_leds=False):
     y = int(53 / 250 * 640) if camera_type == CameraType.RGB else int(48 / 250 * 640)
 
     # Collect mean LED intensities relative to local background
@@ -246,6 +251,8 @@ def read_counter(extracted_board, camera_type, draw_result=False):
             x = int((65 + i * 8) / 250 * 640)
             color = (0, 0, 255) if leds[i] else (255, 0, 0)
             cv2.circle(extracted_board, (x, y), led_size, color, 1)
+    if return_leds:
+        return counter, leds.flatten()
     return counter
 
 
@@ -290,10 +297,15 @@ def find_corners_convexhull(mask, frame_number, debug_dir=None):
         return corners
 
 
-def find_corners_dots(mask, frame_number, debug_dir=None, try_hard=False):
+def find_corners_dots(mask, frame_number, debug_dir=None):
+    """Find the 4 corner LEDs in the rough-rectified image.
+
+    Returns a list of 4 elements in the same order as corner_dots.
+    Each element is a (x, y) tuple for matched corners, or None if unmatched.
+    """
     points = blob_detector.detect(mask)
     if not points:
-        return
+        return [None, None, None, None]
     if debug_dir:
         debug_image = cv2.drawKeypoints(
             mask.copy(),
@@ -309,23 +321,7 @@ def find_corners_dots(mask, frame_number, debug_dir=None, try_hard=False):
     ]
     distances = [np.linalg.norm(act - exp) for act, exp in zip(closest_points, corner_dots)]
 
-    if try_hard:
-        # Keep individual corners that pass the 50px threshold
-        detected_pts = []
-        expected_pts = []
-        for pt, exp, dist in zip(closest_points, corner_dots, distances):
-            if dist <= 50:
-                detected_pts.append(pt)
-                expected_pts.append(exp)
-        if len(detected_pts) == 0:
-            return
-        return (np.array(detected_pts, dtype=np.float32),
-                np.array(expected_pts, dtype=np.float32))
-
-    if max(distances) > 50:
-        return  # Some corner is too far away from where it should be
-
-    return np.array(closest_points, dtype=np.float32)
+    return [pt if dist <= 50 else None for pt, dist in zip(closest_points, distances)]
 
 
 def find_corners_aruco(mask, frame_number, debug_dir=None, brightness_boost=None):
@@ -340,10 +336,11 @@ def find_corners_aruco(mask, frame_number, debug_dir=None, brightness_boost=None
         cv2.imwrite(f"{debug_dir}/aruco_{frame_number}.png", debug_image)
 
     if marker_ids is None:
-        return
+        return None, None
     marker_dict = {id[0]: marker for id, marker in zip(marker_ids, markers)}
     if aruco_marker_id in marker_dict.keys():
-        return marker_dict[aruco_marker_id]
+        return marker_dict[aruco_marker_id], int(aruco_marker_id)
+    return None, None
 
 
 def process_frame(image, camera_type, frame_number, debug_dir=None, brightness_boost=None, try_hard=False, stats=None):
@@ -359,10 +356,17 @@ def process_frame(image, camera_type, frame_number, debug_dir=None, brightness_b
             # First extract course PCB using ArUco marker
             t0 = time.perf_counter()
             gray_img_clahe = clahe.apply(gray_image)
-            aruco_corners = find_corners_aruco(gray_img_clahe, frame_number, debug_dir, brightness_boost)
+            aruco_corners, aruco_id = find_corners_aruco(gray_img_clahe, frame_number, debug_dir, brightness_boost)
             _record_step(stats, "aruco_detection", t0, success=aruco_corners is not None, count=1 if aruco_corners is not None else 0)
 
+            if stats is not None:
+                stats["aruco_id"] = aruco_id
+                stats["aruco_corners"] = aruco_corners.tolist() if aruco_corners is not None else None
+
             if aruco_corners is None:
+                if stats is not None:
+                    stats["rectified"] = None
+                    stats["corner_positions"] = None
                 _finalize_stats(stats, total_start, False, None)
                 return False, None
 
@@ -378,15 +382,21 @@ def process_frame(image, camera_type, frame_number, debug_dir=None, brightness_b
             )
 
             t0 = time.perf_counter()
+            corners = find_corners_dots(rough_pcb, frame_number, debug_dir)
+            matched = [(pt, exp) for pt, exp in zip(corners, corner_dots) if pt is not None]
+            corner_count = len(matched)
+
+            if stats is not None:
+                stats["corner_positions"] = [list(pt) if pt is not None else None for pt in corners]
+
             if try_hard:
-                corners_result = find_corners_dots(rough_pcb, frame_number, debug_dir, try_hard=True)
-                corner_count = 0
-                if corners_result is None:
+                if corner_count == 0:
                     # 0 corner LEDs found — use coarse ArUco homography as-is
                     transformation_matrix = rough_transformation_matrix
                 else:
-                    detected_pts, expected_pts = corners_result
-                    corner_count = len(detected_pts)
+                    detected_pts = np.array([pt for pt, _ in matched], dtype=np.float32)
+                    expected_pts = np.array([exp for _, exp in matched], dtype=np.float32)
+
                     # Back-project detected corner LEDs from rough-rectified → original image space
                     inv_rough = np.linalg.inv(rough_transformation_matrix)
                     src_corners = cv2.perspectiveTransform(
@@ -398,23 +408,29 @@ def process_frame(image, camera_type, frame_number, debug_dir=None, brightness_b
                     dst_all = np.vstack([aruco_corners_coords, expected_pts]).astype(np.float64)
 
                     transformation_matrix, _ = cv2.findHomography(src_all, dst_all)
-                _record_step(stats, "corner_detection", t0, success=corners_result is not None, count=corner_count)
+                _record_step(stats, "corner_detection", t0, success=corner_count > 0, count=corner_count)
             else:
-                corners = find_corners_dots(rough_pcb, frame_number, debug_dir)
-                _record_step(stats, "corner_detection", t0, success=corners is not None, count=len(corners) if corners is not None else 0)
-                if corners is None:
+                _record_step(stats, "corner_detection", t0, success=corner_count == 4, count=corner_count)
+                if corner_count < 4:
+                    if stats is not None:
+                        stats["rectified"] = None
                     _finalize_stats(stats, total_start, True, None)
                     return True, None
 
-                # NOTE: only four points are needed/allowed to calculate the perspective transform. removing the one that doesn't for a perfect square.
+                all_corners = np.array([pt for pt in corners], dtype=np.float32)
+                # NOTE: only four points are needed/allowed to calculate the perspective transform.
                 transformation_matrix = np.dot(
-                    cv2.getPerspectiveTransform(corners, corner_dots),
+                    cv2.getPerspectiveTransform(all_corners, corner_dots),
                     rough_transformation_matrix,
                 )
 
             t0 = time.perf_counter()
             pcb = cv2.warpPerspective(mask, transformation_matrix, (board_size, board_size))
             _record_step(stats, "fine_rectification", t0)
+
+            if stats is not None:
+                stats["rectified"] = pcb.copy()
+                stats["homography"] = transformation_matrix
 
             if debug_dir:
                 cv2.imwrite(f"{debug_dir}/rectified_pcb_{frame_number}.png", pcb)
@@ -440,11 +456,19 @@ def process_frame(image, camera_type, frame_number, debug_dir=None, brightness_b
         pcb = cv2.cvtColor(pcb, cv2.COLOR_GRAY2BGR)
 
     t0 = time.perf_counter()
-    counter = read_counter(pcb, camera_type, draw_result=True)
+    if stats is not None:
+        counter, counter_leds = read_counter(pcb, camera_type, draw_result=True, return_leds=True)
+        stats["counter_leds"] = counter_leds
+    else:
+        counter = read_counter(pcb, camera_type, draw_result=True)
     _record_step(stats, "counter_reading", t0, value=int(counter))
 
     t0 = time.perf_counter()
-    ring = read_ring(pcb, camera_type, draw_result=True)
+    if stats is not None:
+        ring, ring_leds = read_ring(pcb, camera_type, draw_result=True, return_leds=True)
+        stats["ring_leds"] = ring_leds
+    else:
+        ring = read_ring(pcb, camera_type, draw_result=True)
     _record_step(stats, "ring_reading", t0, success=ring is not None)
 
     if debug_dir:

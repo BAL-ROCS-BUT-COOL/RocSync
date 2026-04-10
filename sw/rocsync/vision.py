@@ -102,14 +102,14 @@ def read_led(img, x, y):
     return led_intensity
 
 
-def find_optimal_ring_start_end(leds):
+def find_optimal_ring_start_end(scores):
     """
         Find the most likely window of leds turned ON, while allowing for false detections.
         Computes the window [start, end) that maximizes the sum of values within the window minus the sum of values outside,
-        while allowing for wrap-around windows. True is treated as 1 and False as -1.
+        while allowing for wrap-around windows.
 
         Args:
-            leds: A list of booleans indicating the detected led state.
+            scores: A list of numeric values where positive means likely ON and negative means likely OFF.
 
         Returns:
             A tuple containing:
@@ -118,7 +118,7 @@ def find_optimal_ring_start_end(leds):
               If start == end, the window is empty.
             - The maximum possible score.
         """
-    nums = [1 if val else -1 for val in leds]
+    nums = list(scores)
     n = len(nums)
     total_sum = sum(nums)
 
@@ -187,7 +187,7 @@ def read_ring(extracted_board, camera_type, draw_result=False, return_leds=False
     radius = visible_radius if camera_type == CameraType.RGB else ir_radius
 
     # Collect mean LED intensities relative to local background
-    led_intensities = np.zeros(period, dtype=np.uint8)
+    led_intensities = np.zeros(period, dtype=np.float64)
     for i in range(period):
         angle = -(i / period + 0.25) * 2 * math.pi
 
@@ -199,14 +199,13 @@ def read_ring(extracted_board, camera_type, draw_result=False, return_leds=False
         y_bg = int(board_size / 2 + (radius - 25) * math.sin(angle))
         bg_intensity = read_led(extracted_board, x_bg, y_bg)
 
-        led_intensities[i] = np.clip(led_intensity - bg_intensity, 0, 255)
+        led_intensities[i] = max(led_intensity - bg_intensity, 0.0)
 
-    # Apply Otsu's thresholding to led_intensities
-    _, otsu_thresh = cv2.threshold(led_intensities, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    leds = otsu_thresh.astype(bool).flatten().tolist()
+    # Center around median so ON LEDs are positive, OFF LEDs are negative
+    scores = led_intensities - np.median(led_intensities)
 
     # Find most likely segment of enabled LEDs, allowing for false detections
-    (start, end), score = find_optimal_ring_start_end(leds)
+    (start, end), score = find_optimal_ring_start_end(scores)
 
     if start == end:
         # no segment found
@@ -219,7 +218,7 @@ def read_ring(extracted_board, camera_type, draw_result=False, return_leds=False
             angle = -(i / period + 0.25) * 2 * math.pi
             x = int(board_size / 2 + radius * math.cos(angle))
             y = int(board_size / 2 + radius * math.sin(angle))
-            color = (0, 0, 255) if leds[i] else (255, 0, 0)
+            color = (0, 0, 255) if scores[i] > 0 else (255, 0, 0)
             cv2.circle(extracted_board, (x, y), led_size, color, 1)
     # return inclusive bounds (i.e. start is the first led ON, end -1 is the last led ON)
     result = (start, (end - 1) % period)
@@ -370,8 +369,11 @@ def process_frame(image, camera_type, frame_number, debug_dir=None, brightness_b
                 _finalize_stats(stats, total_start, False, None)
                 return False, None
 
-            red_channel = image[:, :, 2]
-            mask = red_channel
+            # Redness map: R - max(G, B), isolates red LED light from white/ambient
+            mask = np.clip(
+                image[:, :, 2].astype(int) - np.maximum(image[:, :, 0], image[:, :, 1]).astype(int),
+                0, 255,
+            ).astype(np.uint8)
 
             # Use course PCB to accurately extract corner
             rough_transformation_matrix = cv2.getPerspectiveTransform(

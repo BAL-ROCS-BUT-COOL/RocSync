@@ -201,8 +201,11 @@ def read_ring(extracted_board, camera_type, draw_result=False, return_leds=False
 
         led_intensities[i] = max(led_intensity - bg_intensity, 0.0)
 
-    # Center around median so ON LEDs are positive, OFF LEDs are negative
-    scores = led_intensities - np.median(led_intensities)
+    # Remove smooth illumination gradient (DC + 1st harmonic sinusoidal fit)
+    angles = np.array([-(i / period + 0.25) * 2 * math.pi for i in range(period)])
+    X = np.column_stack([np.ones(period), np.cos(angles), np.sin(angles)])
+    coeffs, _, _, _ = np.linalg.lstsq(X, led_intensities, rcond=None)
+    scores = led_intensities - X @ coeffs
 
     # Find most likely segment of enabled LEDs, allowing for false detections
     (start, end), score = find_optimal_ring_start_end(scores)

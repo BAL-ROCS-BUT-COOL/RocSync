@@ -207,6 +207,18 @@ def read_ring(extracted_board, camera_type, draw_result=False, return_leds=False
     # Find most likely segment of enabled LEDs, allowing for false detections
     (start, end), score = find_optimal_ring_start_end(scores)
 
+    # Derive binary LED states from the arc boundaries
+    leds = [False] * period
+    if start != end:
+        if start < end:
+            for i in range(start, end):
+                leds[i] = True
+        else:  # wraps around
+            for i in range(start, period):
+                leds[i] = True
+            for i in range(0, end):
+                leds[i] = True
+
     if start == end:
         # no segment found
         if return_leds:
@@ -218,7 +230,7 @@ def read_ring(extracted_board, camera_type, draw_result=False, return_leds=False
             angle = -(i / period + 0.25) * 2 * math.pi
             x = int(board_size / 2 + radius * math.cos(angle))
             y = int(board_size / 2 + radius * math.sin(angle))
-            color = (0, 0, 255) if scores[i] > 0 else (255, 0, 0)
+            color = (0, 0, 255) if leds[i] else (255, 0, 0)
             cv2.circle(extracted_board, (x, y), led_size, color, 1)
     # return inclusive bounds (i.e. start is the first led ON, end -1 is the last led ON)
     result = (start, (end - 1) % period)

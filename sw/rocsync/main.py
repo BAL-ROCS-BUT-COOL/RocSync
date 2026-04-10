@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
+from rocsync.board_profiles import PROFILES_BY_NAME
 from rocsync.printer import errprint, succprint, warnprint
 from rocsync.video import process_video
 from rocsync.vision import CameraType, process_frame
@@ -26,9 +27,9 @@ class NpEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
-def process_image(path, camera_type, debug_dir=None):
+def process_image(path, camera_type, debug_dir=None, board=None):
     image = cv2.imread(path)
-    _, timestamp = process_frame(image, camera_type, 0, debug_dir)
+    _, timestamp = process_frame(image, camera_type, 0, board, debug_dir)
     if timestamp is not None:
         succprint(f"start: {timestamp[0]} ms, end {timestamp[1]} ms")
         return {"start": timestamp[0], "end": timestamp[1]}
@@ -123,6 +124,12 @@ def main():
         metavar="DIRECTORY",
         help="directory to store debug images (very slow)",
     )
+    parser.add_argument(
+        "--board-version",
+        choices=["auto"] + list(PROFILES_BY_NAME.keys()),
+        default="auto",
+        help="board hardware revision (default: auto-detect from ArUco marker ID)",
+    )
 
     # Specify time windows to search for ROCsync
     parser.add_argument(
@@ -156,6 +163,8 @@ def main():
     )
 
     args = parser.parse_args()
+
+    board = PROFILES_BY_NAME.get(args.board_version) if args.board_version != "auto" else None
 
     # Parse time arguments
     start_time1, end_time1 = parse_time(args.start1), parse_time(args.end1)
@@ -241,13 +250,14 @@ def main():
                 end_time1,
                 start_time2,
                 end_time2,
+                board=board,
             )
             if ret is not None:
                 result[str(file)] = ret.to_dict()
             else:
                 errprint(f"Error: Unable to time-sync {file}.")
         elif file in images:
-            ret = process_image(file, CameraType(args.camera_type), debug_dir)
+            ret = process_image(file, CameraType(args.camera_type), debug_dir, board)
             if ret is not None:
                 result[str(file)] = ret
             else:

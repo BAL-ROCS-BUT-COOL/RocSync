@@ -369,11 +369,7 @@ def process_frame(image, camera_type, frame_number, debug_dir=None, brightness_b
                 _finalize_stats(stats, total_start, False, None)
                 return False, None
 
-            # Redness map: R - max(G, B), isolates red LED light from white/ambient
-            mask = np.clip(
-                image[:, :, 2].astype(int) - np.maximum(image[:, :, 0], image[:, :, 1]).astype(int),
-                0, 255,
-            ).astype(np.uint8)
+            mask = image[:, :, 2]
 
             # Use course PCB to accurately extract corner
             rough_transformation_matrix = cv2.getPerspectiveTransform(

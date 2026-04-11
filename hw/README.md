@@ -2,7 +2,9 @@
 This folder contains the KiCad project for the RocSync device, designed with JLCPCB manufacturing and assembly in mind. Fabrication files were generated using the [JLCPCB tools plugin](https://github.com/Bouni/kicad-jlcpcb-tools). The latest production files are available [here](rev2/jlcpcb/production_files/).
 
 ## Accuracy
-Revision 1 likely experienced accuracy issues documented [here](https://github.com/nlouman/documentation_todos_nino/blob/main/rocsync/1_checking_rocsync_clock.md), though never confirmed against a known accurate reference. Revision 2 replaced the crystal with a high-precision TCXO to improve absolute accuracy. Testing against a u-blox NEO-M8N GPS timepulse output showed ~1.3 ppm drift over 24 hours, roughly consistent with the TCXO's specification. This equates to 1 ms drift every 13 minutes. If required, one of the OLED pins could be used to feed a 1000 Hz timepulse signal from the GPS module into the microcontroller.
+Revision 1 likely experienced accuracy issues documented [here](https://github.com/nlouman/documentation_todos_nino/blob/main/rocsync/1_checking_rocsync_clock.md), though never confirmed against a known accurate reference. Revision 2 replaced the crystal with a high-precision TCXO to improve absolute accuracy. Testing against a u-blox NEO-M8N GPS timepulse output showed ~1.3 ppm drift over 24 hours, roughly consistent with the TCXO's specification. This equates to 1 ms drift every 13 minutes. 
+
+For even better accuracy, consider dedicating an unused GPIO pin (e.g., OLED SDA or SCL) to feed a 1000 Hz timepulse signal directly from the GPS module into the microcontroller, using it as the clock source.
 
 ## Revision History
 - **Rev1**: Initial design with 16-bit counter and crystal oscillator. Single-sided JLCPCB assembly with manual back-side soldering.

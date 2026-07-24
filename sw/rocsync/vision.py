@@ -189,11 +189,11 @@ def read_counter(extracted_board, camera_type, board, draw_result=False):
 
     # Apply Otsu's thresholding to led_intensities
     _, otsu_thresh = cv2.threshold(led_intensities, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    leds = otsu_thresh.astype(bool)
+    leds = otsu_thresh.astype(bool).squeeze()
 
     # convert binary table to time value
     potrange = np.arange(0, n_bits, 1)[::-1]
-    counter = np.sum(2**potrange[leds.squeeze()])
+    counter = np.sum(2**potrange[leds])
 
     # draw optional debug output
     if draw_result:
@@ -287,7 +287,7 @@ def find_corners_aruco(mask, frame_number, debug_dir=None, brightness_boost=None
 
     if marker_ids is None:
         return {}
-    return {id[0]: marker for id, marker in zip(marker_ids, markers)}
+    return {id.item(): marker for id, marker in zip(marker_ids, markers)}
 
 
 def process_frame(image, camera_type, frame_number, board=None, debug_dir=None, brightness_boost=None):

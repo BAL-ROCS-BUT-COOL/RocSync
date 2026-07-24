@@ -165,7 +165,11 @@ def main():
 
     args = parser.parse_args()
 
-    board = PROFILES_BY_NAME.get(args.board_version) if args.board_version != "auto" else None
+    board = (
+        PROFILES_BY_NAME.get(args.board_version)
+        if args.board_version != "auto"
+        else None
+    )
 
     # Parse time arguments
     start_time1, end_time1 = parse_time(args.start1), parse_time(args.end1)

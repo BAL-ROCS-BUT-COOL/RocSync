@@ -4,6 +4,7 @@ import numpy as np
 
 from rocsync.vision import CameraType
 
+
 def _mm2px(mm, board_mm, board_size):
     return mm / board_mm * board_size
 
@@ -11,18 +12,24 @@ def _mm2px(mm, board_mm, board_size):
 @dataclass(frozen=True)
 class BoardProfile:
     name: str
-    board_size: int                   # rectified image dimension (px)
-    board_mm: float                   # physical board size (mm)
+    board_size: int  # rectified image dimension (px)
+    board_mm: float  # physical board size (mm)
     aruco_marker_id: int
     period: int
     visible_radius: int
     ir_radius: int
-    corner_dots: np.ndarray           # RGB corner LED positions in rectified image (px)
-    ir_corners: np.ndarray            # IR corner positions for perspective transform (px, always 4)
-    aruco_corners_coords: np.ndarray  # ArUco destination corners in rectified image (px, always 4)
-    perspective_corner_slice: slice   # which corner_dots subset for the 4-point transform
-    counter_led_coords: dict          # {CameraType: np.ndarray Nx2 int} LED positions (px)
-    counter_bg_y: dict                # {CameraType: int} background sample y-coordinate (px)
+    corner_dots: np.ndarray  # RGB corner LED positions in rectified image (px)
+    ir_corners: (
+        np.ndarray
+    )  # IR corner positions for perspective transform (px, always 4)
+    aruco_corners_coords: (
+        np.ndarray
+    )  # ArUco destination corners in rectified image (px, always 4)
+    perspective_corner_slice: (
+        slice  # which corner_dots subset for the 4-point transform
+    )
+    counter_led_coords: dict  # {CameraType: np.ndarray Nx2 int} LED positions (px)
+    counter_bg_y: dict  # {CameraType: int} background sample y-coordinate (px)
     counter_bits: int
 
     def __hash__(self):
@@ -32,26 +39,35 @@ class BoardProfile:
 def _build_v1(board_size=640, board_mm=250):
     mm2px = lambda mm: _mm2px(mm, board_mm, board_size)
 
-    corner_dots = np.array([
-        [51, 51],
-        [board_size - 52, 51],
-        [board_size - 52, board_size - 52],
-        [51, board_size - 52],
-    ], dtype=np.float32)
+    corner_dots = np.array(
+        [
+            [51, 51],
+            [board_size - 52, 51],
+            [board_size - 52, board_size - 52],
+            [51, board_size - 52],
+        ],
+        dtype=np.float32,
+    )
 
-    ir_corners = np.array([
-        [13, 13],
-        [board_size - 14, 13],
-        [board_size - 14, board_size - 13],
-        [13, board_size - 14],
-    ], dtype=np.float32)
+    ir_corners = np.array(
+        [
+            [13, 13],
+            [board_size - 14, 13],
+            [board_size - 14, board_size - 13],
+            [13, board_size - 14],
+        ],
+        dtype=np.float32,
+    )
 
-    aruco_corners_coords = np.array([
-        [202, 202],
-        [board_size - 203, 202],
-        [board_size - 203, board_size - 203],
-        [202, board_size - 203],
-    ], dtype=np.float32)
+    aruco_corners_coords = np.array(
+        [
+            [202, 202],
+            [board_size - 203, 202],
+            [board_size - 203, board_size - 203],
+            [202, board_size - 203],
+        ],
+        dtype=np.float32,
+    )
 
     # Counter: 16 LEDs in a single row, x = (65 + i*8) mm
     n_leds = 16
@@ -87,29 +103,38 @@ def _build_v1(board_size=640, board_mm=250):
 def _build_v2(board_size=640, board_mm=250):
     mm2px = lambda mm: _mm2px(mm, board_mm, board_size)
 
-    corner_dots = np.array([
-        [13, 51],   # 5th additional RGB LED
-        [51, 51],
-        [board_size - 52, 51],
-        [board_size - 52, board_size - 52],
-        [51, board_size - 52],
-    ], dtype=np.float32)
+    corner_dots = np.array(
+        [
+            [13, 51],  # 5th additional RGB LED
+            [51, 51],
+            [board_size - 52, 51],
+            [board_size - 52, board_size - 52],
+            [51, board_size - 52],
+        ],
+        dtype=np.float32,
+    )
 
     # 4 standard corners for IR perspective transform
     # (v2 has a 5th IR LED at [51, 13] but it is not used for the transform)
-    ir_corners = np.array([
-        [13, 13],
-        [board_size - 14, 13],
-        [board_size - 14, board_size - 13],
-        [13, board_size - 14],
-    ], dtype=np.float32)
+    ir_corners = np.array(
+        [
+            [13, 13],
+            [board_size - 14, 13],
+            [board_size - 14, board_size - 13],
+            [13, board_size - 14],
+        ],
+        dtype=np.float32,
+    )
 
-    aruco_corners_coords = np.array([
-        [202, 202],
-        [board_size - 203, 202],
-        [board_size - 203, board_size - 203],
-        [202, board_size - 203],
-    ], dtype=np.float32)
+    aruco_corners_coords = np.array(
+        [
+            [202, 202],
+            [board_size - 203, 202],
+            [board_size - 203, board_size - 203],
+            [202, board_size - 203],
+        ],
+        dtype=np.float32,
+    )
 
     # Counter: 20 LEDs in 2 rows x 10, x from 71mm to 179mm
     n_per_row = 10
@@ -119,14 +144,20 @@ def _build_v2(board_size=640, board_mm=250):
     ir_y1 = round(mm2px(47))
     ir_y2 = round(mm2px(59))
 
-    rgb_leds = np.stack([
-        np.tile(x_coords, 2),
-        np.concatenate([np.full(n_per_row, rgb_y1), np.full(n_per_row, rgb_y2)]),
-    ], axis=1)
-    ir_leds = np.stack([
-        np.tile(x_coords, 2),
-        np.concatenate([np.full(n_per_row, ir_y1), np.full(n_per_row, ir_y2)]),
-    ], axis=1)
+    rgb_leds = np.stack(
+        [
+            np.tile(x_coords, 2),
+            np.concatenate([np.full(n_per_row, rgb_y1), np.full(n_per_row, rgb_y2)]),
+        ],
+        axis=1,
+    )
+    ir_leds = np.stack(
+        [
+            np.tile(x_coords, 2),
+            np.concatenate([np.full(n_per_row, ir_y1), np.full(n_per_row, ir_y2)]),
+        ],
+        axis=1,
+    )
 
     bg_y = round(mm2px(34))
 

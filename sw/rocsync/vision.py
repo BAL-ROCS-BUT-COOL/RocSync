@@ -54,26 +54,26 @@ def read_led(img, x, y):
 
 def find_optimal_ring_start_end(leds):
     """
-        Find the most likely window of leds turned ON, while allowing for false detections.
-        Computes the window [start, end) that maximizes the sum of values within the window minus the sum of values outside,
-        while allowing for wrap-around windows. True is treated as 1 and False as -1.
+    Find the most likely window of leds turned ON, while allowing for false detections.
+    Computes the window [start, end) that maximizes the sum of values within the window minus the sum of values outside,
+    while allowing for wrap-around windows. True is treated as 1 and False as -1.
 
-        Args:
-            leds: A list of booleans indicating the detected led state.
+    Args:
+        leds: A list of booleans indicating the detected led state.
 
-        Returns:
-            A tuple containing:
-            - A tuple of [start, end) indices for the optimal window.
-              If start > end, the window wraps around.
-              If start == end, the window is empty.
-            - The maximum possible score.
-        """
+    Returns:
+        A tuple containing:
+        - A tuple of [start, end) indices for the optimal window.
+          If start > end, the window wraps around.
+          If start == end, the window is empty.
+        - The maximum possible score.
+    """
     nums = [1 if val else -1 for val in leds]
     n = len(nums)
     total_sum = sum(nums)
 
     # --- Find max non-wrapping subarray and its indices (Kadane's Algorithm) ---
-    max_score = -float('inf')
+    max_score = -float("inf")
     max_start, max_end = 0, 0
     current_max = 0
     current_start_max = 0
@@ -90,7 +90,7 @@ def find_optimal_ring_start_end(leds):
             max_end = i + 1
 
     # --- Find min non-wrapping subarray and its indices ---
-    min_score = float('inf')
+    min_score = float("inf")
     min_start, min_end = 0, 0
     current_min = 0
     current_start_min = 0
@@ -107,7 +107,7 @@ def find_optimal_ring_start_end(leds):
             min_end = i + 1
 
     # --- Determine the optimal window and score, now considering the empty set ---
-    max_wrap_sum = -float('inf')
+    max_wrap_sum = -float("inf")
     if n > 1:  # A wrapping window needs at least 2 elements
         max_wrap_sum = total_sum - min_score
 
@@ -154,7 +154,9 @@ def read_ring(extracted_board, camera_type, board, draw_result=False):
         led_intensities[i] = np.clip(led_intensity - bg_intensity, 0, 255)
 
     # Apply Otsu's thresholding to led_intensities
-    _, otsu_thresh = cv2.threshold(led_intensities, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, otsu_thresh = cv2.threshold(
+        led_intensities, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
     leds = otsu_thresh.astype(bool).flatten().tolist()
 
     # Find most likely segment of enabled LEDs, allowing for false detections
@@ -188,12 +190,14 @@ def read_counter(extracted_board, camera_type, board, draw_result=False):
         led_intensities[i] = np.clip(led_intensity - bg_intensity, 0, 255)
 
     # Apply Otsu's thresholding to led_intensities
-    _, otsu_thresh = cv2.threshold(led_intensities, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, otsu_thresh = cv2.threshold(
+        led_intensities, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
     leds = otsu_thresh.astype(bool).squeeze()
 
     # convert binary table to time value
     potrange = np.arange(0, n_bits, 1)[::-1]
-    counter = np.sum(2**potrange[leds])
+    counter = np.sum(2 ** potrange[leds])
 
     # draw optional debug output
     if draw_result:
@@ -203,7 +207,7 @@ def read_counter(extracted_board, camera_type, board, draw_result=False):
                 (x, y),
                 led_size,
                 (0, 0, 255) if state else (255, 0, 0),
-                1
+                1,
             )
 
     return counter
@@ -266,9 +270,12 @@ def find_corners_dots(mask, frame_number, board, debug_dir=None):
         cv2.imwrite(f"{debug_dir}/corner_{frame_number}.png", debug_image)
 
     closest_points = [
-        min(points, key=lambda p: np.linalg.norm(p.pt - target)).pt for target in corner_dots
+        min(points, key=lambda p: np.linalg.norm(p.pt - target)).pt
+        for target in corner_dots
     ]
-    max_distance = max([np.linalg.norm(act - exp) for act, exp in zip(closest_points, corner_dots)])
+    max_distance = max(
+        [np.linalg.norm(act - exp) for act, exp in zip(closest_points, corner_dots)]
+    )
     if max_distance > 50:
         return  # Some corner is too far away from where it should be
 
@@ -290,13 +297,17 @@ def find_corners_aruco(mask, frame_number, debug_dir=None, brightness_boost=None
     return {id.item(): marker for id, marker in zip(marker_ids, markers)}
 
 
-def process_frame(image, camera_type, frame_number, board=None, debug_dir=None, brightness_boost=None):
+def process_frame(
+    image, camera_type, frame_number, board=None, debug_dir=None, brightness_boost=None
+):
     from rocsync.board_profiles import PROFILES_BY_ARUCO
 
     match camera_type:
         case CameraType.RGB:
             # Detect ArUco markers
-            markers = find_corners_aruco(image, frame_number, debug_dir, brightness_boost)
+            markers = find_corners_aruco(
+                image, frame_number, debug_dir, brightness_boost
+            )
             if not markers:
                 return False, None
 
@@ -335,22 +346,32 @@ def process_frame(image, camera_type, frame_number, board=None, debug_dir=None, 
                 cv2.getPerspectiveTransform(corners[s], board.corner_dots[s]),
                 rough_transformation_matrix,
             )
-            pcb = cv2.warpPerspective(mask, transformation_matrix, (board_size, board_size))
+            pcb = cv2.warpPerspective(
+                mask, transformation_matrix, (board_size, board_size)
+            )
 
         case CameraType.INFRARED:
             if board is None:
-                raise ValueError("IR mode requires an explicit board version (--board-version)")
+                raise ValueError(
+                    "IR mode requires an explicit board version (--board-version)"
+                )
 
             board_size = board.board_size
 
             gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            _, mask = cv2.threshold(gray_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            _, mask = cv2.threshold(
+                gray_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
             corners = find_corners_convexhull(mask, frame_number, debug_dir)
             if corners is None:
                 return False, None
-            transformation_matrix = cv2.getPerspectiveTransform(corners, board.ir_corners)
-            pcb = cv2.warpPerspective(mask, transformation_matrix, (board_size, board_size))
+            transformation_matrix = cv2.getPerspectiveTransform(
+                corners, board.ir_corners
+            )
+            pcb = cv2.warpPerspective(
+                mask, transformation_matrix, (board_size, board_size)
+            )
 
             # Find correct rotation
             for _ in range(4):

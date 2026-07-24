@@ -25,3 +25,18 @@ rocsync-align = "rocsync.helpers.align:main"
 [tool.setuptools]
 # This replaces find_packages()
 packages = { find = {} }
+
+[tool.black]
+line-length = 88
+target-version = ["py310", "py311", "py312"]
+include = '\.pyi?$'
+extend-exclude = '''
+(
+  | \.venv/
+)
+'''
+
+[dependency-groups]
+dev = [
+    "black>=26.5.1",
+]

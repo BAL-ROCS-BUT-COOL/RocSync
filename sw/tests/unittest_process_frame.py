@@ -17,20 +17,19 @@ from rocsync.vision import (
     read_ring,
 )
 
+
 def test_piecewise():
-    """ test the individual elements of the process_frame function with the new led layout """
+    """test the individual elements of the process_frame function with the new led layout"""
 
     board = BOARD_V2
     board_size = board.board_size
     TEST_DIR = Path(__file__).resolve().parents[0]
 
     # prepare the pcb ----------------------------------------------------------
-    image = cv.imread(TEST_DIR/"img1.jpg")
+    image = cv.imread(TEST_DIR / "img1.jpg")
 
     markers = find_corners_aruco(
-        image,
-        frame_number=999,
-        debug_dir=TEST_DIR/"output_piecewise"
+        image, frame_number=999, debug_dir=TEST_DIR / "output_piecewise"
     )
     aruco_corners = markers[board.aruco_marker_id]
     red_channel = image[:, :, 2]
@@ -44,10 +43,7 @@ def test_piecewise():
 
     # still works, additional led is just ignored with the original 4 points. Add the 5th red one just to be safe
     corners = find_corners_dots(
-        rough_pcb,
-        999,
-        board,
-        debug_dir=TEST_DIR/"output_piecewise"
+        rough_pcb, 999, board, debug_dir=TEST_DIR / "output_piecewise"
     )
 
     # however, this only works with exactly 4 points
@@ -56,16 +52,20 @@ def test_piecewise():
         cv.getPerspectiveTransform(corners[s], board.corner_dots[s]),
         rough_transformation_matrix,
     )
-    pcb = cv.warpPerspective(red_channel, transformation_matrix, (board_size, board_size))
+    pcb = cv.warpPerspective(
+        red_channel, transformation_matrix, (board_size, board_size)
+    )
 
-    cv.imwrite(TEST_DIR/"output_piecewise"/"pcb.jpg", pcb)
+    cv.imwrite(TEST_DIR / "output_piecewise" / "pcb.jpg", pcb)
 
     # decode the ring (should remain the same) ---------------------------------
     ring = read_ring(pcb, camera_type=CameraType.RGB, board=board, draw_result=True)
     print(f"ring decoded: {ring}")
 
     # decode clock (must be adjusted to new layout) ----------------------------
-    counter = read_counter(pcb, camera_type=CameraType.RGB, board=board, draw_result=True)
+    counter = read_counter(
+        pcb, camera_type=CameraType.RGB, board=board, draw_result=True
+    )
     print(f"decoded clock: {counter} [0.1s]")
 
     # show the debug image output
@@ -86,7 +86,7 @@ def test_full():
         camera_type=CameraType.RGB,
         frame_number=999,
         board=BOARD_V2,
-        debug_dir=TEST_DIR/"output_full"
+        debug_dir=TEST_DIR / "output_full",
     )
     print(f"output of process frame was: {out}")
 

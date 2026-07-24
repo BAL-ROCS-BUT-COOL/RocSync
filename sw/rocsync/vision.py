@@ -325,6 +325,22 @@ def process_frame(
                     return False, None
                 aruco_corners = markers[board.aruco_marker_id]
 
+            # Check if aruco marker fills x % of the image to make sure the PCB was held close enough
+            area = 0
+            for i in range(4):
+                x1, y1 = aruco_corners[0][i]
+                x2, y2 = aruco_corners[0][(i + 1) % 4]  # Wrap around to the first point
+                area += (x1 * y2) - (y1 * x2)
+            area = abs(area) / 2
+            height, width = image.shape[:2]
+            image_area = width * height
+            area_percentage = area / image_area
+            if area_percentage < 0.002:
+                print(
+                    f"Rejected {frame_number}: aruco marker only fills {area_percentage} of the image"
+                )
+                return False, None
+
             board_size = board.board_size
 
             red_channel = image[:, :, 2]

@@ -228,6 +228,7 @@ def find_corners_convexhull(mask, frame_number, debug_dir=None):
     points = [kp.pt for kp in points]
 
     # Find the convex hull and identify the corners
+    corners = None
     if len(points) >= 4:
         hull = cv2.convexHull(np.array(points, dtype=np.float32))
         corners = hull.reshape(-1, 2)

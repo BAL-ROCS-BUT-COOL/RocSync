@@ -78,6 +78,7 @@ def process_video_window(
     stride=None,
     debug_dir: str = None,
     brightness_boost: int = None,
+    board=None,
 ):
     cap = cv2.VideoCapture(video_path)
 
@@ -115,7 +116,7 @@ def process_video_window(
             break
         if scan_window > 0 or frame_number % stride == 0:
             rocsync_detected, timestamp = process_frame(
-                frame, camera_type, frame_number, debug_dir, brightness_boost
+                frame, camera_type, frame_number, board, debug_dir, brightness_boost
             )
             scan_window -= 1
             if timestamp is not None:
@@ -143,6 +144,7 @@ def process_video(
     window2_start=None,
     window2_end=None,
     brightness_boost=None,
+    board=None,
 ):
     # Get video metadata
     cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
@@ -186,6 +188,7 @@ def process_video(
         stride,
         debug_dir,
         brightness_boost,
+        board,
     )
 
     if (
@@ -200,6 +203,7 @@ def process_video(
             stride,
             debug_dir,
             brightness_boost,
+            board,
         )
         timestamps = {**timestamps, **timestamps2}
 
@@ -315,8 +319,8 @@ def print_statistics(statistics: VideoStatistics):
         f"{statistics.rmse_before:.2f}/{statistics.rmse_after:.2f} ms",
         statistics.rmse_after < 2,
     )
-    print(format_str.format("First frame:", f"{statistics.first_frame / 1000:.3f} s"))
-    print(format_str.format("Last frame:", f"{statistics.last_frame / 1000:.3f} s"))
+    print(format_str.format("First frame:", f"{statistics.first_frame/1000:.3f} s"))
+    print(format_str.format("Last frame:", f"{statistics.last_frame/1000:.3f} s"))
     print(
         format_str.format(
             "Framerate (expected/measured):",
@@ -326,7 +330,7 @@ def print_statistics(statistics: VideoStatistics):
     print(
         format_str.format(
             "Duration (expected/measured):",
-            f"{statistics.expected_duration / 1000:.3f}/{statistics.measured_duration / 1000:.3f} s (Δ={statistics.measured_duration - statistics.expected_duration:.2f} ms)",
+            f"{statistics.expected_duration/1000:.3f}/{statistics.measured_duration/1000:.3f} s (Δ={statistics.measured_duration-statistics.expected_duration:.2f} ms)",
         )
     )
     print(

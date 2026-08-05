@@ -338,7 +338,7 @@ def process_frame(
             area_percentage = area / image_area
             if area_percentage < 0.002:
                 print(
-                    f"Rejected {frame_number}: aruco marker only fills {area_percentage} of the image"
+                    f"Rejected {frame_number}: aruco marker only fills {area_percentage:.2%} of the image"
                 )
                 return False, None
 

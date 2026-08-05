@@ -54,20 +54,20 @@ def mkdir_unique(name, parent_dir):
 
 
 def parse_time(time_str: str) -> float:
-    """Expects a delta time string with format hh:mm:ss.ms"""
+    """Expects a delta time string with format hh:mm:ss"""
     if time_str is None:
         return None
 
     time = time_str.split(":")
     if len(time) != 3:
-        errprint(f"Invalid time format: {time_str}, expected hh:mm:ss.ms")
+        errprint(f"Invalid time format: {time_str}, expected hh:mm:ss")
         raise ValueError
     try:
         h = int(time[0])
         m = int(time[1])
         s = float(time[2])
     except ValueError:
-        errprint(f"Invalid time format: {time_str}, expected hh:mm:ss.ms")
+        errprint(f"Invalid time format: {time_str}, expected hh:mm:ss")
         raise ValueError
 
     return h * 3600 + m * 60 + s

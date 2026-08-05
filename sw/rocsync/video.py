@@ -17,20 +17,32 @@ from rocsync.video_statistics import VideoStatistics
 from rocsync.vision import CameraType, process_frame
 
 
-def read_frames_async(cap, frame_queue, start_frame=0, end_frame=None):
+def read_frames_async(cap, frame_queue, start_frame=0, end_frame=None, stop_event=None):
+    def put(item):
+        # Blocking put, but wake up regularly so a consumer that went away
+        # (e.g. because it raised) cannot wedge this thread on a full queue.
+        while stop_event is None or not stop_event.is_set():
+            try:
+                frame_queue.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-    while True:
+    while stop_event is None or not stop_event.is_set():
         ret, frame = cap.read()
         if not ret:
-            frame_queue.put((None, None))
+            put((None, None))
             break
 
         frame_number = int(cap.get(cv2.CAP_PROP_POS_FRAMES) - 1)
         if end_frame is not None and frame_number >= end_frame:
-            frame_queue.put((None, None))
+            put((None, None))
             break
 
-        frame_queue.put((frame, frame_number))
+        if not put((frame, frame_number)):
+            break
 
 
 def export_frame_async(frame_queue, y_pred, path):
@@ -91,10 +103,12 @@ def process_video_window(
 
     # Read frames in separate thread
     frame_queue = queue.Queue(maxsize=100)
+    stop_event = threading.Event()
     thread = threading.Thread(
-        target=read_frames_async, args=(cap, frame_queue, start_frame, end_frame)
+        target=read_frames_async,
+        args=(cap, frame_queue, start_frame, end_frame, stop_event),
     )
-    thread.daemon = False
+    thread.daemon = True
     thread.start()
 
     timestamps = {}
@@ -107,28 +121,30 @@ def process_video_window(
         desc=f"Analyzing frames in time window [{window_start:.3f}s, {window_end:.3f}s] --> Found {len(timestamps)} timestamps",
         position=1,
     )
-    for _ in pbar:
-        frame, frame_number = frame_queue.get()  # blocking wait
-        if frame is None:
-            errprint(
-                "Error: Input stream ended unexpectedly. Could be a sign of skipped frames."
-            )
-            break
-        if scan_window > 0 or frame_number % stride == 0:
-            rocsync_detected, timestamp = process_frame(
-                frame, camera_type, frame_number, board, debug_dir, brightness_boost
-            )
-            scan_window -= 1
-            if timestamp is not None:
-                timestamps[frame_number] = timestamp
-            if rocsync_detected:
-                scan_window = 5
-                pbar.set_description(
-                    f"Analyzing frames in time window [{window_start:.3f}s, {window_end:.3f}s] --> Found {len(timestamps)} timestamps"
+    try:
+        for _ in pbar:
+            frame, frame_number = frame_queue.get()  # blocking wait
+            if frame is None:
+                errprint(
+                    "Error: Input stream ended unexpectedly. Could be a sign of skipped frames."
                 )
-
-    thread.join()
-    cap.release()
+                break
+            if scan_window > 0 or frame_number % stride == 0:
+                rocsync_detected, timestamp = process_frame(
+                    frame, camera_type, frame_number, board, debug_dir, brightness_boost
+                )
+                scan_window -= 1
+                if timestamp is not None:
+                    timestamps[frame_number] = timestamp
+                if rocsync_detected:
+                    scan_window = 5
+                    pbar.set_description(
+                        f"Analyzing frames in time window [{window_start:.3f}s, {window_end:.3f}s] --> Found {len(timestamps)} timestamps"
+                    )
+    finally:
+        stop_event.set()
+        thread.join(timeout=5)
+        cap.release()
 
     return timestamps
 

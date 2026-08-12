@@ -1,12 +1,11 @@
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Circle
-from sklearn.linear_model import RANSACRegressor
-from sklearn.metrics import root_mean_squared_error
 from tqdm import tqdm
 
 from rocsync.board_profiles import PROFILES_BY_FTK, BoardProfile
 from rocsync.camera import CameraType
+from rocsync.timeline import fit_timeline
 
 DISTANCE_THRESHOLD = 3
 
@@ -187,41 +186,29 @@ def plot_timechart(x, y, x_range, y_pred, debug_dir):
 
 
 def fit_ftk_timestamps(timestamps: dict[int, tuple[int, int]], debug_dir=None) -> dict:
-    # Assuming constant frame rate, fit robust linear model
-    x = np.array(list(timestamps.keys())).reshape(-1, 1)
-    y = np.array([start for start, _ in timestamps.values()])
-    model = RANSACRegressor(
+    # The device reports its own clock, so regress board time directly on it.
+    # Not frame-periodic, hence an explicit residual threshold.
+    device_times = {k: k for k in timestamps}
+    fit = fit_timeline(
+        device_times,
+        timestamps,
         residual_threshold=10,
         max_trials=10000,  # more trials for more consistent results
-        random_state=0,  # deterministic results
     )
-    # Convert x to numeric type before fitting
-    model.fit(x, y)
-    # print(model.estimator_.coef_)
-    # print(model.estimator_.intercept_)
 
-    # Remove outliers
-    filtered_timestamps = {
-        k: v for i, (k, v) in enumerate(timestamps.items()) if model.inlier_mask_[i]
-    }
-
-    filtered_x = np.array(list(filtered_timestamps.keys())).reshape(-1, 1)
-    filtered_y = np.array([start for start, _ in filtered_timestamps.values()])
-
-    rmse = root_mean_squared_error(filtered_y, model.predict(filtered_x))
     results = {
-        "slope": model.estimator_.coef_[0],
-        "intercept": model.estimator_.intercept_,
-        "rmse_after": rmse,
-        "n_considered_frames": len(filtered_timestamps),
-        "n_rejected_frames": len(timestamps) - len(filtered_timestamps),
+        "slope": fit.slope,
+        "intercept": fit.intercept,
+        "rmse_after": fit.rmse_after,
+        "n_considered_frames": int(np.sum(fit.inlier_mask)),
+        "n_rejected_frames": int(np.sum(~fit.inlier_mask)),
     }
 
     if debug_dir is not None:
-        # Predict timestamps for all frames
+        x = np.array(fit.order).reshape(-1, 1)
+        y = np.array([timestamps[k][0] for k in fit.order])
         x_range = np.array([np.min(x), np.max(x)]).reshape(-1, 1)
-        y_pred = model.predict(x_range)
-        plot_timechart(x, y, x_range, y_pred, debug_dir)
+        plot_timechart(x, y, x_range, fit.predict(x_range), debug_dir)
     return results
 
 

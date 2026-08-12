@@ -14,6 +14,13 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
+try:
+    from rocsync.timeline import affine_from_statistics, per_frame_times
+except ImportError:
+    raise SystemExit(
+        "This script needs the rocsync package: pip install -e <path to RocSync>/sw"
+    )
+
 # Use lowercase, dotted suffixes; we compare with .lower()
 camera_formats = {".mp4", ".mov", ".avi", ".mkv"}
 
@@ -67,10 +74,13 @@ def main(config: Config) -> None:
     with open(time_sync_json_path, "r", encoding="utf-8") as f:
         time_sync_data_raw: Dict[str, dict] = json.load(f)
 
-    # Normalize keys to '<parent>/<file>' so they can be joined with dataset_folder
+    # Normalize keys to '<parent>/<file>' so they can be joined with dataset_folder.
+    # Device recordings land in the same JSON without a frame timeline, so they
+    # are dropped here rather than failing the overlap checks below.
     time_sync_data_all: Dict[str, dict] = {
         os.path.join(*camera.replace("\\", "/").split("/")[-2:]): data
         for camera, data in time_sync_data_raw.items()
+        if "first_frame" in data
     }
 
     def _pretty_cam_name(cam_key: str) -> str:
@@ -150,11 +160,12 @@ def main(config: Config) -> None:
             "--from-camera",
         )
         defining = time_sync_data_all[defining_key]
+        defining_slope, defining_intercept = affine_from_statistics(defining)
         clips = _parse_clips_to_extract_json(
             config.clips_to_extract_json,
             from_camera_time=True,
-            first_frame_time=defining["first_frame"],
-            speed_factor=defining["speed_factor"],
+            intercept=defining_intercept,
+            slope=defining_slope,
         )
     else:
         clips = _parse_clips_to_extract_json(config.clips_to_extract_json)
@@ -264,10 +275,9 @@ def main(config: Config) -> None:
             cam_last = float(camera_time_sync_data["last_frame"])
             has_full_overlap = (cam_first <= clip.start) and (clip.end <= cam_last)
 
-            # Build per-frame real-time timestamps (uses measured_fps & speed_factor when present)
-            actual_timestamps = _get_theoretical_timestamps_of_all_frames(
-                camera_time_sync_data
-            )
+            # Build per-frame real-time timestamps from the frames' own
+            # presentation timestamps, so dropped frames stay where they are
+            actual_timestamps = per_frame_times(raw_video_path, camera_time_sync_data)
 
             # Compute the EXACT number of frames we want at target_fps
             frames_to_extract = _get_frames_to_extract(
@@ -321,12 +331,12 @@ class Clip:
         start_string: str,
         end_string: str,
         from_camera_time: bool = False,
-        first_frame_time: float = None,
-        speed_factor: float = None,
+        intercept: float = None,
+        slope: float = None,
     ) -> None:
         if from_camera_time:
             start_string, end_string = self._convert_to_real_time(
-                start_string, end_string, first_frame_time, speed_factor
+                start_string, end_string, intercept, slope
             )
         self.start = self._parse_timecode_to_milliseconds(start_string)
         self.end = self._parse_timecode_to_milliseconds(end_string)
@@ -339,13 +349,13 @@ class Clip:
         self,
         start_string: str,
         end_string: str,
-        first_frame_time: float,
-        speed_factor: float,
+        intercept: float,
+        slope: float,
     ) -> tuple[str, str]:
         start = self._parse_timecode_to_milliseconds(start_string)
         end = self._parse_timecode_to_milliseconds(end_string)
-        start_real = int(round(first_frame_time + speed_factor * start))
-        end_real = int(round(first_frame_time + speed_factor * end))
+        start_real = int(round(intercept + slope * start))
+        end_real = int(round(intercept + slope * end))
         start_real_string = self._parse_timecode_to_milliseconds_inverse(start_real)
         end_real_string = self._parse_timecode_to_milliseconds_inverse(end_real)
         return start_real_string, end_real_string
@@ -374,15 +384,13 @@ class Clip:
 def _parse_clips_to_extract_json(
     path: str,
     from_camera_time: bool = False,
-    first_frame_time: float = None,
-    speed_factor: float = None,
+    intercept: float = None,
+    slope: float = None,
 ) -> List[Clip]:
     with open(path, "r", encoding="utf-8") as f:
         clips_raw = json.load(f)
     return [
-        Clip(
-            clip["start"], clip["end"], from_camera_time, first_frame_time, speed_factor
-        )
+        Clip(clip["start"], clip["end"], from_camera_time, intercept, slope)
         for clip in clips_raw
     ]
 
@@ -426,30 +434,6 @@ def _get_frames_to_extract(
             frames_to_extract = frames_to_extract[:n_target]
 
     return frames_to_extract
-
-
-def _get_theoretical_timestamps_of_all_frames(time_sync_data: dict) -> List[float]:
-    """
-    Build per-frame REAL timeline (in ms) for this camera.
-    Prefer measured_fps (+ optional speed_factor) when available; fall back to linear interpolation.
-    """
-    first_frame = float(time_sync_data["first_frame"])
-    last_frame = float(time_sync_data["last_frame"])
-    n_frames = int(time_sync_data["n_frames"])
-
-    measured_fps = time_sync_data.get("measured_fps", None)
-    speed_factor = time_sync_data.get("speed_factor", None)
-
-    if measured_fps and measured_fps > 0:
-        dt = 1000.0 / float(measured_fps)
-        if speed_factor and speed_factor > 0:
-            dt *= float(speed_factor)
-        return [first_frame + n * dt for n in range(n_frames)]
-    else:
-        if n_frames <= 1:
-            return [first_frame]
-        step = (last_frame - first_frame) / (n_frames - 1)
-        return [first_frame + n * step for n in range(n_frames)]
 
 
 def write_sampled_video_by_indices(

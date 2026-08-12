@@ -1,4 +1,17 @@
 # Multi-Camera Sync Toolkit
+
+## ⚙️ Requirements
+
+These scripts import the shared timing code from the `rocsync` package, so install it once:
+
+```bash
+pip install -e path/to/RocSync/sw
+```
+
+They read each frame's presentation timestamp out of the video itself and map it to
+board time through the fit in `time_synchronization_*.json`, so a recording that
+dropped frames keeps the missing span where it happened.
+
 ## 📂 Folder Setup
 
 Your dataset folder should look like this:

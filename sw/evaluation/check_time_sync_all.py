@@ -4,11 +4,18 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import cv2
 import numpy as np
 from tqdm import tqdm
+
+try:
+    from rocsync.timeline import affine_from_statistics, per_frame_times
+except ImportError:
+    raise SystemExit(
+        "This script needs the rocsync package: pip install -e <path to RocSync>/sw"
+    )
 
 # Reuse the same video extensions as extract_synced_videos.py
 camera_formats = {".mp4", ".mov", ".avi", ".mkv"}
@@ -74,30 +81,6 @@ def _ms_to_timecode(ms: float) -> str:
     return f"{hours:02}:{minutes:02}:{secs:02}.{milliseconds:03}"
 
 
-def _get_theoretical_timestamps_of_all_frames(time_sync_data: dict) -> List[float]:
-    """
-    Build per-frame REAL timeline (in ms) for this camera.
-    Prefer measured_fps (+ optional speed_factor) when available; fall back to linear interpolation.
-    """
-    first_frame = float(time_sync_data["first_frame"])
-    last_frame = float(time_sync_data["last_frame"])
-    n_frames = int(time_sync_data["n_frames"])
-
-    measured_fps = time_sync_data.get("measured_fps", None)
-    speed_factor = time_sync_data.get("speed_factor", None)
-
-    if measured_fps and measured_fps > 0:
-        dt = 1000.0 / float(measured_fps)
-        if speed_factor and speed_factor > 0:
-            dt *= float(speed_factor)
-        return [first_frame + n * dt for n in range(n_frames)]
-    else:
-        if n_frames <= 1:
-            return [first_frame]
-        step = (last_frame - first_frame) / (n_frames - 1)
-        return [first_frame + n * step for n in range(n_frames)]
-
-
 def _build_arg_parser() -> argparse.ArgumentParser:
     # Default dataset folder = parent of script (same logic as extract_synced_videos.py)
     try:
@@ -146,14 +129,14 @@ def compute_global_time_from_camera(
     time_string: str, camera_time_sync_data: dict
 ) -> float:
     """
-    Convert a time given in camera-local units to GLOBAL ms using first_frame & speed_factor.
+    Convert a time given in camera-local units to GLOBAL ms through the camera's
+    fitted clock. Local time is a position in the container's own timeline, which
+    is what the fit maps, so the intercept is the correct anchor.
     (Same math as in Clip._convert_to_real_time, but for a single time.)
     """
     local_ms = _parse_timecode_to_milliseconds(time_string)
-    first_frame = float(camera_time_sync_data["first_frame"])
-    speed_factor = float(camera_time_sync_data.get("speed_factor", 1.0))
-    global_ms = first_frame + speed_factor * local_ms
-    return float(global_ms)
+    slope, intercept = affine_from_statistics(camera_time_sync_data)
+    return float(intercept + slope * local_ms)
 
 
 def validate_moment_in_overlap(
@@ -211,7 +194,7 @@ def extract_frame_for_moment(
         return None
 
     timestamps = np.asarray(
-        _get_theoretical_timestamps_of_all_frames(time_sync_data),
+        per_frame_times(video_path, time_sync_data),
         dtype=np.float64,
     )
     # Find closest frame
@@ -246,10 +229,12 @@ def main(cfg: Config) -> None:
         raw_time_sync_data: Dict[str, dict] = json.load(f)
 
     # Normalize keys to '<parent>/<file>' so they can be joined with dataset_folder,
-    # exactly like in extract_synced_videos.py.
+    # exactly like in extract_synced_videos.py. Device recordings land in the same
+    # JSON without a frame timeline, so they are dropped here.
     time_sync_data = {
         os.path.join(*camera.replace("\\", "/").split("/")[-2:]): data
         for camera, data in raw_time_sync_data.items()
+        if "first_frame" in data
     }
 
     # Find the time-defining camera entry by basename match

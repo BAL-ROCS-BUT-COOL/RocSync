@@ -15,15 +15,26 @@ class VideoStatistics:
     rmse_after: float
 
     # Duration and FPS
-    expected_duration: float
-    measured_duration: float
-    expected_fps: float
-    measured_fps: float
+    expected_duration: float  # container span of the analyzed frames
+    measured_duration: float  # board time between the first and last frame
+    expected_fps: float  # nominal rate reported by the container
+    measured_fps: float  # 1000 / median frame period
+
+    # Affine map from container presentation time to board time, in ms:
+    # board_ms = speed_factor * pts_ms + intercept
     speed_factor: float
+    intercept: float
 
     # Start and end
     first_frame: float
     last_frame: float
+
+    # Container timeline
+    median_frame_period: float
+    n_gaps: int
+    n_dropped_frames: int
+    largest_gap_ms: float
+    timeline_windowed: bool  # True if only part of the file was analyzed
 
     # Exposure
     mean_exposure_time: float
@@ -34,7 +45,6 @@ class VideoStatistics:
     # Timestamps
     considered_timestamps: dict
     rejected_timestamps: dict
-    # interpolated_timestamps: list
 
     def to_dict(self):
         return asdict(self)

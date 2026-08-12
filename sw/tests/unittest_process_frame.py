@@ -21,7 +21,7 @@ from rocsync.vision import (
 def test_piecewise():
     """test the individual elements of the process_frame function with the new led layout"""
 
-    board = BOARD_V2
+    board = BOARD_V2.rectify()
     board_size = board.board_size
     TEST_DIR = Path(__file__).resolve().parents[0]
 
@@ -41,15 +41,16 @@ def test_piecewise():
     )
     cv.imwrite(TEST_DIR / "output_piecewise" / "rough_pcb.jpg", rough_pcb)
 
-    # still works, additional led is just ignored with the original 4 points. Add the 5th red one just to be safe
+    # Matches every always-on dot, including the 5th one, as a sanity check
     corners = find_corners_dots(
         rough_pcb, 999, board, debug_dir=TEST_DIR / "output_piecewise"
     )
 
     # however, this only works with exactly 4 points
-    s = board.perspective_corner_slice
     transformation_matrix = np.dot(
-        cv.getPerspectiveTransform(corners[s], board.corner_dots[s]),
+        cv.getPerspectiveTransform(
+            corners[:4], board.transform_corners(CameraType.RGB)
+        ),
         rough_transformation_matrix,
     )
     pcb = cv.warpPerspective(

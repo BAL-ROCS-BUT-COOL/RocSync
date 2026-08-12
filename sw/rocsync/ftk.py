@@ -5,7 +5,8 @@ from sklearn.linear_model import RANSACRegressor
 from sklearn.metrics import root_mean_squared_error
 from tqdm import tqdm
 
-from rocsync.geometry import Geometry, geometry_from_ftk_marker
+from rocsync.board_profiles import PROFILES_BY_FTK, BoardProfile
+from rocsync.camera import CameraType
 
 DISTANCE_THRESHOLD = 3
 
@@ -48,11 +49,11 @@ class FTKPipeline:
 
 def read_ring(
     fiducials: list[tuple[float, float]],
-    geometry: Geometry,
+    board: BoardProfile,
     ax: plt.Axes | None = None,
 ) -> tuple[int, int] | None:
-    leds = np.zeros(geometry.period(), dtype=bool)
-    for i, led in enumerate(geometry.ring_leds("ir")):
+    leds = np.zeros(board.period, dtype=bool)
+    for i, led in enumerate(board.ring_led_coords(CameraType.INFRARED)):
         # Check if any fiducial matches this LED
         for fiducial in fiducials:
             distance = np.linalg.norm(fiducial - led)
@@ -66,10 +67,10 @@ def read_ring(
 
     potential_starts = []
     potential_ends = []
-    for i in range(geometry.period()):
-        if not leds[(i - 1) % geometry.period()] and leds[i]:
+    for i in range(board.period):
+        if not leds[(i - 1) % board.period] and leds[i]:
             potential_starts.append(i)
-        if leds[i] and not leds[(i + 1) % geometry.period()]:
+        if leds[i] and not leds[(i + 1) % board.period]:
             potential_ends.append(i)
 
     # Make sure that there is exactly ONE of enabled
@@ -79,11 +80,12 @@ def read_ring(
 
 def read_counter(
     fiducials: list[tuple[float, float]],
-    geometry: Geometry,
+    board: BoardProfile,
     ax: plt.Axes | None = None,
 ):
     counter = 0
-    for i, led in enumerate(geometry.counter_leds("ir")):
+    # Counter LEDs are listed most significant bit first, matching vision.read_counter.
+    for i, led in enumerate(board.counter_led_coords[CameraType.INFRARED]):
         enabled = False
         for fiducial in fiducials:
             distance = np.linalg.norm(fiducial - led)
@@ -91,7 +93,7 @@ def read_counter(
                 enabled = True
                 break
         if enabled:
-            counter += 2**i
+            counter += 2 ** (board.counter_bits - 1 - i)
 
         if ax is not None:
             color = "red" if enabled else "blue"
@@ -104,7 +106,7 @@ def process_frame(
     position: np.ndarray,
     rotation_matrix: np.ndarray,
     fiducials: list[dict],
-    geometry: Geometry,
+    board: BoardProfile,
     ax: plt.Axes | None = None,
 ) -> tuple[int, int] | None:
     # Transform fiducials into local coordinate system
@@ -133,14 +135,14 @@ def process_frame(
     # Rotate until counter is readable
     # TODO: not required for Rev2
     for i in range(4):
-        counter = read_counter(transformed_fiducials, geometry, ax)
+        counter = read_counter(transformed_fiducials, board, ax)
         if counter > 0:
             break
 
         # Rotate 90 degrees arround center
         rot90 = np.array([[0, -1], [1, 0]])
         rotated_fiducials = []
-        center = np.array([125, 125])
+        center = np.array([board.centre_mm, board.centre_mm])
         for f in transformed_fiducials:
             v = f - center
             rotated = rot90 @ v + center
@@ -154,19 +156,19 @@ def process_frame(
     if counter == 0:
         return None
 
-    ring = read_ring(transformed_fiducials, geometry, ax)
+    ring = read_ring(transformed_fiducials, board, ax)
     if ring is not None:
         start, end = ring
         # Check if the values are valid
         if (
             start > end
-            or min(start, geometry.period() - start) <= 2
-            or min(geometry.period(), 100 - end) <= 2
+            or min(start, board.period - start) <= 2
+            or min(board.period, 100 - end) <= 2
         ):
             return None
 
-        start += counter * geometry.period()
-        end += counter * geometry.period()
+        start += counter * board.period
+        end += counter * board.period
         return start, end
     return None
 
@@ -241,9 +243,9 @@ def process_ftk_recording(filename: str, debug_dir=None) -> dict:
                 if len(fields) >= len(maker_format) and fields[2] == "m":
                     marker = dict(zip(maker_format, fields))
 
-                    # Get geometry for PCB associated with this marker
-                    geometry = geometry_from_ftk_marker(int(marker["marker_id"]))
-                    if geometry is None:
+                    # Get board profile for the PCB associated with this marker
+                    board = PROFILES_BY_FTK.get(int(marker["marker_id"]))
+                    if board is None:
                         continue
 
                     # Read and collect all related fiducials (type "f") immediately after this marker
@@ -337,7 +339,7 @@ def process_ftk_recording(filename: str, debug_dir=None) -> dict:
                         ax.set_aspect("equal")
 
                         result = process_frame(
-                            position, rotation_matrix, fiducials, geometry, ax
+                            position, rotation_matrix, fiducials, board, ax
                         )
                         # if result is not None and result[0] > 100:
                         fig.savefig(
@@ -347,7 +349,7 @@ def process_ftk_recording(filename: str, debug_dir=None) -> dict:
                         plt.close(fig)
                     else:
                         result = process_frame(
-                            position, rotation_matrix, fiducials, geometry
+                            position, rotation_matrix, fiducials, board
                         )
 
                     if result is not None:

@@ -1,16 +1,13 @@
-import math
-from enum import Enum
-
 import cv2
 import numpy as np
 
+from rocsync.board_profiles import (
+    DEFAULT_BOARD_SIZE,
+    RING_BG_OFFSET_MM,
+    PROFILES_BY_ARUCO,
+)
+from rocsync.camera import CameraType
 from rocsync.printer import *
-
-
-class CameraType(Enum):
-    RGB = "rgb"
-    INFRARED = "ir"
-
 
 # Blob detector params
 params = cv2.SimpleBlobDetector_Params()
@@ -20,7 +17,7 @@ params.filterByColor = True
 params.blobColor = 255
 
 # Exclude elongated blobs caused by motion blur
-params.filterByInertia = False
+params.filterByInertia = True
 params.minInertiaRatio = 0.8
 
 blob_detector = cv2.SimpleBlobDetector_create(params)
@@ -30,8 +27,6 @@ dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 parameters = cv2.aruco.DetectorParameters()
 parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
 aruco_detector = cv2.aruco.ArucoDetector(dictionary, parameters)
-
-led_size = 8
 
 
 def draw_polygon(points, image, color):
@@ -45,9 +40,9 @@ def draw_polygon(points, image, color):
         )
 
 
-def read_led(img, x, y):
+def read_led(img, x, y, radius):
     led_mask = np.zeros(img.shape[:2], dtype=np.uint8)
-    cv2.circle(led_mask, (x, y), led_size, (255), -1)
+    cv2.circle(led_mask, (x, y), radius, (255), -1)
     led_intensity = np.quantile(img[led_mask > 0], 0.75)
     return led_intensity
 
@@ -134,23 +129,16 @@ def find_optimal_ring_start_end(leds):
 
 
 def read_ring(extracted_board, camera_type, board, draw_result=False):
-    radius = board.visible_radius if camera_type == CameraType.RGB else board.ir_radius
-    board_size = board.board_size
     period = board.period
+    radius = board.led_sample_radius
+    led_coords = board.ring_led_coords(camera_type).astype(int)
+    bg_coords = board.ring_led_coords(camera_type, RING_BG_OFFSET_MM).astype(int)
 
     # Collect mean LED intensities relative to local background
     led_intensities = np.zeros(period, dtype=np.uint8)
-    for i in range(period):
-        angle = -(i / period + 0.25) * 2 * math.pi
-
-        x = int(board_size / 2 + radius * math.cos(angle))
-        y = int(board_size / 2 + radius * math.sin(angle))
-        led_intensity = read_led(extracted_board, x, y)
-
-        x_bg = int(board_size / 2 + (radius - 25) * math.cos(angle))
-        y_bg = int(board_size / 2 + (radius - 25) * math.sin(angle))
-        bg_intensity = read_led(extracted_board, x_bg, y_bg)
-
+    for i, ((x, y), (x_bg, y_bg)) in enumerate(zip(led_coords, bg_coords)):
+        led_intensity = read_led(extracted_board, x, y, radius)
+        bg_intensity = read_led(extracted_board, x_bg, y_bg, radius)
         led_intensities[i] = np.clip(led_intensity - bg_intensity, 0, 255)
 
     # Apply Otsu's thresholding to led_intensities
@@ -167,26 +155,24 @@ def read_ring(extracted_board, camera_type, board, draw_result=False):
         return None
 
     if draw_result:
-        for i in range(period):
-            angle = -(i / period + 0.25) * 2 * math.pi
-            x = int(board_size / 2 + radius * math.cos(angle))
-            y = int(board_size / 2 + radius * math.sin(angle))
-            color = (0, 0, 255) if leds[i] else (255, 0, 0)
-            cv2.circle(extracted_board, (x, y), led_size, color, 1)
+        for state, (x, y) in zip(leds, led_coords):
+            color = (0, 0, 255) if state else (255, 0, 0)
+            cv2.circle(extracted_board, (x, y), radius, color, 1)
     # return inclusive bounds (i.e. start is the first led ON, end -1 is the last led ON)
     return start, (end - 1) % period
 
 
 def read_counter(extracted_board, camera_type, board, draw_result=False):
-    led_coords = board.counter_led_coords[camera_type]
-    bg_y = board.counter_bg_y[camera_type]
+    led_coords = board.counter_led_coords[camera_type].astype(int)
+    bg_y = int(board.counter_bg_y[camera_type])
     n_bits = board.counter_bits
+    radius = board.led_sample_radius
 
     # Collect mean LED intensities relative to local background
     led_intensities = np.zeros(led_coords.shape[0], dtype=np.uint8)
     for i, (x, y) in enumerate(led_coords):
-        led_intensity = read_led(extracted_board, x, y)
-        bg_intensity = read_led(extracted_board, x, bg_y)
+        led_intensity = read_led(extracted_board, x, y, radius)
+        bg_intensity = read_led(extracted_board, x, bg_y, radius)
         led_intensities[i] = np.clip(led_intensity - bg_intensity, 0, 255)
 
     # Apply Otsu's thresholding to led_intensities
@@ -205,7 +191,7 @@ def read_counter(extracted_board, camera_type, board, draw_result=False):
             cv2.circle(
                 extracted_board,
                 (x, y),
-                led_size,
+                radius,
                 (0, 0, 255) if state else (255, 0, 0),
                 1,
             )
@@ -256,7 +242,7 @@ def find_corners_convexhull(mask, frame_number, debug_dir=None):
 
 
 def find_corners_dots(mask, frame_number, board, debug_dir=None):
-    corner_dots = board.corner_dots
+    corner_dots = board.always_on_leds[CameraType.RGB]
     points = blob_detector.detect(mask)
     if not points:
         return
@@ -299,10 +285,14 @@ def find_corners_aruco(mask, frame_number, debug_dir=None, brightness_boost=None
 
 
 def process_frame(
-    image, camera_type, frame_number, board=None, debug_dir=None, brightness_boost=None
+    image,
+    camera_type,
+    frame_number,
+    board=None,
+    debug_dir=None,
+    brightness_boost=None,
+    board_size=DEFAULT_BOARD_SIZE,
 ):
-    from rocsync.board_profiles import PROFILES_BY_ARUCO
-
     match camera_type:
         case CameraType.RGB:
             # Detect ArUco markers
@@ -316,12 +306,13 @@ def process_frame(
             if board is None:
                 for marker_id, corners in markers.items():
                     if marker_id in PROFILES_BY_ARUCO:
-                        board = PROFILES_BY_ARUCO[marker_id]
+                        board = PROFILES_BY_ARUCO[marker_id].rectify(board_size)
                         aruco_corners = corners
                         break
                 else:
                     return False, None
             else:
+                board = board.rectify(board_size)
                 if board.aruco_marker_id not in markers:
                     return False, None
                 aruco_corners = markers[board.aruco_marker_id]
@@ -342,8 +333,6 @@ def process_frame(
                 )
                 return False, None
 
-            board_size = board.board_size
-
             red_channel = image[:, :, 2]
             mask = red_channel
 
@@ -358,9 +347,12 @@ def process_frame(
             if corners is None:
                 return True, None
 
-            s = board.perspective_corner_slice
+            # Only the four anchors define the transform; any extra always-on dots were
+            # matched purely as a sanity check.
             transformation_matrix = np.dot(
-                cv2.getPerspectiveTransform(corners[s], board.corner_dots[s]),
+                cv2.getPerspectiveTransform(
+                    corners[:4], board.transform_corners(CameraType.RGB)
+                ),
                 rough_transformation_matrix,
             )
             pcb = cv2.warpPerspective(
@@ -372,8 +364,7 @@ def process_frame(
                 raise ValueError(
                     "IR mode requires an explicit board version (--board-version)"
                 )
-
-            board_size = board.board_size
+            board = board.rectify(board_size)
 
             gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             _, mask = cv2.threshold(
@@ -384,7 +375,7 @@ def process_frame(
             if corners is None:
                 return False, None
             transformation_matrix = cv2.getPerspectiveTransform(
-                corners, board.ir_corners
+                corners, board.transform_corners(CameraType.INFRARED)
             )
             pcb = cv2.warpPerspective(
                 mask, transformation_matrix, (board_size, board_size)

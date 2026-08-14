@@ -6,12 +6,11 @@ import subprocess
 
 import cv2
 from rocsync.printer import errprint, succprint, warnprint
+from rocsync.timeline import affine_from_statistics, per_frame_times
 
 
 def hevc_nvenc_available() -> bool:
-    """Whether this ffmpeg can encode with hevc_nvenc, which is far faster than
-    libx265. Probed once up front rather than per encode: it shells out, and the
-    answer cannot change while we run."""
+    """Whether this ffmpeg can encode with hevc_nvenc, which is far faster than libx265."""
     try:
         encoders = subprocess.check_output(
             ["ffmpeg", "-hide_banner", "-encoders"], text=True
@@ -24,9 +23,10 @@ def hevc_nvenc_available() -> bool:
 def reap(
     running: list[tuple[str, subprocess.Popen]], failed: list[str], block: bool
 ) -> None:
-    """Remove finished encodes from `running`, appending their input path to
-    `failed` if ffmpeg exited non-zero. With `block`, waits for the oldest
-    encode to finish first, so the caller makes progress instead of spinning."""
+    """Drop finished encodes from `running`, recording non-zero exits in `failed`.
+
+    With `block`, waits for the oldest encode first instead of spinning.
+    """
     if block and running:
         running[0][1].wait()
     for entry in list(running):
@@ -111,6 +111,39 @@ def main():
         warnprint(
             "hevc_nvenc not available, encoding will be very slow. Install NVIDIA drivers and ffmpeg with nvenc support or disable drift compensation."
         )
+    if not args.compensate_drift:
+        warnprint(
+            "Stream copy can only cut at a keyframe; the rest is left to a container "
+            "edit list. Use --compensate-drift for a frame-exact start."
+        )
+
+    # first_frame/last_frame only cover the analyzed frames, so measure the files
+    spans = {}
+    for file, statistics in videos.items():
+        try:
+            board_times = per_frame_times(file, statistics)
+        except (OSError, KeyError) as e:
+            errprint(f"Cannot determine the board-time span of {file}: {e}")
+            return 1
+        if not board_times:
+            errprint(f"No frames found in {file}; cannot align it.")
+            return 1
+        spans[file] = (board_times[0], board_times[-1])
+
+    # Window covered by every video, in board time
+    origin_ms = max(start for start, _ in spans.values())
+    end_ms = min(end for _, end in spans.values())
+    if origin_ms >= end_ms:
+        errprint(
+            f"The videos have no common time span: the latest start "
+            f"({origin_ms:.1f} ms board time) is at or after the earliest end "
+            f"({end_ms:.1f} ms). They do not overlap and cannot be aligned."
+        )
+        return 1
+    print(
+        f"Aligning to board time {origin_ms:.1f} ms, keeping "
+        f"{(end_ms - origin_ms) / 1000:.3f} s up to {end_ms:.1f} ms"
+    )
 
     running: list[tuple[str, subprocess.Popen]] = []
     failed: list[str] = []
@@ -136,6 +169,11 @@ def main():
                 print(f"Skipping {file}, already synced.")
                 continue
 
+        # -ss and -t are container time, so map the window through this video's fit
+        clock_rate, clock_offset_ms = affine_from_statistics(statistics)
+        cut_time = (origin_ms - clock_offset_ms) / clock_rate / 1000
+        duration = (end_ms - origin_ms) / clock_rate / 1000
+
         # ffmpeg runs in the background, so throttle before starting another one
         while args.jobs and len(running) >= args.jobs:
             reap(running, failed, block=True)
@@ -145,7 +183,9 @@ def main():
                 file,
                 sync_video(
                     file,
-                    statistics,
+                    cut_time,
+                    duration,
+                    clock_rate,
                     output_file=output_file,
                     frame_rate=expected_fps,
                     compensate_drift=args.compensate_drift,
@@ -167,17 +207,16 @@ def main():
 
 def sync_video(
     video_path: str,
-    stats: dict,
-    offset: float = 0,
+    cut_time: float,
+    duration: float,
+    clock_rate: float,
     output_file: str = "synced.mp4",
     frame_rate: int = 30,
     compensate_drift: bool = True,
     use_nvenc: bool = False,
 ) -> subprocess.Popen:
-    cut_time = stats["first_frame"] * (-1 / 1000) + offset  # in seconds
-
-    # Board ms per container ms, as fitted against the frames' own presentation timestamps. Warn if not close to 1.0
-    clock_rate = stats["clock_rate"]
+    """Cut `duration` seconds starting `cut_time` seconds into the video, both in
+    container time, rescaling by `clock_rate` if drift is compensated."""
     if abs(clock_rate - 1) > 0.05:
         warnprint(
             f"Video clock runs at {clock_rate:.4f}x board time; "
@@ -187,9 +226,11 @@ def sync_video(
     ffmpeg_command = [
         "ffmpeg",
         "-ss",
-        str(cut_time),
+        f"{cut_time:.6f}",
         "-i",
         video_path,
+        "-t",
+        f"{duration:.6f}",
     ]
 
     if compensate_drift:

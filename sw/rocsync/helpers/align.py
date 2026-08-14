@@ -1,10 +1,43 @@
 import argparse
 import json
 import os
+import shlex
 import subprocess
 
 import cv2
-from rocsync.printer import errprint, warnprint
+from rocsync.printer import errprint, succprint, warnprint
+
+
+def hevc_nvenc_available() -> bool:
+    """Whether this ffmpeg can encode with hevc_nvenc, which is far faster than
+    libx265. Probed once up front rather than per encode: it shells out, and the
+    answer cannot change while we run."""
+    try:
+        encoders = subprocess.check_output(
+            ["ffmpeg", "-hide_banner", "-encoders"], text=True
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return "hevc_nvenc" in encoders
+
+
+def reap(
+    running: list[tuple[str, subprocess.Popen]], failed: list[str], block: bool
+) -> None:
+    """Remove finished encodes from `running`, appending their input path to
+    `failed` if ffmpeg exited non-zero. With `block`, waits for the oldest
+    encode to finish first, so the caller makes progress instead of spinning."""
+    if block and running:
+        running[0][1].wait()
+    for entry in list(running):
+        path, process = entry
+        returncode = process.poll()
+        if returncode is None:
+            continue
+        running.remove(entry)
+        if returncode != 0:
+            failed.append(path)
+            errprint(f"ffmpeg exited with {returncode} for {path}")
 
 
 def main():
@@ -34,8 +67,17 @@ def main():
         default=None,
         help="Target frame rate for synchronized videos. If not specified, uses the source frame rate of the first video",
     )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=4,
+        help="Maximum number of ffmpeg processes to run concurrently, or 0 for no limit (default: 4)",
+    )
 
     args = parser.parse_args()
+
+    if args.jobs < 0:
+        parser.error("--jobs must be 0 (unlimited) or a positive number")
 
     with open(args.sync_file, "r") as file:
         stats = json.load(file)
@@ -64,7 +106,15 @@ def main():
     )
     print(f"Syncing {len(videos)} videos to {expected_fps} FPS")
 
-    processes = []
+    use_nvenc = args.compensate_drift and hevc_nvenc_available()
+    if args.compensate_drift and not use_nvenc:
+        warnprint(
+            "hevc_nvenc not available, encoding will be very slow. Install NVIDIA drivers and ffmpeg with nvenc support or disable drift compensation."
+        )
+
+    running: list[tuple[str, subprocess.Popen]] = []
+    failed: list[str] = []
+    started = 0
     for file, statistics in videos.items():
         # Check if the output file already exists
         video_name, _ = os.path.splitext(os.path.basename(file))
@@ -86,18 +136,33 @@ def main():
                 print(f"Skipping {file}, already synced.")
                 continue
 
-        processes.append(
-            sync_video(
+        # ffmpeg runs in the background, so throttle before starting another one
+        while args.jobs and len(running) >= args.jobs:
+            reap(running, failed, block=True)
+
+        running.append(
+            (
                 file,
-                statistics,
-                output_file=output_file,
-                frame_rate=expected_fps,
-                compensate_drift=args.compensate_drift,
+                sync_video(
+                    file,
+                    statistics,
+                    output_file=output_file,
+                    frame_rate=expected_fps,
+                    compensate_drift=args.compensate_drift,
+                    use_nvenc=use_nvenc,
+                ),
             )
         )
+        started += 1
 
-    for p in processes:
-        p.wait()
+    while running:
+        reap(running, failed, block=True)
+
+    if failed:
+        errprint(f"{len(failed)} of {started} encoded videos failed.")
+        return 1
+
+    succprint(f"Aligned {started} videos into {args.output_dir}")
 
 
 def sync_video(
@@ -107,6 +172,7 @@ def sync_video(
     output_file: str = "synced.mp4",
     frame_rate: int = 30,
     compensate_drift: bool = True,
+    use_nvenc: bool = False,
 ) -> subprocess.Popen:
     cut_time = stats["first_frame"] * (-1 / 1000) + offset  # in seconds
 
@@ -117,21 +183,6 @@ def sync_video(
             f"Video clock runs at {clock_rate:.4f}x board time; "
             f"drift compensation will rescale it substantially."
         )
-
-    # Check if nvenc is available for speed up
-    nvenc_available = False
-    if compensate_drift:
-        try:
-            cmd = "ffmpeg -hide_banner -encoders | grep hevc_nvenc"
-            encoders = subprocess.check_output(cmd, shell=True).decode("utf-8")
-            if "hevc_nvenc" not in encoders:
-                raise subprocess.CalledProcessError(1, cmd)
-            else:
-                nvenc_available = True
-        except subprocess.CalledProcessError:
-            warnprint(
-                "hevc_nvenc not available, encoding will be very slow. Install NVIDIA drivers and ffmpeg with nvenc support or disable drift compensation."
-            )
 
     ffmpeg_command = [
         "ffmpeg",
@@ -144,11 +195,11 @@ def sync_video(
     if compensate_drift:
         ffmpeg_command += [
             "-c:v",
-            "hevc_nvenc" if nvenc_available else "libx265",
+            "hevc_nvenc" if use_nvenc else "libx265",
             "-crf",
             "0",
             "-filter_complex",
-            f'"setpts=PTS*{clock_rate}"',
+            f"setpts=PTS*{clock_rate}",
             "-r",
             str(frame_rate),
         ]
@@ -162,13 +213,11 @@ def sync_video(
         output_file,
     ]
 
-    cmd_str = " ".join(ffmpeg_command)
-    print(cmd_str)
+    # No shell: the arguments go to ffmpeg verbatim, so paths containing spaces
+    # survive. shlex.join only builds the human-readable echo of the command.
+    print(shlex.join(ffmpeg_command))
 
-    process = subprocess.Popen(cmd_str, shell=True)
-    stdout, sterr = process.communicate()
-
-    return process
+    return subprocess.Popen(ffmpeg_command)
 
 
 if __name__ == "__main__":

@@ -165,6 +165,14 @@ def main():
 
     args = parser.parse_args()
 
+    # Auto-detection identifies the board from its ArUco marker, which is invisible in IR
+    if args.camera_type == CameraType.INFRARED.value and args.board_version == "auto":
+        parser.error(
+            f"-c {CameraType.INFRARED.value} requires an explicit --board-version "
+            f"(choices: {', '.join(PROFILES_BY_NAME)}); auto-detection needs the "
+            "ArUco marker, which is not visible in IR"
+        )
+
     board = (
         PROFILES_BY_NAME.get(args.board_version)
         if args.board_version != "auto"

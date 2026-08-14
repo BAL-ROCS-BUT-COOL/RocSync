@@ -395,6 +395,9 @@ def process_frame(
             if read_counter(pcb, CameraType.INFRARED, board) == 0:
                 return True, None  # Counter was actually 0, can't determine orientation
 
+        case _:
+            raise ValueError(f"Unsupported camera type: {camera_type!r}")
+
     # Sample the pristine board; overlays go onto a separate canvas
     debug_canvas = cv2.cvtColor(pcb, cv2.COLOR_GRAY2BGR) if debug_dir else None
 

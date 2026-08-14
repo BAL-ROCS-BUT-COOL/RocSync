@@ -20,10 +20,10 @@ class VideoStatistics:
     expected_fps: float  # nominal rate reported by the container
     measured_fps: float  # 1000 / median frame period
 
-    # Affine map from container presentation time to board time, in ms:
-    # board_ms = speed_factor * pts_ms + intercept
-    speed_factor: float
-    intercept: float
+    # Affine map from source clock time to board time, in ms:
+    # board_ms = clock_rate * source_ms + clock_offset_ms
+    clock_rate: float
+    clock_offset_ms: float
 
     # Start and end
     first_frame: float

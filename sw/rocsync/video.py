@@ -84,7 +84,7 @@ def export_frames(video_path, output_path, fit, n_frames=None):
             frame, frame_number, pts_ms = frame_queue.get()  # blocking wait
             if frame is None:
                 break
-            timestamp = fit.slope * pts_ms + fit.intercept
+            timestamp = fit.clock_rate * pts_ms + fit.clock_offset_ms
             futures.append(
                 executor.submit(
                     cv2.imwrite,
@@ -282,8 +282,8 @@ def process_video(
         return
 
     # Fit a robust linear model of board time against the frames' own
-    # presentation timestamps. Both axes are in milliseconds, so the slope is
-    # the clock rate and the intercept is the clock offset.
+    # presentation timestamps. Both axes are in milliseconds, so the clock_rate is
+    # the clock rate and the clock_offset_ms is the clock offset.
     period = median_frame_period(frame_times.values(), fallback=nominal_period)
     try:
         fit = fit_timeline(frame_times, timestamps, fallback_period=nominal_period)
@@ -302,9 +302,9 @@ def process_video(
         warnprint(
             f"WARNING: Estimated model has fewer than 80% inliers ({np.sum(fit.inlier_mask) / len(fit.order):.2%})."
         )
-    if abs(fit.slope - 1) > 0.05:
+    if abs(fit.clock_rate - 1) > 0.05:
         warnprint(
-            f"WARNING: Container clock runs at {fit.slope:.4f}x board time; "
+            f"WARNING: Container clock runs at {fit.clock_rate:.4f}x board time; "
             f"expected approximately 1x."
         )
 
@@ -350,26 +350,15 @@ def process_video(
 
     # Calculate statistics. The span is anchored on the first and last frame
     # actually present, so nothing is extrapolated to a frame that may not exist.
+    fit_stats = fit.to_dict()
     pts_min, pts_max = min(frame_times.values()), max(frame_times.values())
-    first_frame = float(fit.predict(pts_min))
-    last_frame = float(fit.predict(pts_max))
     exposure_times = [end - start for start, end, _ in filtered_timestamps.values()]
     statistics = VideoStatistics(
         n_frames=n_frames,
-        n_considered_frames=len(filtered_timestamps),
-        n_rejected_frames=len(timestamps) - len(filtered_timestamps),
-        r2_before=fit.r2_before,
-        rmse_before=fit.rmse_before,
-        r2_after=fit.r2_after,
-        rmse_after=fit.rmse_after,
         expected_duration=pts_max - pts_min,
-        measured_duration=last_frame - first_frame,
+        measured_duration=fit_stats["last_frame"] - fit_stats["first_frame"],
         expected_fps=fps,
         measured_fps=1000 / period,
-        speed_factor=fit.slope,
-        intercept=fit.intercept,
-        first_frame=first_frame,
-        last_frame=last_frame,
         median_frame_period=period,
         n_gaps=n_gaps,
         n_dropped_frames=n_dropped_frames,
@@ -381,6 +370,7 @@ def process_video(
         std_exposure_time=np.std(exposure_times),
         considered_timestamps=filtered_timestamps,
         rejected_timestamps=rejected_timestamps,
+        **fit_stats,
     )
 
     print_statistics(statistics)
@@ -443,7 +433,7 @@ def print_statistics(statistics: VideoStatistics):
     print(
         format_str.format(
             "Clock rate (board/container):",
-            f"{statistics.speed_factor:.6f}x",
+            f"{statistics.clock_rate:.6f}x",
         )
     )
     scope = "analyzed window" if statistics.timeline_windowed else "container"
@@ -481,7 +471,7 @@ def plot_timechart(
     plt.plot(span / 1000, fit.predict(span), color="blue", label="Fitted frametime")
 
     # A perfectly matched clock would run parallel to this, so drift shows up as
-    # divergence from it rather than as an overall slope
+    # divergence from it rather than as an overall clock_rate
     plt.plot(
         span / 1000,
         fit.predict(pts_min) + (span - pts_min),

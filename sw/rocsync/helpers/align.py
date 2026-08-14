@@ -98,10 +98,10 @@ def sync_video(
     # timestamps. It corrects genuine clock drift only, so it sits very close to
     # 1 and rescaling here is close to a no-op; a value far from 1 means the fit
     # found a real rate mismatch and the re-encode below is doing real work.
-    speed_factor = stats["speed_factor"]
-    if abs(speed_factor - 1) > 0.05:
+    clock_rate = stats["clock_rate"]
+    if abs(clock_rate - 1) > 0.05:
         warnprint(
-            f"Video clock runs at {speed_factor:.4f}x board time; "
+            f"Video clock runs at {clock_rate:.4f}x board time; "
             f"drift compensation will rescale it substantially."
         )
 
@@ -135,7 +135,7 @@ def sync_video(
             "-crf",
             "0",
             "-filter_complex",
-            f'"setpts=PTS*{speed_factor}"',
+            f'"setpts=PTS*{clock_rate}"',
             "-r",
             str(frame_rate),
         ]

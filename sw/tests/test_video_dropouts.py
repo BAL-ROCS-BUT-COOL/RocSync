@@ -131,8 +131,8 @@ def test_process_video_recovers_the_clock_across_a_dropout(gap_video, board_at_p
 
     # The container clock is correct as it stands, so no rescaling is needed.
     # Fitting on the frame index instead would misplace this by the 1.5 s hole.
-    assert statistics.speed_factor == pytest.approx(1.0, abs=1e-4)
-    assert statistics.intercept == pytest.approx(OFFSET, abs=1.0)
+    assert statistics.clock_rate == pytest.approx(1.0, abs=1e-4)
+    assert statistics.clock_offset_ms == pytest.approx(OFFSET, abs=1.0)
     assert statistics.first_frame == pytest.approx(OFFSET, abs=1.0)
     assert statistics.rmse_after < 1.0
     assert statistics.n_rejected_frames == 0

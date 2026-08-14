@@ -131,12 +131,12 @@ def compute_global_time_from_camera(
     """
     Convert a time given in camera-local units to GLOBAL ms through the camera's
     fitted clock. Local time is a position in the container's own timeline, which
-    is what the fit maps, so the intercept is the correct anchor.
+    is what the fit maps, so the clock_offset_ms is the correct anchor.
     (Same math as in Clip._convert_to_real_time, but for a single time.)
     """
     local_ms = _parse_timecode_to_milliseconds(time_string)
-    slope, intercept = affine_from_statistics(camera_time_sync_data)
-    return float(intercept + slope * local_ms)
+    clock_rate, clock_offset_ms = affine_from_statistics(camera_time_sync_data)
+    return float(clock_offset_ms + clock_rate * local_ms)
 
 
 def validate_moment_in_overlap(

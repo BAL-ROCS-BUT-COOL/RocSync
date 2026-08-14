@@ -5,9 +5,9 @@ clock is a direct measurement of when each frame was shown. Fitting board time
 against that timestamp -- rather than against the frame index -- keeps the fit
 correct when frames are missing: a dropped span is a gap in the timestamps, not
 a constant shift of every later index that the fit would have to absorb into
-its slope and offset.
+its clock_rate and offset.
 
-The result is a plain affine map, board_ms = slope * pts_ms + intercept, which
+The result is a plain affine map, board_ms = clock_rate * pts_ms + clock_offset_ms, which
 is all any consumer needs in order to time a frame it has just decoded.
 """
 
@@ -23,8 +23,8 @@ from sklearn.metrics import root_mean_squared_error
 class TimelineFit:
     """Affine map from container presentation time to RocSync board time."""
 
-    slope: float  # board ms per container ms
-    intercept: float  # board ms at pts == 0
+    clock_rate: float  # board ms per container ms
+    clock_offset_ms: float  # board ms at pts == 0
     order: list  # frame indices, in the order they entered the fit
     inlier_mask: np.ndarray = field(repr=False)
     r2_before: float
@@ -32,10 +32,27 @@ class TimelineFit:
     r2_after: float
     rmse_after: float
     residual_threshold: float
+    source_time_min: float  # smallest source-clock value among all measurements offered to the fit
+    source_time_max: float  # largest source-clock value among all measurements offered to the fit
 
     def predict(self, pts_ms):
         """Board time in ms for one or many container timestamps in ms."""
-        return self.slope * np.asarray(pts_ms, dtype=float) + self.intercept
+        return self.clock_rate * np.asarray(pts_ms, dtype=float) + self.clock_offset_ms
+
+    def to_dict(self) -> dict:
+        """Fit-derived fields shared by every clock-fit producer (video, FTK)."""
+        return {
+            "clock_rate": self.clock_rate,
+            "clock_offset_ms": self.clock_offset_ms,
+            "r2_before": self.r2_before,
+            "rmse_before": self.rmse_before,
+            "r2_after": self.r2_after,
+            "rmse_after": self.rmse_after,
+            "n_considered_frames": int(np.sum(self.inlier_mask)),
+            "n_rejected_frames": int(np.sum(~self.inlier_mask)),
+            "first_frame": float(self.predict(self.source_time_min)),
+            "last_frame": float(self.predict(self.source_time_max)),
+        }
 
 
 def median_frame_period(pts, fallback=None):
@@ -106,6 +123,9 @@ def fit_timeline(
             f"timestamp, got {len(order)}."
         )
 
+    valid_source_times = [v for v in frame_times.values() if v is not None]
+    source_time_min, source_time_max = min(valid_source_times), max(valid_source_times)
+
     x = np.array([frame_times[k] for k in order], dtype=float).reshape(-1, 1)
     y = np.array([timestamps[k][0] for k in order], dtype=float)
 
@@ -125,8 +145,8 @@ def fit_timeline(
     inlier_mask = model.inlier_mask_
     inlier_x, inlier_y = x[inlier_mask], y[inlier_mask]
     return TimelineFit(
-        slope=float(model.estimator_.coef_[0]),
-        intercept=float(model.estimator_.intercept_),
+        clock_rate=float(model.estimator_.coef_[0]),
+        clock_offset_ms=float(model.estimator_.intercept_),
         order=order,
         inlier_mask=inlier_mask,
         r2_before=model.score(x, y),
@@ -134,6 +154,8 @@ def fit_timeline(
         r2_after=model.score(inlier_x, inlier_y),
         rmse_after=root_mean_squared_error(inlier_y, model.predict(inlier_x)),
         residual_threshold=threshold,
+        source_time_min=source_time_min,
+        source_time_max=source_time_max,
     )
 
 
@@ -157,19 +179,15 @@ def frame_pts(video_path):
 
 
 def affine_from_statistics(statistics):
-    """(slope, intercept) out of one entry of the JSON written by `rocsync`.
-
-    Video entries name the slope `speed_factor`, device recordings name it
-    `slope`; both mean board ms per source ms.
-    """
-    slope = statistics.get("speed_factor", statistics.get("slope"))
-    intercept = statistics.get("intercept")
-    if slope is None or intercept is None:
+    """(clock_rate, clock_offset_ms) out of one entry of the JSON written by `rocsync`."""
+    clock_rate = statistics.get("clock_rate")
+    clock_offset_ms = statistics.get("clock_offset_ms")
+    if clock_rate is None or clock_offset_ms is None:
         raise KeyError(
-            "Time-sync data has no slope/intercept; it predates the "
+            "Time-sync data has no clock_rate/clock_offset_ms; it predates the "
             "presentation-timestamp fit. Re-run rocsync to regenerate it."
         )
-    return float(slope), float(intercept)
+    return float(clock_rate), float(clock_offset_ms)
 
 
 def per_frame_times(video_path, statistics):
@@ -178,5 +196,5 @@ def per_frame_times(video_path, statistics):
     Frame times are read from the video itself, so dropped frames stay where
     they actually are instead of being smeared across a constant-rate timeline.
     """
-    slope, intercept = affine_from_statistics(statistics)
-    return [slope * p + intercept for p in frame_pts(video_path)]
+    clock_rate, clock_offset_ms = affine_from_statistics(statistics)
+    return [clock_rate * p + clock_offset_ms for p in frame_pts(video_path)]

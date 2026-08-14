@@ -5,7 +5,7 @@ from tqdm import tqdm
 
 from rocsync.board_profiles import PROFILES_BY_FTK, BoardProfile
 from rocsync.camera import CameraType
-from rocsync.timeline import fit_timeline
+from rocsync.timeline import detect_dropouts, fit_timeline, median_frame_period
 
 DISTANCE_THRESHOLD = 3
 
@@ -185,24 +185,46 @@ def plot_timechart(x, y, x_range, y_pred, debug_dir):
     plt.savefig(f"{debug_dir}/timestamps.png")
 
 
-def fit_ftk_timestamps(timestamps: dict[int, tuple[int, int]], debug_dir=None) -> dict:
+def fit_ftk_timestamps(
+    timestamps: dict[int, tuple[int, int]],
+    frame_times: dict[int, int],
+    debug_dir=None,
+) -> dict:
     # The device reports its own clock, so regress board time directly on it.
     # Not frame-periodic, hence an explicit residual threshold.
-    device_times = {k: k for k in timestamps}
     fit = fit_timeline(
-        device_times,
+        frame_times,
         timestamps,
         residual_threshold=10,
         max_trials=10000,  # more trials for more consistent results
     )
 
-    results = {
-        "slope": fit.slope,
-        "intercept": fit.intercept,
-        "rmse_after": fit.rmse_after,
-        "n_considered_frames": int(np.sum(fit.inlier_mask)),
-        "n_rejected_frames": int(np.sum(~fit.inlier_mask)),
+    period = median_frame_period(frame_times.values())
+    n_gaps, n_dropped_frames, largest_gap_ms, _ = detect_dropouts(
+        frame_times.values(), period
+    )
+
+    considered = {
+        k: timestamps[k]
+        for k, is_inlier in zip(fit.order, fit.inlier_mask)
+        if is_inlier
     }
+    exposure_times = [end - start for start, end in considered.values()]
+
+    results = fit.to_dict()
+    results.update(
+        {
+            "n_frames": len(frame_times),
+            "median_frame_period": period,
+            "n_gaps": n_gaps,
+            "n_dropped_frames": n_dropped_frames,
+            "largest_gap_ms": largest_gap_ms,
+            "mean_exposure_time": float(np.mean(exposure_times)),
+            "min_exposure_time": float(np.min(exposure_times)),
+            "max_exposure_time": float(np.max(exposure_times)),
+            "std_exposure_time": float(np.std(exposure_times)),
+        }
+    )
 
     if debug_dir is not None:
         x = np.array(fit.order).reshape(-1, 1)
@@ -217,6 +239,7 @@ def process_ftk_recording(filename: str, debug_dir=None) -> dict:
         total_lines = sum(1 for _ in file)
 
     timestamps = {}
+    frame_times = {}
     with open(filename, "r") as file:
         with tqdm(total=total_lines, desc="Processing lines") as pbar:
             while True:
@@ -234,6 +257,12 @@ def process_ftk_recording(filename: str, debug_dir=None) -> dict:
                     board = PROFILES_BY_FTK.get(int(marker["marker_id"]))
                     if board is None:
                         continue
+
+                    # Record every frame the tracker reported for this board,
+                    # whether or not the counter/ring below decodes: the frame
+                    # count and any dropouts are measured off this map.
+                    ftk_timestamp = int(marker["ftk_timestamp"])
+                    frame_times[ftk_timestamp] = ftk_timestamp
 
                     # Read and collect all related fiducials (type "f") immediately after this marker
                     fiducials = []
@@ -342,6 +371,6 @@ def process_ftk_recording(filename: str, debug_dir=None) -> dict:
                     if result is not None:
                         timestamps[int(marker["ftk_timestamp"])] = result
     if len(timestamps) > 0:
-        statistics = fit_ftk_timestamps(timestamps, debug_dir)
+        statistics = fit_ftk_timestamps(timestamps, frame_times, debug_dir)
         return statistics
     return None

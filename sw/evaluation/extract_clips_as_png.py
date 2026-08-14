@@ -170,14 +170,14 @@ def main(config: Config) -> None:
             )
 
         time_defining_camera_time_sync_data = time_sync_data[matching_key]
-        defining_slope, defining_intercept = affine_from_statistics(
+        defining_clock_rate, defining_clock_offset_ms = affine_from_statistics(
             time_defining_camera_time_sync_data
         )
         clips = _parse_clips_to_extract_json(
             config.clips_to_extract_json,
             from_camera_time=True,
-            intercept=defining_intercept,
-            slope=defining_slope,
+            clock_offset_ms=defining_clock_offset_ms,
+            clock_rate=defining_clock_rate,
         )
     else:
         clips = _parse_clips_to_extract_json(config.clips_to_extract_json)
@@ -237,12 +237,12 @@ class Clip:
         start_string: str,
         end_string: str,
         from_camera_time: bool = False,
-        intercept: float = None,
-        slope: float = None,
+        clock_offset_ms: float = None,
+        clock_rate: float = None,
     ) -> None:
         if from_camera_time:
             start_string, end_string = self._convert_to_real_time(
-                start_string, end_string, intercept, slope
+                start_string, end_string, clock_offset_ms, clock_rate
             )
         self.start = self._parse_timecode_to_milliseconds(start_string)
         self.end = self._parse_timecode_to_milliseconds(end_string)
@@ -255,14 +255,14 @@ class Clip:
         self,
         start_string: str,
         end_string: str,
-        intercept: float,
-        slope: float,
+        clock_offset_ms: float,
+        clock_rate: float,
     ) -> tuple[str, str]:
         start = self._parse_timecode_to_milliseconds(start_string)
         end = self._parse_timecode_to_milliseconds(end_string)
 
-        start_real = int(round(intercept + slope * start))
-        end_real = int(round(intercept + slope * end))
+        start_real = int(round(clock_offset_ms + clock_rate * start))
+        end_real = int(round(clock_offset_ms + clock_rate * end))
 
         start_real_string = self._parse_timecode_to_milliseconds_inverse(start_real)
         end_real_string = self._parse_timecode_to_milliseconds_inverse(end_real)
@@ -294,8 +294,8 @@ class Clip:
 def _parse_clips_to_extract_json(
     path: str,
     from_camera_time: bool = False,
-    intercept: float = None,
-    slope: float = None,
+    clock_offset_ms: float = None,
+    clock_rate: float = None,
 ) -> List[Clip]:
     with open(path, "r", encoding="utf-8") as f:
         clips_raw = json.load(f)
@@ -306,8 +306,8 @@ def _parse_clips_to_extract_json(
             clip["start"],
             clip["end"],
             from_camera_time=from_camera_time,
-            intercept=intercept,
-            slope=slope,
+            clock_offset_ms=clock_offset_ms,
+            clock_rate=clock_rate,
         )
         clips.append(c)
 

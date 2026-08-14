@@ -23,12 +23,14 @@ def test_piecewise():
     board = BOARD_V2.rectify()
     board_size = board.board_size
     TEST_DIR = Path(__file__).resolve().parents[0]
+    TEST_OUT_DIR = TEST_DIR / "output" / "piecewise"
+    TEST_OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # prepare the pcb ----------------------------------------------------------
     image = cv.imread(TEST_DIR / "img1.jpg")
 
     markers = find_corners_aruco(
-        image, frame_number=999, debug_dir=TEST_DIR / "output_piecewise"
+        image, frame_number=999, debug_dir=TEST_OUT_DIR
     )
     assert board.aruco_marker_id in markers, "ArUco marker was not detected"
     aruco_corners = markers[board.aruco_marker_id]
@@ -39,11 +41,11 @@ def test_piecewise():
     rough_pcb = cv.warpPerspective(
         red_channel, rough_transformation_matrix, (board_size, board_size)
     )
-    cv.imwrite(TEST_DIR / "output_piecewise" / "rough_pcb.jpg", rough_pcb)
+    cv.imwrite(TEST_OUT_DIR / "rough_pcb.jpg", rough_pcb)
 
     # Matches every always-on dot, including the 5th one, as a sanity check
     corners = find_corners_dots(
-        rough_pcb, 999, board, debug_dir=TEST_DIR / "output_piecewise"
+        rough_pcb, 999, board, debug_dir=TEST_OUT_DIR
     )
     assert corners is not None, "always-on corner dots were not detected"
 
@@ -58,7 +60,7 @@ def test_piecewise():
         red_channel, transformation_matrix, (board_size, board_size)
     )
 
-    cv.imwrite(TEST_DIR / "output_piecewise" / "pcb.jpg", pcb)
+    cv.imwrite(TEST_OUT_DIR / "pcb.jpg", pcb)
 
     # decode the ring (should remain the same) ---------------------------------
     ring = read_ring(pcb, camera_type=CameraType.RGB, board=board, draw_result=True)
@@ -75,6 +77,8 @@ def test_full():
     """test the full process_frame function for validation."""
 
     TEST_DIR = Path(__file__).resolve().parents[0]
+    TEST_OUT_DIR = TEST_DIR / "output" / "full"
+    TEST_OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # prepare the pcb ----------------------------------------------------------
     image = cv.imread(TEST_DIR / "img1.jpg")
@@ -84,7 +88,7 @@ def test_full():
         camera_type=CameraType.RGB,
         frame_number=999,
         board=BOARD_V2,
-        debug_dir=TEST_DIR / "output_full",
+        debug_dir=TEST_OUT_DIR,
     )
     print(f"output of process frame was: {out}")
 

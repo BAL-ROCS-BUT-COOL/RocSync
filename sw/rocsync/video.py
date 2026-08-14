@@ -501,13 +501,13 @@ def plot_timechart(
     x = np.array([frame_times[k] for k in filtered_timestamps]) / 1000
     y = np.array([start for start, _, _ in filtered_timestamps.values()])
 
-    plt.figure()
-    plt.scatter(x, y, color="blue", label="Measurements")
-    plt.plot(span / 1000, fit.predict(span), color="blue", label="Fitted frametime")
+    fig, ax = plt.subplots()
+    ax.scatter(x, y, color="blue", label="Measurements")
+    ax.plot(span / 1000, fit.predict(span), color="blue", label="Fitted frametime")
 
     # A perfectly matched clock would run parallel to this, so drift shows up as
     # divergence from it rather than as an overall clock_rate
-    plt.plot(
+    ax.plot(
         span / 1000,
         fit.predict(pts_min) + (span - pts_min),
         color="red",
@@ -515,7 +515,7 @@ def plot_timechart(
     )
 
     if rejected_timestamps:
-        plt.scatter(
+        ax.scatter(
             np.array([frame_times[k] for k in rejected_timestamps]) / 1000,
             [start for start, _, _ in rejected_timestamps.values()],
             color="red",
@@ -523,32 +523,34 @@ def plot_timechart(
             label="Rejected outliers",
         )
     for before, after, _ in gaps:
-        plt.axvspan(before / 1000, after / 1000, color="grey", alpha=0.3)
+        ax.axvspan(before / 1000, after / 1000, color="grey", alpha=0.3)
     if gaps:
-        plt.axvspan(np.nan, np.nan, color="grey", alpha=0.3, label="Dropped frames")
+        ax.axvspan(np.nan, np.nan, color="grey", alpha=0.3, label="Dropped frames")
 
-    plt.xlabel("Presentation timestamp [s]")
-    plt.ylabel("Time relative to RocSync [ms]")
-    plt.title("Frame timing")
-    plt.gca().ticklabel_format(style="plain", useOffset=False)
-    plt.legend()
-    plt.grid(True)
-    ax2 = plt.gca().twinx()
+    ax.set_xlabel("Presentation timestamp [s]")
+    ax.set_ylabel("Time relative to RocSync [ms]")
+    ax.set_title("Frame timing")
+    ax.ticklabel_format(style="plain", useOffset=False)
+    ax.legend()
+    ax.grid(True)
+    ax2 = ax.twinx()
     ax2.scatter(x, exposure_times, color="green", label="Exposure time [ms]")
     ax2.set_ylabel("Exposure time [ms]")
     ax2.ticklabel_format(style="plain", useOffset=False)
     ax2.yaxis.set_major_locator(MaxNLocator(integer=True))
     ax2.legend(loc="upper right")
-    plt.savefig(f"{debug_dir}/timestamps.png")
+    fig.savefig(f"{debug_dir}/timestamps.png")
+    plt.close(fig)
 
 
 def plot_exposure_histogram(exposure_times, debug_dir):
-    plt.figure()
+    fig, ax = plt.subplots()
     unique_values, counts = np.unique(exposure_times, return_counts=True)
-    bar = plt.bar(unique_values, counts)
-    plt.bar_label(bar, counts)
-    plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
-    plt.xlabel("Exposure time [ms]")
-    plt.ylabel("Number of measured frames")
-    plt.title("Exposure time histogram")
-    plt.savefig(f"{debug_dir}/exposure.png")
+    bar = ax.bar(unique_values, counts)
+    ax.bar_label(bar, counts)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.set_xlabel("Exposure time [ms]")
+    ax.set_ylabel("Number of measured frames")
+    ax.set_title("Exposure time histogram")
+    fig.savefig(f"{debug_dir}/exposure.png")
+    plt.close(fig)

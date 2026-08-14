@@ -163,16 +163,17 @@ def process_frame(
 
 
 def plot_timechart(x, y, x_range, y_pred, debug_dir):
-    plt.figure()
-    plt.scatter(x, y, color="blue", label="Measurements", marker=".")
-    plt.plot(x_range, y_pred, color="r", label="Fitted Model")
-    plt.xlabel("Device timestamp")
-    plt.ylabel("RocSync timestamp [ms]")
-    plt.title("Frame timing")
-    plt.gca().ticklabel_format(style="plain", useOffset=False)
-    plt.legend(loc="upper left")
-    plt.grid(True)
-    plt.savefig(f"{debug_dir}/timestamps.png")
+    fig, ax = plt.subplots()
+    ax.scatter(x, y, color="blue", label="Measurements", marker=".")
+    ax.plot(x_range, y_pred, color="r", label="Fitted Model")
+    ax.set_xlabel("Device timestamp")
+    ax.set_ylabel("RocSync timestamp [ms]")
+    ax.set_title("Frame timing")
+    ax.ticklabel_format(style="plain", useOffset=False)
+    ax.legend(loc="upper left")
+    ax.grid(True)
+    fig.savefig(f"{debug_dir}/timestamps.png")
+    plt.close(fig)
 
 
 def fit_ftk_timestamps(

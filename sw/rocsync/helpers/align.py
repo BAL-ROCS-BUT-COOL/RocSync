@@ -4,7 +4,7 @@ import os
 import subprocess
 
 import cv2
-from rocsync.printer import warnprint
+from rocsync.printer import errprint, warnprint
 
 
 def main():
@@ -40,45 +40,61 @@ def main():
     with open(args.sync_file, "r") as file:
         stats = json.load(file)
 
+    # Filter recordings, keep only videos (image and ftk cannot be processed).
+    videos = {
+        path: data
+        for path, data in stats.items()
+        if data and data.get("type") == "video"
+    }
+    if not videos:
+        errprint(
+            f"No video entries found in {args.sync_file}; nothing to align. "
+            "Run rocsync on the video files first."
+        )
+        return 1
+
+    skipped = len(stats) - len(videos)
+    if skipped:
+        print(f"Ignoring {skipped} non-video entries in {args.sync_file}")
+
     expected_fps = (
-        int(round(list(stats.values())[0]["expected_fps"]))
+        int(round(next(iter(videos.values()))["expected_fps"]))
         if args.fps is None
         else args.fps
     )
-    print(f"Syncing all videos to {expected_fps} FPS")
+    print(f"Syncing {len(videos)} videos to {expected_fps} FPS")
 
     processes = []
-    for file in stats:
-        if stats[file]:
-            # Check if the output file already exists
-            video_name, _ = os.path.splitext(os.path.basename(file))
-            video_folder = os.path.dirname(file)
-            print(f"video_folder: {video_folder}, video_name: {video_name}")
-            output_folder = os.path.join(video_folder, args.output_dir)
-            output_file = os.path.join(output_folder, f"{video_name}.mp4")
-            os.makedirs(output_folder, exist_ok=True)
-            print(f"Output file will be saved to {output_file}. Input file: {file}")
+    for file, statistics in videos.items():
+        # Check if the output file already exists
+        video_name, _ = os.path.splitext(os.path.basename(file))
+        video_folder = os.path.dirname(file)
+        print(f"video_folder: {video_folder}, video_name: {video_name}")
+        output_folder = os.path.join(video_folder, args.output_dir)
+        output_file = os.path.join(output_folder, f"{video_name}.mp4")
+        os.makedirs(output_folder, exist_ok=True)
+        print(f"Output file will be saved to {output_file}. Input file: {file}")
 
-            if os.path.exists(output_file):
-                try:
-                    vid = cv2.VideoCapture(output_file)
-                    if not vid.isOpened():
-                        raise ValueError("Could not open video file")
-                except Exception as e:
-                    pass
-                else:
-                    print(f"Skipping {file}, already synced.")
-                    continue
+        if os.path.exists(output_file):
+            try:
+                vid = cv2.VideoCapture(output_file)
+                if not vid.isOpened():
+                    raise ValueError("Could not open video file")
+            except Exception as e:
+                pass
+            else:
+                print(f"Skipping {file}, already synced.")
+                continue
 
-            processes.append(
-                sync_video(
-                    file,
-                    stats[file],
-                    output_file=output_file,
-                    frame_rate=expected_fps,
-                    compensate_drift=args.compensate_drift,
-                )
+        processes.append(
+            sync_video(
+                file,
+                statistics,
+                output_file=output_file,
+                frame_rate=expected_fps,
+                compensate_drift=args.compensate_drift,
             )
+        )
 
     for p in processes:
         p.wait()
@@ -94,10 +110,7 @@ def sync_video(
 ) -> subprocess.Popen:
     cut_time = stats["first_frame"] * (-1 / 1000) + offset  # in seconds
 
-    # Board ms per container ms, as fitted against the frames' own presentation
-    # timestamps. It corrects genuine clock drift only, so it sits very close to
-    # 1 and rescaling here is close to a no-op; a value far from 1 means the fit
-    # found a real rate mismatch and the re-encode below is doing real work.
+    # Board ms per container ms, as fitted against the frames' own presentation timestamps. Warn if not close to 1.0
     clock_rate = stats["clock_rate"]
     if abs(clock_rate - 1) > 0.05:
         warnprint(

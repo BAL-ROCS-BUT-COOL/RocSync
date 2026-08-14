@@ -261,16 +261,17 @@ def process_ftk_recording(filename: str, debug_dir=None) -> dict:
                         fid_line = file.readline()
                         if not fid_line:
                             break
-                        pbar.update(1)
                         fid_fields = fid_line.strip().split(",")
                         if (
-                            fid_fields[2] != "f"
+                            len(fid_fields) < len(fiducial_format)
+                            or fid_fields[2] != "f"
                             or fid_fields[1] != marker["ftk_timestamp"]
                         ):
                             # Not a fiducial or not part of the marker; stop collecting and restore cursor
                             file.seek(current_pos)
                             break
 
+                        pbar.update(1)
                         fiducial = dict(
                             zip(fiducial_format, fid_fields[: len(fiducial_format)])
                         )

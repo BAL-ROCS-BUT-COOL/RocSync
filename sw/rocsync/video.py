@@ -10,6 +10,7 @@ import numpy as np
 from matplotlib.ticker import MaxNLocator
 from tqdm import tqdm
 
+from rocsync.clips import MAX_FRAMES_IN_FLIGHT
 from rocsync.printer import *
 from rocsync.timeline import detect_dropouts, fit_timeline, median_frame_period
 from rocsync.video_statistics import VideoStatistics
@@ -19,9 +20,17 @@ from rocsync.vision import CameraType, process_frame
 def read_frames_async(
     cap, frame_queue, skip_before_pts_ms=None, stop_after_pts_ms=None, stop_event=None
 ):
+    """Push (frame, frame number, pts) onto the queue until EOF or the window ends.
+
+    Seeking is deliberately not used to reach the window: OpenCV maps a requested
+    time onto a frame index through the container's average frame rate, which is
+    exactly the quantity a dropped span invalidates -- on a file with a 1.5 s hole,
+    seeking to 2 s lands 8 frames past it. The file is scanned from the start
+    instead, and each frame's own presentation timestamp decides where it belongs.
+    """
+
     def put(item):
-        # Blocking put, but wake up regularly so a consumer that went away
-        # (e.g. because it raised) cannot wedge this thread on a full queue.
+        # Wake up regularly so a consumer that went away cannot wedge this thread
         while stop_event is None or not stop_event.is_set():
             try:
                 frame_queue.put(item, timeout=0.1)
@@ -30,18 +39,13 @@ def read_frames_async(
                 continue
         return False
 
-    # Frames before the window are grabbed but never retrieved, which skips
-    # decoding them into an image. Seeking is deliberately not used: OpenCV maps
-    # a requested time onto a frame index through the container's average frame
-    # rate, which is exactly the quantity a dropped span invalidates -- on a file
-    # with a 1.5 s hole, seeking to 2 s lands 8 frames past it.
+    # Frames outside the window are grabbed but never retrieved into an image
     while stop_event is None or not stop_event.is_set():
         if not cap.grab():
             put((None, None, None))
             break
 
-        # Read directly after grabbing, where this is the presentation timestamp
-        # of the frame just grabbed, already relative to the stream start
+        # Straight after grabbing, this is the grabbed frame's own timestamp
         pts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
         frame_number = int(cap.get(cv2.CAP_PROP_POS_FRAMES) - 1)
 
@@ -138,13 +142,14 @@ def export_frames(video_path, output_path, fit, n_frames=None):
     os.makedirs(output_path, exist_ok=True)
 
     # Read frames in separate thread
-    frame_queue = queue.Queue(maxsize=100)
+    frame_queue = queue.Queue(maxsize=MAX_FRAMES_IN_FLIGHT)
     thread = threading.Thread(target=read_frames_async, args=(cap, frame_queue))
     thread.daemon = True
     thread.start()
 
-    # Export frames concurrently using multiple threads
-    with ThreadPoolExecutor(max_workers=100) as executor:
+    # Export frames concurrently, but only as fast as they can be encoded
+    in_flight = threading.Semaphore(MAX_FRAMES_IN_FLIGHT)
+    with ThreadPoolExecutor() as executor:
         futures = []
         pbar = tqdm(total=n_frames, desc="Exporting frames", position=1)
         while True:
@@ -152,13 +157,14 @@ def export_frames(video_path, output_path, fit, n_frames=None):
             if frame is None:
                 break
             timestamp = fit.clock_rate * pts_ms + fit.clock_offset_ms
-            futures.append(
-                executor.submit(
-                    cv2.imwrite,
-                    f"{output_path}/f{frame_number}_s{timestamp:.0f}.png",
-                    frame,
-                )
+            in_flight.acquire()
+            future = executor.submit(
+                cv2.imwrite,
+                f"{output_path}/f{frame_number}_s{timestamp:.0f}.png",
+                frame,
             )
+            future.add_done_callback(lambda _: in_flight.release())
+            futures.append(future)
             pbar.update(1)
         pbar.close()
         for future in futures:
@@ -186,9 +192,8 @@ def process_video_window(
     window_start_ms = window_start * 1000.0
     window_end_ms = window_end * 1000.0
 
-    # Read frames in separate thread. Each frame's own timestamp decides whether
-    # it belongs to the window.
-    frame_queue = queue.Queue(maxsize=100)
+    # Read frames in separate thread
+    frame_queue = queue.Queue(maxsize=MAX_FRAMES_IN_FLIGHT)
     stop_event = threading.Event()
     thread = threading.Thread(
         target=read_frames_async,
@@ -201,8 +206,7 @@ def process_video_window(
     frame_times = {}
     scan_window = 0
     if stride is None:
-        # One analyzed frame per second, or every frame if the container reports
-        # no usable frame rate
+        # One analyzed frame per second, or every frame without a usable frame rate
         stride = int(fps) if fps >= 1 else 1
 
     expected_frames = n_frames
@@ -225,8 +229,7 @@ def process_video_window(
                 break
             pbar.update(1)
 
-            # Record every frame that was read, whether or not it is analyzed:
-            # the frame period and any dropouts are measured off this map.
+            # Every frame read, analyzed or not: period and dropouts come from this
             frame_times[frame_number] = pts_ms
 
             if not window_start_ms <= pts_ms <= window_end_ms:
@@ -275,13 +278,10 @@ def process_video(
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
 
-    # A last-resort frame period only; the analyzed span is measured off the frames
-    # themselves further down. A container that reports no frame rate leaves both
-    # to the timestamps.
+    # Last-resort frame period only; the span is measured off the frames themselves
     nominal_period = 1000 / fps if fps > 0 else None
 
-    # Whether the analyzed timeline covers the whole file, which decides if the
-    # reported span and dropouts describe the file or just the requested windows
+    # Whether the reported span and dropouts describe the file or just the windows
     timeline_windowed = bool(windows)
 
     try:
@@ -316,9 +316,7 @@ def process_video(
         errprint("Error: No frames could be read.")
         return
 
-    # Fit a robust linear model of board time against the frames' own
-    # presentation timestamps. Both axes are in milliseconds, so the clock_rate is
-    # the clock rate and the clock_offset_ms is the clock offset.
+    # Fit board time against the frames' own presentation timestamps, both in ms
     period = median_frame_period(frame_times.values(), fallback=nominal_period)
     try:
         fit = fit_timeline(frame_times, timestamps, fallback_period=nominal_period)
@@ -332,7 +330,7 @@ def process_video(
             f"presentation timestamp and were excluded from the fit."
         )
 
-    # Assert that we have at least 80% inliers
+    # Warn below 80% inliers
     if np.sum(fit.inlier_mask) < 0.8 * len(fit.order):
         warnprint(
             f"WARNING: Estimated model has fewer than 80% inliers ({np.sum(fit.inlier_mask) / len(fit.order):.2%})."
@@ -343,8 +341,7 @@ def process_video(
             f"expected approximately 1x."
         )
 
-    # Dropouts are counted per window, so the untouched span between two
-    # disjoint windows is not mistaken for missing frames
+    # Counted per window, so the span between disjoint windows is not a dropout
     n_gaps = n_dropped_frames = 0
     largest_gap_ms = 0.0
     gaps = []
@@ -383,8 +380,7 @@ def process_video(
         if not is_inlier
     }
 
-    # Calculate statistics. The span is anchored on the first and last frame
-    # actually present, so nothing is extrapolated to a frame that may not exist.
+    # Span anchored on frames actually present, so nothing is extrapolated
     fit_stats = fit.to_dict()
     pts_min, pts_max = min(frame_times.values()), max(frame_times.values())
     exposure_times = [end - start for start, end, _ in filtered_timestamps.values()]
@@ -505,8 +501,7 @@ def plot_timechart(
     ax.scatter(x, y, color="blue", label="Measurements")
     ax.plot(span / 1000, fit.predict(span), color="blue", label="Fitted frametime")
 
-    # A perfectly matched clock would run parallel to this, so drift shows up as
-    # divergence from it rather than as an overall clock_rate
+    # A matched clock runs parallel to this, so drift shows as divergence from it
     ax.plot(
         span / 1000,
         fit.predict(pts_min) + (span - pts_min),

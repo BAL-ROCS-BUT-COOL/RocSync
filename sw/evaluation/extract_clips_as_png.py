@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,6 +13,7 @@ import numpy as np
 from tqdm import tqdm
 
 try:
+    from rocsync.clips import MAX_FRAMES_IN_FLIGHT, read_frames_at_indices
     from rocsync.timeline import affine_from_statistics, per_frame_times
 except ImportError:
     raise SystemExit(
@@ -360,72 +362,34 @@ def _get_frames_to_extract(
 def _save_frames_as_png(video_path: str, frames: List[int], output_folder: str) -> None:
     """
     Assumes frames is sorted ascendingly.
+
+    Each frame is encoded as soon as it is decoded, so memory stays flat over a
+    long clip. PNG compression is the slow part and cv2.imwrite drops the GIL,
+    so the writes run on a pool -- bounded, because an unbounded one would just
+    queue the whole clip in RAM again.
     """
     if not frames:
         return
 
     os.makedirs(output_folder, exist_ok=True)
-    extracted_frames = _extract_frames(video_path, frames)
-    _write_frames_to_png_async(extracted_frames, frames, output_folder)
 
+    def write_one_frame(i: int, frame) -> None:
+        cv2.imwrite(os.path.join(output_folder, f"{i:03d}.png"), frame)
 
-def _extract_frames(video_path: str, frames: List[int]) -> List:
-    enumerated_frames = list(enumerate(frames))
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise IOError(f"Could not open video file: {video_path}")
-
-    extracted_frames = [None] * len(frames)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, enumerated_frames[0][1])
-    current_frame_idx = enumerated_frames[0][1]
-    max_frame_needed = enumerated_frames[-1][1]
-
-    sorted_idx = 0
-    n_targets = len(enumerated_frames)
-
-    pbar = tqdm(total=n_targets, desc="Extracting frames")
-
-    while current_frame_idx <= max_frame_needed:
-        success, frame = cap.read()
-        if not success:
-            break
-
-        while (
-            sorted_idx < n_targets
-            and enumerated_frames[sorted_idx][1] == current_frame_idx
-        ):
-            i, _ = enumerated_frames[sorted_idx]
-            extracted_frames[i] = frame.copy()
-            pbar.update(1)
-            sorted_idx += 1
-
-        current_frame_idx += 1
-        if sorted_idx >= n_targets:
-            break
-
-    cap.release()
-    pbar.close()
-    return extracted_frames
-
-
-def _write_frames_to_png_async(
-    extracted_frames: List, frames: List[int], output_folder: str
-) -> None:
-    def write_one_frame(i, frame_idx):
-        frame = extracted_frames[i]
-        filename = os.path.join(output_folder, f"{i:03d}.png")
-        if frame is None:
-            raise ValueError(f"Error: Could not read frame {frame_idx}")
-        cv2.imwrite(filename, frame)
-
+    in_flight = threading.Semaphore(MAX_FRAMES_IN_FLIGHT)
     with ThreadPoolExecutor() as executor:
         futures = []
-        for i, frame_idx in enumerate(tqdm(frames, desc="Queueing writes")):
-            futures.append(executor.submit(write_one_frame, i, frame_idx))
+        for i, frame in read_frames_at_indices(
+            video_path, frames, desc="Extracting frames"
+        ):
+            in_flight.acquire()
+            # The pool outlives the iteration, so it needs its own frame.
+            future = executor.submit(write_one_frame, i, frame.copy())
+            future.add_done_callback(lambda _: in_flight.release())
+            futures.append(future)
 
-        for f in tqdm(futures, desc="Writing PNGs"):
-            f.result()
+        for future in futures:
+            future.result()
 
 
 # -------------------------

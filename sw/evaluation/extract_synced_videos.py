@@ -15,6 +15,7 @@ import numpy as np
 from tqdm import tqdm
 
 try:
+    from rocsync.clips import read_frames_at_indices
     from rocsync.timeline import affine_from_statistics, per_frame_times
 except ImportError:
     raise SystemExit(
@@ -442,7 +443,7 @@ def write_sampled_video_by_indices(
 ):
     """
     Writes a video composed EXACTLY of the frames at `frame_indices`, in that order,
-    encoded at `target_fps`. Guarantees len(frame_indices) frames in the output.
+    encoded at `target_fps`. One frame per index, unless the source runs out early.
     """
     if not frame_indices:
         print(f"[write_sampled_video_by_indices] No frames requested for {video_path}")
@@ -451,32 +452,23 @@ def write_sampled_video_by_indices(
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise IOError(f"Cannot open video: {video_path}")
-
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(output_path, fourcc, target_fps, (width, height))
 
-    pbar = tqdm(
-        total=len(frame_indices),
-        desc=f"Writing {os.path.basename(output_path)} (sampled)",
-    )
-
-    for idx in frame_indices:
-        if idx < 0:
-            idx = 0
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        if not ret:
-            break
-        out.write(frame)
-        pbar.update(1)
-
-    cap.release()
-    out.release()
-    pbar.close()
+    try:
+        for _, frame in read_frames_at_indices(
+            video_path,
+            frame_indices,
+            desc=f"Writing {os.path.basename(output_path)} (sampled)",
+        ):
+            out.write(frame)
+    finally:
+        out.release()
 
 
 def cut_video(

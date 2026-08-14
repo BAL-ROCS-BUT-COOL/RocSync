@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import pathlib
 from pathlib import Path
@@ -53,24 +54,39 @@ def mkdir_unique(name, parent_dir):
     return str(debug_dir)
 
 
-def parse_time(time_str: str) -> float:
-    """Expects a delta time string with format hh:mm:ss"""
-    if time_str is None:
-        return None
-
-    time = time_str.split(":")
-    if len(time) != 3:
-        errprint(f"Invalid time format: {time_str}, expected hh:mm:ss")
-        raise ValueError
+def _parse_hms(time_str: str, original: str) -> float:
+    """Seconds from an hh:mm:ss time."""
+    invalid = ValueError(
+        f"invalid time {original!r}, expected hh:mm:ss, 'end' or 'end-hh:mm:ss'"
+    )
+    fields = time_str.split(":")
+    if len(fields) != 3:
+        raise invalid
     try:
-        h = int(time[0])
-        m = int(time[1])
-        s = float(time[2])
+        h, m, s = int(fields[0]), int(fields[1]), float(fields[2])
     except ValueError:
-        errprint(f"Invalid time format: {time_str}, expected hh:mm:ss")
-        raise ValueError
+        raise invalid from None
+    if h < 0 or m < 0 or s < 0:
+        raise invalid
 
     return h * 3600 + m * 60 + s
+
+
+def parse_time(time_str: str) -> float:
+    """Parses a time in hh:mm:ss format, "end" for the end of the file, or
+    "end-hh:mm:ss" for an offset back from it.
+
+    An offset from the end is returned as a negative time.
+    """
+    text = time_str.strip().lower()
+    if text == "end":
+        return math.inf
+    # A bare leading "-" means the same, but needs quoting on a command line
+    for prefix in ("end-", "-"):
+        if text.startswith(prefix):
+            return -_parse_hms(text[len(prefix) :], time_str)
+
+    return _parse_hms(text, time_str)
 
 
 def main():
@@ -134,28 +150,13 @@ def main():
 
     # Specify time windows to search for ROCsync
     parser.add_argument(
-        "--start1",
-        type=str,
-        default=None,
-        help="start time of first window to search, in hh:mm:ss.ms format",
-    )
-    parser.add_argument(
-        "--end1",
-        type=str,
-        default=None,
-        help="end time window of first window to search, in hh:mm:ss.ms format",
-    )
-    parser.add_argument(
-        "--start2",
-        type=str,
-        default=None,
-        help="start time window of second window to search, in hh:mm:ss.ms format",
-    )
-    parser.add_argument(
-        "--end2",
-        type=str,
-        default=None,
-        help="end time window of second window to search, in hh:mm:ss.ms format",
+        "--window",
+        nargs=2,
+        action="append",
+        metavar=("START", "END"),
+        help="time span to search, in hh:mm:ss format; 'end' is the end of the file and "
+        "'end-hh:mm:ss' counts back from it, e.g. --window end-0:00:30 end. Repeat for "
+        "several spans; overlapping ones are merged (default: whole file)",
     )
     parser.add_argument(
         "--recurse_in_dir",
@@ -179,9 +180,18 @@ def main():
         else None
     )
 
-    # Parse time arguments
-    start_time1, end_time1 = parse_time(args.start1), parse_time(args.end1)
-    start_time2, end_time2 = parse_time(args.start2), parse_time(args.end2)
+    # Parse the search windows; they are resolved against the video and merged later
+    windows = []
+    for start_str, end_str in args.window or []:
+        try:
+            start, end = parse_time(start_str), parse_time(end_str)
+        except ValueError as e:
+            parser.error(f"argument --window: {e}")
+        if start >= 0 and start >= end:
+            parser.error(
+                f"argument --window: start {start_str} is not before end {end_str}"
+            )
+        windows.append((start, end))
 
     files = set()
     for path in args.path:
@@ -260,13 +270,10 @@ def main():
             statistics = process_video(
                 file,
                 CameraType(args.camera_type),
-                export_dir,
-                args.stride,
-                debug_dir,
-                start_time1,
-                end_time1,
-                start_time2,
-                end_time2,
+                export_dir=export_dir,
+                stride=args.stride,
+                debug_dir=debug_dir,
+                windows=windows,
                 board=board,
             )
             if statistics is not None:

@@ -6,6 +6,7 @@ quantity the pipeline times against. The board detection is stubbed out -- what
 is under test is the timing, not the vision.
 """
 
+import math
 import shutil
 import subprocess
 
@@ -187,3 +188,61 @@ def test_window_selects_frames_by_timestamp_not_by_index(gap_video, board_at_pts
     )
     assert set(timestamps) == set(analyzed_indices)
     assert all(frame_times[i] == pytest.approx(p) for i, p in board_at_pts)
+
+
+def test_a_single_window_is_the_only_span_analyzed(gap_video, board_at_pts):
+    """A lone window must not be widened to the whole file."""
+    video.process_video(gap_video, CameraType.RGB, stride=1, windows=[(2.5, 3.5)])
+
+    analyzed_pts = [pts for _, pts in board_at_pts]
+    assert analyzed_pts, "nothing was analyzed"
+    assert min(analyzed_pts) >= 2500
+    assert max(analyzed_pts) <= 3500
+
+
+def test_disjoint_windows_are_analyzed_and_the_span_between_them_is_not(
+    gap_video, board_at_pts
+):
+    statistics = video.process_video(
+        gap_video, CameraType.RGB, stride=1, windows=[(0.0, 0.5), (3.0, 3.5)]
+    )
+
+    analyzed_pts = [pts for _, pts in board_at_pts]
+    assert any(pts <= 500 for pts in analyzed_pts)
+    assert any(pts >= 3000 for pts in analyzed_pts)
+    assert not any(500 < pts < 3000 for pts in analyzed_pts)
+
+    # The 1.5 s hole lies between the windows, so it is nobody's dropout
+    assert statistics.n_dropped_frames == 0
+    assert statistics.timeline_windowed
+
+
+def test_overlapping_windows_are_merged_into_one_scan(gap_video, board_at_pts):
+    statistics = video.process_video(
+        gap_video, CameraType.RGB, stride=1, windows=[(0.0, 2.0), (1.0, 3.0)]
+    )
+
+    analyzed_indices = [index for index, _ in board_at_pts]
+    assert analyzed_indices, "nothing was analyzed"
+    assert len(analyzed_indices) == len(set(analyzed_indices)), "frames scanned twice"
+    assert max(pts for _, pts in board_at_pts) <= 3000
+
+    # Counting the hole once, not once per overlapping window
+    assert statistics.n_gaps == 1
+    assert statistics.n_dropped_frames == N_DROPPED
+
+
+def test_negative_window_bounds_count_back_from_the_last_frame(gap_video, board_at_pts):
+    pts = frame_pts(gap_video)
+    video.process_video(
+        gap_video, CameraType.RGB, stride=1, windows=[(-1.0, math.inf)]
+    )
+
+    analyzed_pts = [p for _, p in board_at_pts]
+    assert analyzed_pts, "nothing was analyzed"
+    assert min(analyzed_pts) >= pts[-1] - 1000
+    assert max(analyzed_pts) == pytest.approx(pts[-1])
+
+
+def test_probe_last_pts_ms_finds_the_real_last_frame(gap_video):
+    assert video.probe_last_pts_ms(gap_video) == pytest.approx(frame_pts(gap_video)[-1])

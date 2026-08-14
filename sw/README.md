@@ -39,15 +39,9 @@ options:
   -y, --yes             automatically run yes for all prompts (potentially overwrites existing files)
   --debug DIRECTORY     directory to store debug images (very slow)
 
-  --start1 WINDOW1_START_TIME 
-                        specify optional start timestamp for first search window in format hh:mm:ss.ms (default: 00:00:00.0)
-  --end1 WINDOW1_END_TIME 
-                        specify optional end timestamp for first search window in format hh:mm:ss.ms (default: end of file)
-
-  --start2 WINDOW2_START_TIME 
-                        specify optional start timestamp for second search window in format hh:mm:ss.ms (default: none)
-  --end2 WINDOW2_END_TIME 
-                        specify optional end timestamp for second search window in format hh:mm:ss.ms (default:none)
+  --window START END    time span to search, in hh:mm:ss format; 'end' is the end of the file and
+                        'end-hh:mm:ss' counts back from it, e.g. --window end-0:00:30 end. Repeat
+                        for several spans; overlapping ones are merged (default: whole file)
 
   --sync_video          automatically time-sync the videos using the estimated timestamps (requires ffmpeg)
   --synced_folder FOLDER 

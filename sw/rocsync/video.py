@@ -60,6 +60,73 @@ def read_frames_async(
             break
 
 
+def probe_last_pts_ms(video_path):
+    """Presentation timestamp of the last frame, or None if no frame could be read.
+
+    Seeking near the end is only a starting point: whatever frame the seek lands on,
+    grabbing forward to EOF finds the true last frame, so a frame count the container
+    reports wrongly cannot skew the result.
+    """
+    cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        return None
+    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    try:
+        # An over-reported frame count seeks past the end, so retry further back
+        for first_frame in (max(0, n_frames - 1), max(0, n_frames // 2), 0):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, first_frame)
+            last_pts_ms = None
+            while cap.grab():
+                last_pts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+            if last_pts_ms is not None:
+                return last_pts_ms
+    finally:
+        cap.release()
+    return None
+
+
+def resolve_windows(windows, video_path):
+    """Turns requested search windows into absolute [start, end] spans in seconds.
+
+    A negative bound is an offset from the last frame's presentation timestamp. The
+    result is sorted, and overlapping spans are merged so that no frame is scanned --
+    and no gap between frames counted -- twice.
+    """
+    if not windows:
+        return [(0.0, math.inf)]
+
+    last_pts_s = None
+    if any(bound < 0 for window in windows for bound in window):
+        last_pts_ms = probe_last_pts_ms(video_path)
+        if last_pts_ms is None:
+            raise ValueError(
+                "no frame could be read to resolve a window bound given from the end"
+            )
+        last_pts_s = last_pts_ms / 1000.0
+
+    resolved = []
+    for start, end in windows:
+        if start < 0:
+            start = max(0.0, last_pts_s + start)
+        if end < 0:
+            end = max(0.0, last_pts_s + end)
+        if start >= end:
+            raise ValueError(
+                f"window [{start:.3f}s, {end:.3f}s] starts at or after it ends"
+            )
+        resolved.append((start, end))
+
+    resolved.sort()
+    merged = [resolved[0]]
+    for start, end in resolved[1:]:
+        merged_start, merged_end = merged[-1]
+        if start <= merged_end:  # overlapping or touching
+            merged[-1] = (merged_start, max(merged_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def export_frames(video_path, output_path, fit, n_frames=None):
     cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
     # cap.set(cv2.CAP_PROP_FFMPEG_HWACCEL, cv2.CAP_FFMPEG_HWACCEL_NVDEC)  # try to use
@@ -192,10 +259,7 @@ def process_video(
     export_dir=None,
     stride=None,
     debug_dir=None,
-    window1_start=None,
-    window1_end=None,
-    window2_start=None,
-    window2_end=None,
+    windows=None,
     brightness_boost=None,
     board=None,
 ):
@@ -211,49 +275,20 @@ def process_video(
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
 
-    # Only used to resolve the window arguments and as a last-resort frame period;
-    # the analyzed span is measured off the frames themselves further down. A
-    # container that reports no frame rate leaves both to the timestamps.
+    # A last-resort frame period only; the analyzed span is measured off the frames
+    # themselves further down. A container that reports no frame rate leaves both
+    # to the timestamps.
     nominal_period = 1000 / fps if fps > 0 else None
-    nominal_duration = (n_frames - 1) * nominal_period if nominal_period else 0
 
     # Whether the analyzed timeline covers the whole file, which decides if the
     # reported span and dropouts describe the file or just the requested windows
-    timeline_windowed = any(
-        w is not None for w in (window1_start, window1_end, window2_start, window2_end)
-    )
+    timeline_windowed = bool(windows)
 
-    # An unspecified end means the end of the file. It must not be derived from
-    # the frame count and average frame rate: on a file with dropped frames that
-    # duration is far shorter than the real span, and would cut the read short.
-    # Offsets from the end have no better reference available, so they resolve
-    # against the nominal duration and are only as good as it is.
-    if window1_start is None:
-        window1_start = 0
-    elif window1_start < 0:
-        window1_start = max(0, (nominal_duration / 1000) + window1_start)
-
-    if window1_end is None:
-        window1_end = math.inf
-    elif window1_end < 0:
-        window1_end = max(0, (nominal_duration / 1000) + window1_end)
-
-    if window2_start is None:
-        window2_start = 0
-    elif window2_start < 0:
-        window2_start = max(0, (nominal_duration / 1000) + window2_start)
-
-    if window2_end is None:
-        window2_end = math.inf
-    elif window2_end < 0:
-        window2_end = max(0, (nominal_duration / 1000) + window2_end)
-
-    windows = [(window1_start, window1_end)]
-    if (
-        window2_start > window1_end or window2_end < window1_start
-    ):  # check if window2 is not overlapping with window1
-        # TODO: better window checking
-        windows.append((window2_start, window2_end))
+    try:
+        windows = resolve_windows(windows, video_path)
+    except ValueError as e:
+        errprint(f"Error: Unable to resolve the search windows: {e}")
+        return
 
     # Analyze frames
     timestamps = {}

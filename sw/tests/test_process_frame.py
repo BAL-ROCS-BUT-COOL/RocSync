@@ -5,7 +5,6 @@ from pathlib import Path
 sys.path.insert(0, os.path.normcase(Path(__file__).resolve().parents[1]))
 
 import cv2 as cv
-import matplotlib.pyplot as plt
 import numpy as np
 from rocsync.board_profiles import BOARD_V2
 from rocsync.vision import (
@@ -31,6 +30,7 @@ def test_piecewise():
     markers = find_corners_aruco(
         image, frame_number=999, debug_dir=TEST_DIR / "output_piecewise"
     )
+    assert board.aruco_marker_id in markers, "ArUco marker was not detected"
     aruco_corners = markers[board.aruco_marker_id]
     red_channel = image[:, :, 2]
     rough_transformation_matrix = cv.getPerspectiveTransform(
@@ -45,6 +45,7 @@ def test_piecewise():
     corners = find_corners_dots(
         rough_pcb, 999, board, debug_dir=TEST_DIR / "output_piecewise"
     )
+    assert corners is not None, "always-on corner dots were not detected"
 
     # however, this only works with exactly 4 points
     transformation_matrix = np.dot(
@@ -68,10 +69,6 @@ def test_piecewise():
         pcb, camera_type=CameraType.RGB, board=board, draw_result=True
     )
     print(f"decoded clock: {counter} [0.1s]")
-
-    # show the debug image output
-    plt.imshow(pcb)
-    plt.show()
 
 
 def test_full():

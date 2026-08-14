@@ -20,6 +20,8 @@ LED_SAMPLE_RADIUS_MM = 3.0  # radius of the disc each LED's intensity is read fr
 RING_BG_OFFSET_MM = -10.0  # background ring, measured inward from the LED ring
 LAYOUT_TOL_MM = 4.0  # how far a blob may sit from a modelled LED and still count
 
+RING_EDGE_MARGIN = 1  # ring LEDs of slack required at either end of the period
+
 
 def _ring(radius_mm, period, centre):
     """Ring LED centres (mm), index 0 at the top, running counter-clockwise."""
@@ -66,6 +68,23 @@ class BoardProfile:
             self.period,
             self.centre_mm,
         )
+
+    def board_time_from_ring(self, counter, ring):
+        """Board time (start_ms, end_ms) for one counter value and ring reading.
+
+        `ring` holds the first and last lit ring LED, inclusive. Returns None when
+        the counter incremented during the exposure, which makes the reading
+        ambiguous: either the run wraps the end of the period, or it sits within
+        RING_EDGE_MARGIN LEDs of one end and may already have wrapped.
+        """
+        start, end = ring
+        if (
+            start > end
+            or start < RING_EDGE_MARGIN
+            or self.period - 1 - end < RING_EDGE_MARGIN
+        ):
+            return None
+        return start + counter * self.period, end + counter * self.period
 
     def aruco_corners(self):
         """The marker's black-border corners (mm), clockwise from the top-left."""
@@ -151,6 +170,9 @@ class RectifiedBoard:
 
     def layout_coords(self, camera_type):
         return self._px(self.profile.layout_coords(camera_type))
+
+    def board_time_from_ring(self, counter, ring):
+        return self.profile.board_time_from_ring(counter, ring)
 
 
 _RECTIFIED_CACHE = {}

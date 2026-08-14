@@ -397,14 +397,6 @@ def process_frame(
     if debug_dir:
         cv2.imwrite(f"{debug_dir}/leds_{frame_number}.png", pcb)
 
-    if ring is not None:
-        start, end = ring
-        period = board.period
-        if start > end or start <= 1 or period - end <= 1:
-            return True, None  # Counter increment during exposure
-
-        start += counter * period
-        end += counter * period
-        return True, (start, end)
-
-    return True, None
+    if ring is None:
+        return True, None
+    return True, board.board_time_from_ring(counter, ring)

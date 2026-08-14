@@ -157,20 +157,9 @@ def process_frame(
         return None
 
     ring = read_ring(transformed_fiducials, board, ax)
-    if ring is not None:
-        start, end = ring
-        # Check if the values are valid
-        if (
-            start > end
-            or min(start, board.period - start) <= 2
-            or min(board.period, 100 - end) <= 2
-        ):
-            return None
-
-        start += counter * board.period
-        end += counter * board.period
-        return start, end
-    return None
+    if ring is None:
+        return None
+    return board.board_time_from_ring(counter, ring)
 
 
 def plot_timechart(x, y, x_range, y_pred, debug_dir):

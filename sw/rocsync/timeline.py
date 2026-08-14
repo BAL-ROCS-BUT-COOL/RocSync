@@ -114,7 +114,8 @@ def fit_timeline(
     threshold is the median frame period, i.e. at most one frame of deviation.
 
     Only frames present in both dicts are used. Raises ValueError if fewer than
-    two such frames exist, or if no usable threshold can be determined.
+    two such frames exist, if no usable threshold can be determined, or if the
+    fit is degenerate (a non-positive or non-finite clock rate).
     """
     order = sorted(k for k in timestamps if frame_times.get(k) is not None)
     if len(order) < 2:
@@ -142,11 +143,21 @@ def fit_timeline(
     )
     model.fit(x, y)
 
+    clock_rate = float(model.estimator_.coef_[0])
+    clock_offset_ms = float(model.estimator_.intercept_)
+    if not np.isfinite(clock_rate) or clock_rate <= 0:
+        raise ValueError(
+            f"Fitted clock_rate is {clock_rate}, but board time must advance "
+            f"with the source clock."
+        )
+    if not np.isfinite(clock_offset_ms):
+        raise ValueError(f"Fitted clock_offset_ms is {clock_offset_ms}.")
+
     inlier_mask = model.inlier_mask_
     inlier_x, inlier_y = x[inlier_mask], y[inlier_mask]
     return TimelineFit(
-        clock_rate=float(model.estimator_.coef_[0]),
-        clock_offset_ms=float(model.estimator_.intercept_),
+        clock_rate=clock_rate,
+        clock_offset_ms=clock_offset_ms,
         order=order,
         inlier_mask=inlier_mask,
         r2_before=model.score(x, y),

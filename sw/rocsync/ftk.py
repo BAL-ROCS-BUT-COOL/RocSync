@@ -5,6 +5,7 @@ from tqdm import tqdm
 
 from rocsync.board_profiles import PROFILES_BY_FTK, BoardProfile
 from rocsync.camera import CameraType
+from rocsync.printer import errprint
 from rocsync.timeline import detect_dropouts, fit_timeline, median_frame_period
 
 DISTANCE_THRESHOLD = 3
@@ -371,6 +372,8 @@ def process_ftk_recording(filename: str, debug_dir=None) -> dict:
                     if result is not None:
                         timestamps[int(marker["ftk_timestamp"])] = result
     if len(timestamps) > 0:
-        statistics = fit_ftk_timestamps(timestamps, frame_times, debug_dir)
-        return statistics
+        try:
+            return fit_ftk_timestamps(timestamps, frame_times, debug_dir)
+        except ValueError as e:
+            errprint(f"Error: Unable to fit the FTK timeline: {e}")
     return None

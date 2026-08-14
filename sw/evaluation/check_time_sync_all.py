@@ -229,12 +229,14 @@ def main(cfg: Config) -> None:
         raw_time_sync_data: Dict[str, dict] = json.load(f)
 
     # Normalize keys to '<parent>/<file>' so they can be joined with dataset_folder,
-    # exactly like in extract_synced_videos.py. Device recordings land in the same
-    # JSON without a frame timeline, so they are dropped here.
+    # exactly like in extract_synced_videos.py. Image and FTK device entries land
+    # in the same JSON tagged with their own "type"; only video entries have the
+    # per-frame timeline the overlap checks below need, so anything else is
+    # dropped here.
     time_sync_data = {
         os.path.join(*camera.replace("\\", "/").split("/")[-2:]): data
         for camera, data in raw_time_sync_data.items()
-        if "first_frame" in data
+        if data.get("type") == "video"
     }
 
     # Find the time-defining camera entry by basename match

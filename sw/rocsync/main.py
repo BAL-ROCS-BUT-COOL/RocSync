@@ -246,7 +246,9 @@ def main():
             export_dir = mkdir_unique(name, args.export_frames)
 
         ret = None
+        entry_type = None
         if file in videos:
+            entry_type = "video"
             statistics = process_video(
                 file,
                 CameraType(args.camera_type),
@@ -263,12 +265,14 @@ def main():
                 ret = statistics.to_dict()
 
         elif file in images:
+            entry_type = "image"
             ret = process_image(file, CameraType(args.camera_type), debug_dir, board)
         elif file in ftk_recordings:
+            entry_type = "ftk"
             ret = process_ftk_recording(file, debug_dir)
 
         if ret is not None:
-            result[str(file)] = ret
+            result[str(file)] = {"type": entry_type, **ret}
         else:
             errprint(f"Error: Unable to time-sync {file}.")
 

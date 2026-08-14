@@ -144,12 +144,14 @@ def main(config: Config) -> None:
         time_sync_data = json.load(f)
 
     # Adjust keys to reflect relative raw video paths (same logic as original,
-    # extended for Windows-style backslashes). Device recordings land in the same
-    # JSON without a frame timeline, so they are dropped here.
+    # extended for Windows-style backslashes). Image and FTK device entries land
+    # in the same JSON tagged with their own "type"; only video entries have the
+    # per-frame timeline the overlap checks below need, so anything else is
+    # dropped here.
     time_sync_data = {
         os.path.join(*camera.replace("\\", "/").split("/")[-2:]): data
         for camera, data in time_sync_data.items()
-        if "first_frame" in data
+        if data.get("type") == "video"
     }
 
     # Parse clips, optionally using camera time to derive global times

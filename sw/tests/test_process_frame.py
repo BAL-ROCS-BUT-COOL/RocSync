@@ -62,15 +62,19 @@ def test_piecewise():
 
     cv.imwrite(TEST_OUT_DIR / "pcb.jpg", pcb)
 
+    leds_overlay = cv.cvtColor(pcb, cv.COLOR_GRAY2BGR)
+
     # decode the ring (should remain the same) ---------------------------------
-    ring = read_ring(pcb, camera_type=CameraType.RGB, board=board, draw_result=True)
+    ring = read_ring(pcb, camera_type=CameraType.RGB, board=board, draw_on=leds_overlay)
     print(f"ring decoded: {ring}")
 
     # decode clock (must be adjusted to new layout) ----------------------------
     counter = read_counter(
-        pcb, camera_type=CameraType.RGB, board=board, draw_result=True
+        pcb, camera_type=CameraType.RGB, board=board, draw_on=leds_overlay
     )
     print(f"decoded clock: {counter} [0.1s]")
+
+    cv.imwrite(TEST_OUT_DIR / "leds.jpg", leds_overlay)
 
 
 def test_full():

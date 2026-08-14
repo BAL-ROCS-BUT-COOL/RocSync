@@ -128,7 +128,7 @@ def find_optimal_ring_start_end(leds):
     return final_window, final_score
 
 
-def read_ring(extracted_board, camera_type, board, draw_result=False):
+def read_ring(extracted_board, camera_type, board, draw_on=None):
     period = board.period
     radius = board.led_sample_radius
     led_coords = board.ring_led_coords(camera_type).astype(int)
@@ -150,19 +150,20 @@ def read_ring(extracted_board, camera_type, board, draw_result=False):
     # Find most likely segment of enabled LEDs, allowing for false detections
     (start, end), score = find_optimal_ring_start_end(leds)
 
+    if draw_on is not None:
+        for state, (x, y) in zip(leds, led_coords):
+            color = (0, 0, 255) if state else (255, 0, 0)
+            cv2.circle(draw_on, (x, y), radius, color, 1)
+
     if start == end:
         # no segment found
         return None
 
-    if draw_result:
-        for state, (x, y) in zip(leds, led_coords):
-            color = (0, 0, 255) if state else (255, 0, 0)
-            cv2.circle(extracted_board, (x, y), radius, color, 1)
     # return inclusive bounds (i.e. start is the first led ON, end -1 is the last led ON)
     return start, (end - 1) % period
 
 
-def read_counter(extracted_board, camera_type, board, draw_result=False):
+def read_counter(extracted_board, camera_type, board, draw_on=None):
     led_coords = board.counter_led_coords[camera_type].astype(int)
     bg_y = int(board.counter_bg_y[camera_type])
     n_bits = board.counter_bits
@@ -186,10 +187,10 @@ def read_counter(extracted_board, camera_type, board, draw_result=False):
     counter = np.sum(2 ** potrange[leds])
 
     # draw optional debug output
-    if draw_result:
+    if draw_on is not None:
         for state, (x, y) in zip(leds, led_coords):
             cv2.circle(
-                extracted_board,
+                draw_on,
                 (x, y),
                 radius,
                 (0, 0, 255) if state else (255, 0, 0),
@@ -203,12 +204,16 @@ def find_corners_convexhull(mask, frame_number, debug_dir=None):
     points = blob_detector.detect(mask)
 
     # Draw detected blobs as red circles
-    debug_image = cv2.drawKeypoints(
-        mask,
-        points,
-        np.array([]),
-        (0, 0, 255),
-        cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS,
+    debug_image = (
+        cv2.drawKeypoints(
+            mask,
+            points,
+            np.array([]),
+            (0, 0, 255),
+            cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS,
+        )
+        if debug_dir
+        else None
     )
 
     points = [kp.pt for kp in points]
@@ -218,7 +223,8 @@ def find_corners_convexhull(mask, frame_number, debug_dir=None):
     if len(points) >= 4:
         hull = cv2.convexHull(np.array(points, dtype=np.float32))
         corners = hull.reshape(-1, 2)
-        draw_polygon(corners, debug_image, (0, 255, 0))
+        if debug_image is not None:
+            draw_polygon(corners, debug_image, (0, 255, 0))
 
         if len(hull) > 4:
             # Approximate to 4 points
@@ -231,11 +237,12 @@ def find_corners_convexhull(mask, frame_number, debug_dir=None):
                 n_points = len(approx_hull)
                 epsilon_factor += 0.02
 
-            # Draw the approxcuimated convex hull
+            # Draw the approximated convex hull
             corners = approx_hull.reshape(-1, 2)
-            draw_polygon(corners, debug_image, (255, 0, 0))
+            if debug_image is not None:
+                draw_polygon(corners, debug_image, (255, 0, 0))
 
-    if debug_dir:
+    if debug_image is not None:
         cv2.imwrite(f"{debug_dir}/convexhull_{frame_number}.png", debug_image)
     if corners is not None and len(corners) == 4:
         return corners
@@ -388,14 +395,14 @@ def process_frame(
             if read_counter(pcb, CameraType.INFRARED, board) == 0:
                 return True, None  # Counter was actually 0, can't determine orientation
 
-    if debug_dir:  # For RGB debug output
-        pcb = cv2.cvtColor(pcb, cv2.COLOR_GRAY2BGR)
+    # Sample the pristine board; overlays go onto a separate canvas
+    debug_canvas = cv2.cvtColor(pcb, cv2.COLOR_GRAY2BGR) if debug_dir else None
 
-    counter = read_counter(pcb, camera_type, board, draw_result=True)
-    ring = read_ring(pcb, camera_type, board, draw_result=True)
+    counter = read_counter(pcb, camera_type, board, draw_on=debug_canvas)
+    ring = read_ring(pcb, camera_type, board, draw_on=debug_canvas)
 
     if debug_dir:
-        cv2.imwrite(f"{debug_dir}/leds_{frame_number}.png", pcb)
+        cv2.imwrite(f"{debug_dir}/leds_{frame_number}.png", debug_canvas)
 
     if ring is None:
         return True, None

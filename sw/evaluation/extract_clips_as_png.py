@@ -19,9 +19,11 @@ try:
         ClipExtractionConfig,
         add_clip_args,
         add_common_args,
+        camera_name,
         load_video_time_sync,
         resolve_clips_json,
         resolve_time_sync_json,
+        select_camera_key,
     )
     from rocsync.timeline import affine_from_statistics, per_frame_times
 except ImportError:
@@ -72,22 +74,11 @@ def main(config: Config) -> None:
     time_sync_data = load_video_time_sync(config.time_sync_json_path)
 
     # Parse clips, optionally using camera time to derive global times
+    matching_key = None
     if config.from_raw_camera_time_of_camera is not None:
-        matching_key = next(
-            (
-                k
-                for k in time_sync_data
-                if os.path.splitext(os.path.basename(k))[0]
-                == config.from_raw_camera_time_of_camera
-            ),
-            None,
+        matching_key = select_camera_key(
+            time_sync_data, config.from_raw_camera_time_of_camera, "--from-camera"
         )
-
-        if not matching_key:
-            raise ValueError(
-                f"No match found for camera name: {config.from_raw_camera_time_of_camera}"
-            )
-
         time_defining_camera_time_sync_data = time_sync_data[matching_key]
         defining_clock_rate, defining_clock_offset_ms = affine_from_statistics(
             time_defining_camera_time_sync_data
@@ -104,15 +95,9 @@ def main(config: Config) -> None:
     # For each clip and each camera, compute frames and save PNGs
     for clip in clips:
         for camera, camera_time_sync_data in time_sync_data.items():
-            camera_basename = os.path.splitext(os.path.basename(camera))[0]
-
             # If --only-specified is set, skip all other cameras
-            if (
-                config.only_specified
-                and config.from_raw_camera_time_of_camera is not None
-            ):
-                if camera_basename != config.from_raw_camera_time_of_camera:
-                    continue
+            if config.only_specified and camera != matching_key:
+                continue
 
             raw_video_path = os.path.join(config.dataset_folder, camera)
             print(f"Processing {raw_video_path}.")
@@ -129,17 +114,11 @@ def main(config: Config) -> None:
                 config.target_fps, actual_timestamps, clip.start, clip.end
             )
 
-            # Output folder:
-            camera_name = camera_basename
-            # strip trailing "_raw" from camera folder name if present
-            if camera_name.endswith("_raw"):
-                camera_name = camera_name[:-4]
-
             output_folder = os.path.join(
                 config.dataset_folder,
                 output_folder_name,
                 f"{clip.start_string_formatted}-{clip.end_string_formatted}",
-                camera_name,
+                camera_name(camera),
             )
 
             _save_frames_as_png(raw_video_path, frames_to_extract, output_folder)

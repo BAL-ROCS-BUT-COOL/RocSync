@@ -22,9 +22,11 @@ try:
         ClipExtractionConfig,
         add_clip_args,
         add_common_args,
+        camera_name,
         load_video_time_sync,
         resolve_clips_json,
         resolve_time_sync_json,
+        select_camera_key,
     )
     from rocsync.timecode import ms_to_timecode
     from rocsync.timeline import affine_from_statistics, per_frame_times
@@ -46,56 +48,6 @@ def main(config: Config) -> None:
 
     time_sync_data_all = load_video_time_sync(config.time_sync_json_path)
 
-    def _pretty_cam_name(cam_key: str) -> str:
-        """Basename without extension; also strips a trailing '_raw'."""
-        name = os.path.splitext(os.path.basename(cam_key))[0]
-        return name[:-4] if name.endswith("_raw") else name
-
-    def _matches_camera_name(cam_key: str, user_value: str) -> bool:
-        """
-        Match user_value against:
-          - exact normalized '<parent>/<file>' key
-          - last 2 path segments of user_value (parent/file)
-          - basename without extension (with/without _raw stripped)
-        """
-        uv = user_value.replace("\\", "/").strip()
-        uv_base = os.path.splitext(os.path.basename(uv))[0]
-
-        key_base = os.path.splitext(os.path.basename(cam_key))[0]
-        key_base_clean = key_base[:-4] if key_base.endswith("_raw") else key_base
-
-        # Exact match on normalized key
-        if uv == cam_key.replace("\\", "/"):
-            return True
-
-        # If user provided a path, match by last 2 segments
-        if "/" in uv:
-            uv_key = os.path.join(*uv.split("/")[-2:])
-            if uv_key == cam_key:
-                return True
-
-        return (uv_base == key_base) or (uv_base == key_base_clean)
-
-    def _select_single_camera_key(
-        all_data: Dict[str, dict], user_value: str, flag: str
-    ) -> str:
-        matches = [k for k in all_data.keys() if _matches_camera_name(k, user_value)]
-        if not matches:
-            available = ", ".join(
-                sorted({_pretty_cam_name(k) for k in all_data.keys()})
-            )
-            raise ValueError(
-                f"{flag} '{user_value}' did not match any camera.\n"
-                f"Available cameras: [{available}]"
-            )
-        if len(matches) > 1:
-            opts = ", ".join(sorted(matches))
-            raise ValueError(
-                f"{flag} '{user_value}' is ambiguous; matches multiple cameras.\n"
-                f"Disambiguate by passing one of these exact keys (last 2 path segments): [{opts}]"
-            )
-        return matches[0]
-
     def _compute_overlap(data_dict: Dict[str, dict]) -> tuple[float, float]:
         first_frames = [float(d["first_frame"]) for d in data_dict.values()]
         last_frames = [float(d["last_frame"]) for d in data_dict.values()]
@@ -107,7 +59,7 @@ def main(config: Config) -> None:
             cam_first = float(d["first_frame"])
             cam_last = float(d["last_frame"])
             if clip.start < cam_first or clip.end > cam_last:
-                bad.append(_pretty_cam_name(cam_key))
+                bad.append(camera_name(cam_key))
         return sorted(bad)
 
     if not time_sync_data_all:
@@ -115,7 +67,7 @@ def main(config: Config) -> None:
 
     # --- Parse clips (use ALL cameras for --from-camera resolution, even if we later filter extraction) ---
     if config.from_raw_camera_time_of_camera:
-        defining_key = _select_single_camera_key(
+        defining_key = select_camera_key(
             time_sync_data_all,
             config.from_raw_camera_time_of_camera,
             "--from-camera",
@@ -133,7 +85,7 @@ def main(config: Config) -> None:
 
     # --- Apply optional extraction filter AFTER clip parsing ---
     if getattr(config, "only_for_camera", None):
-        only_key = _select_single_camera_key(
+        only_key = select_camera_key(
             time_sync_data_all,
             config.only_for_camera,
             "--only-for-camera",
@@ -246,19 +198,12 @@ def main(config: Config) -> None:
             )
 
             # --- Clean camera name and define output path ---
-            camera_name_raw = os.path.splitext(os.path.basename(camera))[0]
+            camera_name_cleaned = camera_name(camera)
 
-            # 1. Remove "_raw" suffix if present
-            if camera_name_raw.endswith("_raw"):
-                camera_name_cleaned = camera_name_raw[:-4]
-            else:
-                camera_name_cleaned = camera_name_raw
-
-            # 2. If ignoring overlap and this camera is too short, mark with _overlap
+            # A camera that does not cover the whole clip is marked as such
             if config.ignore_overlap and not has_full_overlap:
                 camera_name_cleaned = f"{camera_name_cleaned}_overlap"
 
-            # 3. Set output filename to *_synced.mp4
             output_video_filename = f"{camera_name_cleaned}_synced.mp4"
             output_video_path = os.path.join(
                 config.dataset_folder,
@@ -412,12 +357,6 @@ def cut_video_threaded(
         frame_queue.join()
         futures[1].result()
     print(f"[Main] Finished writing {output_path}")
-
-
-def _pretty_cam_name(cam_key: str) -> str:
-    """Basename without extension; also strips a trailing '_raw'."""
-    name = os.path.splitext(os.path.basename(cam_key))[0]
-    return name[:-4] if name.endswith("_raw") else name
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

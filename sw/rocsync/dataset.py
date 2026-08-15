@@ -116,6 +116,65 @@ def resolve_clips_json(dataset_folder: Path, override: Optional[str] = None) -> 
     return candidates[0]
 
 
+def camera_name(cam_key: str) -> str:
+    """The camera's name: its basename without extension or a trailing '_raw'."""
+    name = os.path.splitext(os.path.basename(cam_key))[0]
+    return name[:-4] if name.endswith("_raw") else name
+
+
+def names_camera_key(cam_key: str, user_value: str) -> bool:
+    """Whether `user_value` is the camera's full key, or a path ending in it."""
+    path = user_value.replace("\\", "/").strip()
+    if path == cam_key.replace("\\", "/"):
+        return True
+
+    # A longer path is matched on its last two segments
+    return "/" in path and os.path.join(*path.split("/")[-2:]) == cam_key
+
+
+def matches_camera_name(cam_key: str, user_value: str) -> bool:
+    """Whether `user_value` names the camera stored under `cam_key`.
+
+    Accepts the full '<parent>/<file>' key, the last two segments of a longer
+    path, or the basename with or without its extension and a trailing '_raw'.
+    """
+    if names_camera_key(cam_key, user_value):
+        return True
+
+    uv_base = os.path.splitext(os.path.basename(user_value.replace("\\", "/").strip()))[
+        0
+    ]
+    key_base = os.path.splitext(os.path.basename(cam_key))[0]
+    return uv_base == key_base or uv_base == camera_name(cam_key)
+
+
+def select_camera_key(cameras: Dict[str, dict], user_value: str, flag: str) -> str:
+    """The one key of `cameras` that `user_value` names.
+
+    Raises a ValueError naming `flag` if nothing matches or several do.
+    """
+    matches = [key for key in cameras if matches_camera_name(key, user_value)]
+
+    # A full key names one camera, so it settles what a shared basename leaves open
+    exact = [key for key in matches if names_camera_key(key, user_value)]
+    if exact:
+        matches = exact
+
+    if not matches:
+        available = ", ".join(sorted({camera_name(key) for key in cameras}))
+        raise ValueError(
+            f"{flag} '{user_value}' did not match any camera.\n"
+            f"Available cameras: [{available}]"
+        )
+    if len(matches) > 1:
+        options = ", ".join(sorted(matches))
+        raise ValueError(
+            f"{flag} '{user_value}' is ambiguous; matches multiple cameras.\n"
+            f"Disambiguate by passing one of these exact keys (last 2 path segments): [{options}]"
+        )
+    return matches[0]
+
+
 def load_video_time_sync(path: str) -> Dict[str, dict]:
     """Read a time-synchronization JSON, keyed by '<parent>/<file>'.
 

@@ -13,8 +13,10 @@ try:
         VIDEO_SUFFIXES,
         DatasetConfig,
         add_common_args,
+        camera_name,
         load_video_time_sync,
         resolve_time_sync_json,
+        select_camera_key,
     )
     from rocsync.timecode import ms_to_timecode, timecode_to_ms
     from rocsync.timeline import affine_from_statistics, per_frame_times
@@ -173,22 +175,7 @@ def main(cfg: Config) -> None:
     screen_w, screen_h = get_screen_size()
     time_sync_data = load_video_time_sync(cfg.time_sync_json_path)
 
-    # Find the time-defining camera entry by basename match
-    matching_key = next(
-        (
-            k
-            for k in time_sync_data
-            if os.path.splitext(os.path.basename(k))[0] == cfg.from_camera
-        ),
-        None,
-    )
-    if not matching_key:
-        raise ValueError(
-            f"No match found for camera basename '{cfg.from_camera}' in time sync JSON.\n"
-            f"Available basenames: "
-            f"{sorted({os.path.splitext(os.path.basename(k))[0] for k in time_sync_data.keys()})}"
-        )
-
+    matching_key = select_camera_key(time_sync_data, cfg.from_camera, "--from-camera")
     time_defining_camera_data = time_sync_data[matching_key]
 
     # Convert local camera time -> global ms
@@ -208,18 +195,18 @@ def main(cfg: Config) -> None:
 
     # For each camera, extract and show the frame corresponding to this global time
     # Pre-extract frames for each camera for this global time
-    frames_info = []  # list of (camera_basename, frame)
+    frames_info = []  # list of (camera name, frame)
     for camera_rel_path, cam_sync_data in tqdm(
         time_sync_data.items(), desc="Extracting frames for each camera"
     ):
         video_path = dataset_folder / camera_rel_path
-        camera_basename = os.path.splitext(os.path.basename(camera_rel_path))[0]
+        camera = camera_name(camera_rel_path)
 
         frame = extract_frame_for_moment(str(video_path), cam_sync_data, global_ms)
         if frame is None:
             continue
 
-        frames_info.append((camera_basename, frame))
+        frames_info.append((camera, frame))
 
     if not frames_info:
         print("[WARN] No frames could be extracted for any camera.")
@@ -234,7 +221,7 @@ def main(cfg: Config) -> None:
     window_name = "Time Sync Check"
 
     while True:
-        camera_basename, frame = frames_info[idx]
+        camera, frame = frames_info[idx]
 
         # --- Resize so width <= 500 px while keeping aspect ratio ---
         max_width = 1000
@@ -252,7 +239,7 @@ def main(cfg: Config) -> None:
         # ------------------------------------------------------------
 
         title = (
-            f"{camera_basename}  @  {cfg.time_string}  "
+            f"{camera}  @  {cfg.time_string}  "
             f"(global: {ms_to_timecode(global_ms)})  "
             f"[{idx + 1}/{len(frames_info)}]"
         )

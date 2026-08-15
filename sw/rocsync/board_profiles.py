@@ -32,6 +32,69 @@ def _ring(radius_mm, period, centre):
     )
 
 
+def _optimal_ring_window(leds):
+    """The half-open window [start, end) of lit ring LEDs that best explains a reading.
+
+    Maximises the number of lit LEDs inside the window minus the number outside,
+    so isolated false detections do not break up an otherwise clean run. Windows
+    may wrap the end of the period, in which case start > end; start == end means
+    no window scored better than the empty one.
+
+    Args:
+        leds: A list of booleans indicating the detected led state.
+
+    Returns:
+        A tuple of [start, end) indices for the optimal window.
+    """
+    nums = [1 if val else -1 for val in leds]
+    n = len(nums)
+    total_sum = sum(nums)
+
+    # --- Find max non-wrapping subarray and its indices (Kadane's Algorithm) ---
+    max_score = -float("inf")
+    max_start, max_end = 0, 0
+    current_max = 0
+    current_start_max = 0
+    for i, x in enumerate(nums):
+        if current_max <= 0:
+            current_start_max = i
+            current_max = x
+        else:
+            current_max += x
+
+        if current_max > max_score:
+            max_score = current_max
+            max_start = current_start_max
+            max_end = i + 1
+
+    # --- Find min non-wrapping subarray and its indices ---
+    min_score = float("inf")
+    min_start, min_end = 0, 0
+    current_min = 0
+    current_start_min = 0
+    for i, x in enumerate(nums):
+        if current_min >= 0:
+            current_start_min = i
+            current_min = x
+        else:
+            current_min += x
+
+        if current_min < min_score:
+            min_score = current_min
+            min_start = current_start_min
+            min_end = i + 1
+
+    # A wrapping window needs at least 2 elements
+    max_wrap_sum = total_sum - min_score if n > 1 else -float("inf")
+
+    # The best window is the best non-wrapping one, the best wrapping one, or empty
+    if max_score > max_wrap_sum and max_score > 0:
+        return max_start, max_end
+    if max_wrap_sum > 0:
+        return min_end, min_start
+    return 0, 0
+
+
 @dataclass(frozen=True)
 class BoardProfile:
     """One revision of the physical board, in millimetres."""
@@ -68,6 +131,22 @@ class BoardProfile:
             self.period,
             self.centre_mm,
         )
+
+    def decode_counter(self, leds):
+        """Counter value from its LED states, most significant bit first."""
+        bits = np.asarray(leds, dtype=bool).reshape(-1)
+        weights = 2 ** np.arange(self.counter_bits - 1, -1, -1)
+        return int(weights[bits].sum())
+
+    def decode_ring(self, leds):
+        """First and last lit ring LED, inclusive, or None if none are lit.
+
+        Tolerates isolated false detections; see ``_optimal_ring_window``.
+        """
+        start, end = _optimal_ring_window(leds)
+        if start == end:
+            return None
+        return start % self.period, (end - 1) % self.period
 
     def board_time_from_ring(self, counter, ring):
         """Board time (start_ms, end_ms) for one counter value and ring reading.
@@ -170,6 +249,12 @@ class RectifiedBoard:
 
     def layout_coords(self, camera_type):
         return self._px(self.profile.layout_coords(camera_type))
+
+    def decode_counter(self, leds):
+        return self.profile.decode_counter(leds)
+
+    def decode_ring(self, leds):
+        return self.profile.decode_ring(leds)
 
     def board_time_from_ring(self, counter, ring):
         return self.profile.board_time_from_ring(counter, ring)

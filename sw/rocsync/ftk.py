@@ -47,59 +47,44 @@ class FTKPipeline:
         self.debug_directory = None
 
 
-def read_ring(
+def read_leds(
     fiducials: list[tuple[float, float]],
-    board: BoardProfile,
+    led_coords: np.ndarray,
     ax: plt.Axes | None = None,
-) -> tuple[int, int] | None:
-    leds = np.zeros(board.period, dtype=bool)
-    for i, led in enumerate(board.ring_led_coords(CameraType.INFRARED)):
-        # Check if any fiducial matches this LED
-        for fiducial in fiducials:
-            distance = np.linalg.norm(fiducial - led)
-            if distance < DISTANCE_THRESHOLD:
-                leds[i] = True
-                break
+) -> np.ndarray:
+    """LED states for the given centres: lit where a fiducial sits close enough."""
+    leds = np.zeros(len(led_coords), dtype=bool)
+    for i, led in enumerate(led_coords):
+        leds[i] = any(
+            np.linalg.norm(fiducial - led) < DISTANCE_THRESHOLD
+            for fiducial in fiducials
+        )
 
         if ax is not None:
             color = "red" if leds[i] else "blue"
             ax.add_patch(Circle(led, DISTANCE_THRESHOLD, color=color, fill=False))
 
-    potential_starts = []
-    potential_ends = []
-    for i in range(board.period):
-        if not leds[(i - 1) % board.period] and leds[i]:
-            potential_starts.append(i)
-        if leds[i] and not leds[(i + 1) % board.period]:
-            potential_ends.append(i)
+    return leds
 
-    # Make sure that there is exactly ONE of enabled
-    if len(potential_starts) == 1 and len(potential_ends) == 1:
-        return (potential_starts[0], potential_ends[0])
+
+def read_ring(
+    fiducials: list[tuple[float, float]],
+    board: BoardProfile,
+    ax: plt.Axes | None = None,
+) -> tuple[int, int] | None:
+    """Ring reading of a board seen by the tracker: first and last lit LED, or None."""
+    leds = read_leds(fiducials, board.ring_led_coords(CameraType.INFRARED), ax)
+    return board.decode_ring(leds)
 
 
 def read_counter(
     fiducials: list[tuple[float, float]],
     board: BoardProfile,
     ax: plt.Axes | None = None,
-):
-    counter = 0
-    # Counter LEDs are listed most significant bit first, matching vision.read_counter.
-    for i, led in enumerate(board.counter_led_coords[CameraType.INFRARED]):
-        enabled = False
-        for fiducial in fiducials:
-            distance = np.linalg.norm(fiducial - led)
-            if distance < DISTANCE_THRESHOLD:
-                enabled = True
-                break
-        if enabled:
-            counter += 2 ** (board.counter_bits - 1 - i)
-
-        if ax is not None:
-            color = "red" if enabled else "blue"
-            ax.add_patch(Circle(led, DISTANCE_THRESHOLD, color=color, fill=False))
-
-    return counter
+) -> int:
+    """Counter reading of a board seen by the tracker."""
+    leds = read_leds(fiducials, board.counter_led_coords[CameraType.INFRARED], ax)
+    return board.decode_counter(leds)
 
 
 def process_frame(

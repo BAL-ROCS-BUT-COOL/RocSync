@@ -1,14 +1,10 @@
 import argparse
 import os
-import queue
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import cv2
-from tqdm import tqdm
 
 try:
     from rocsync.clips import (
@@ -262,101 +258,6 @@ def write_sampled_video_by_indices(
             out.write(frame)
     finally:
         out.release()
-
-
-def cut_video(
-    video_path: str,
-    start_frame: int,
-    end_frame: int,
-    output_path: str,
-    target_fps: float = None,
-):
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise IOError(f"Cannot open video: {video_path}")
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS) if target_fps is None else target_fps
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    start_frame = max(0, start_frame)
-    end_frame = min(end_frame, total_frames - 1)
-    n_frames = end_frame - start_frame + 1
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-    pbar = tqdm(total=n_frames, desc=f"Cutting {os.path.basename(video_path)}")
-    for i in range(n_frames):
-        ret, frame = cap.read()
-        if not ret:
-            break
-        out.write(frame)
-        pbar.update(1)
-    cap.release()
-    out.release()
-    pbar.close()
-
-
-def cut_video_threaded(
-    video_path: str,
-    start_frame: int,
-    end_frame: int,
-    output_path: str,
-    target_fps: float = None,
-):
-    if start_frame >= end_frame:
-        print(f"[cut_video_threaded] Invalid frame range: {start_frame} >= {end_frame}")
-        return
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise IOError(f"Could not open video file: {video_path}")
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    original_fps = cap.get(cv2.CAP_PROP_FPS)
-    fps = target_fps or original_fps
-    start_frame = max(0, min(start_frame, total_frames - 1))
-    end_frame = max(0, min(end_frame, total_frames - 1))
-    n_frames = end_frame - start_frame + 1
-    print(f"[Main] Cutting frames {start_frame}–{end_frame} from {video_path}")
-    print(f"[Main] FPS={fps}, Resolution={width}x{height}, Frames={n_frames}")
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-    frame_queue = queue.Queue(maxsize=64)
-    stop_token = object()
-    write_lock = threading.Lock()
-    pbar = tqdm(total=n_frames, desc=f"Saving {os.path.basename(output_path)}")
-
-    def extractor():
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        for i in range(n_frames):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame_queue.put(frame)
-        frame_queue.put(stop_token)
-        cap.release()
-
-    def writer():
-        while True:
-            frame = frame_queue.get()
-            if frame is stop_token:
-                frame_queue.task_done()
-                break
-            with write_lock:
-                out.write(frame)
-            pbar.update(1)
-            frame_queue.task_done()
-        out.release()
-        pbar.close()
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(extractor), executor.submit(writer)]
-        futures[0].result()
-        frame_queue.join()
-        futures[1].result()
-    print(f"[Main] Finished writing {output_path}")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

@@ -11,7 +11,7 @@ from rocsync.timeline import detect_dropouts, fit_timeline, median_frame_period
 DISTANCE_THRESHOLD = 3
 
 
-maker_format = [
+marker_format = [
     "host_timestamp",
     "ftk_timestamp",
     "type",
@@ -40,11 +40,6 @@ fiducial_format = [
     "z_position",
     "triangulation_error",
 ]
-
-
-class FTKPipeline:
-    def __init__(self) -> None:
-        self.debug_directory = None
 
 
 def read_leds(
@@ -226,8 +221,8 @@ def process_ftk_recording(filename: str, debug_dir=None) -> dict:
                 fields = line.strip().split(",")
 
                 # Find frame with detected marker
-                if len(fields) >= len(maker_format) and fields[2] == "m":
-                    marker = dict(zip(maker_format, fields))
+                if len(fields) >= len(marker_format) and fields[2] == "m":
+                    marker = dict(zip(marker_format, fields))
 
                     # Get board profile for the PCB associated with this marker
                     board = PROFILES_BY_FTK.get(int(marker["marker_id"]))

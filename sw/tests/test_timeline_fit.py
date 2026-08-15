@@ -7,7 +7,6 @@ here come from a real ZED recording (5046 frames, one 27.8 s dropout at ~11.2 s)
 where the index fit reported 0.858x and a first frame of -5.593 s.
 """
 
-import numpy as np
 import pytest
 
 from rocsync.timeline import (

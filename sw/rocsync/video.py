@@ -179,7 +179,6 @@ def process_video_window(
     window_end: float,
     stride=None,
     debug_dir: str = None,
-    brightness_boost: int = None,
     board=None,
 ):
     cap = cv2.VideoCapture(video_path)
@@ -237,7 +236,7 @@ def process_video_window(
 
             if scan_window > 0 or frame_number % stride == 0:
                 rocsync_detected, timestamp = process_frame(
-                    frame, camera_type, frame_number, board, debug_dir, brightness_boost
+                    frame, camera_type, frame_number, board, debug_dir
                 )
                 scan_window -= 1
                 if timestamp is not None:
@@ -263,7 +262,6 @@ def process_video(
     stride=None,
     debug_dir=None,
     windows=None,
-    brightness_boost=None,
     board=None,
 ):
     # Get video metadata
@@ -302,7 +300,6 @@ def process_video(
             window_end,
             stride,
             debug_dir,
-            brightness_boost,
             board,
         )
         timestamps.update(window_timestamps)

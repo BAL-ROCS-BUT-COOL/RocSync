@@ -183,10 +183,7 @@ def find_corners_dots(mask, frame_number, board, debug_dir=None):
     return np.array(closest_points, dtype=np.float32)
 
 
-def find_corners_aruco(mask, frame_number, debug_dir=None, brightness_boost=None):
-    if brightness_boost is not None:
-        mask = np.clip(mask * brightness_boost, 0, 255).astype(np.uint8)
-
+def find_corners_aruco(mask, frame_number, debug_dir=None):
     markers, marker_ids, _ = aruco_detector.detectMarkers(mask)
     if debug_dir:
         debug_image = mask.copy()
@@ -204,7 +201,6 @@ def rectify_board(
     frame_number,
     board=None,
     debug_dir=None,
-    brightness_boost=None,
     board_size=DEFAULT_BOARD_SIZE,
 ):
     """Locate the board in a frame and warp it onto a square pixel grid.
@@ -216,9 +212,7 @@ def rectify_board(
     match camera_type:
         case CameraType.RGB:
             # Detect ArUco markers
-            markers = find_corners_aruco(
-                image, frame_number, debug_dir, brightness_boost
-            )
+            markers = find_corners_aruco(image, frame_number, debug_dir)
             if not markers:
                 return False, None, None
 
@@ -320,12 +314,11 @@ def process_frame(
     frame_number,
     board=None,
     debug_dir=None,
-    brightness_boost=None,
     board_size=DEFAULT_BOARD_SIZE,
 ):
     """Board time (start_ms, end_ms) read off one frame, and whether a board was seen."""
     detected, pcb, board = rectify_board(
-        image, camera_type, frame_number, board, debug_dir, brightness_boost, board_size
+        image, camera_type, frame_number, board, debug_dir, board_size
     )
     if pcb is None:
         return detected, None

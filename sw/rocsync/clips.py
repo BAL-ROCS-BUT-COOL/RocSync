@@ -6,7 +6,7 @@ every output frame, then reading those frames back out of the file.
 
 import json
 from collections.abc import Iterator
-from typing import List, Optional
+from typing import List, Optional  # noqa: UP035
 
 import cv2
 import numpy as np

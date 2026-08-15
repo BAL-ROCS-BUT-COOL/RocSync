@@ -212,7 +212,6 @@ class RectifiedBoard:
         self.counter_bits = profile.counter_bits
         self.aruco_marker_id = profile.aruco_marker_id
         self.led_sample_radius = max(1, round(LED_SAMPLE_RADIUS_MM * self.px_per_mm))
-        self.layout_tol = max(1, round(LAYOUT_TOL_MM * self.px_per_mm))
 
         self.always_on_leds = {
             ct: self._px(coords) for ct, coords in profile.always_on_leds.items()

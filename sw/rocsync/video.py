@@ -175,8 +175,8 @@ def export_frames(video_path, output_path, fit, n_frames=None):
 def process_video_window(
     video_path: str,
     camera_type: CameraType,
-    window_start: int,
-    window_end: int,
+    window_start: float,
+    window_end: float,
     stride=None,
     debug_dir: str = None,
     brightness_boost: int = None,

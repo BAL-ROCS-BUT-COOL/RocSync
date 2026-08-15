@@ -1,8 +1,6 @@
 import argparse
-import json
 import os
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -11,20 +9,23 @@ import numpy as np
 from tqdm import tqdm
 
 try:
+    from rocsync.dataset import (
+        VIDEO_SUFFIXES,
+        DatasetConfig,
+        add_common_args,
+        load_video_time_sync,
+        resolve_time_sync_json,
+    )
+    from rocsync.timecode import ms_to_timecode, timecode_to_ms
     from rocsync.timeline import affine_from_statistics, per_frame_times
 except ImportError:
     raise SystemExit(
         "This script needs the rocsync package: pip install -e <path to RocSync>/sw"
     )
 
-# Reuse the same video extensions as extract_synced_videos.py
-camera_formats = {".mp4", ".mov", ".avi", ".mkv"}
-
 
 @dataclass
-class Config:
-    dataset_folder: str  # root folder containing camera videos and 'time sync/'
-    time_sync_json_path: str  # path to time_synchronization_*.json
+class Config(DatasetConfig):
     from_camera: str  # camera that defines the local time
     time_string: str  # time in that camera's local time (HH:MM:SS.mmm)
 
@@ -47,48 +48,7 @@ def get_screen_size():
         return 1920, 1080
 
 
-def _auto_find_time_sync_json(dataset_folder: Path) -> Path:
-    """
-    Look for 'time sync/time_synchronization_*.json' inside dataset_folder.
-    Prefer a single match; if multiple, pick the first in sorted order.
-    """
-    base = dataset_folder / "time sync"
-    candidates = sorted(base.glob("time_synchronization_*.json"))
-    if not candidates:
-        raise FileNotFoundError(f"No time_synchronization_*.json found under: {base}")
-    return candidates[0]
-
-
-def _parse_timecode_to_milliseconds(timecode: str) -> int:
-    """
-    'HH:MM:SS.mmm' -> milliseconds since 00:00:00.000
-    """
-    dt = datetime.strptime(timecode, "%H:%M:%S.%f")
-    delta = (
-        dt.hour * 3600 + dt.minute * 60 + dt.second
-    ) * 1000 + dt.microsecond // 1000
-    return delta
-
-
-def _ms_to_timecode(ms: float) -> str:
-    """
-    milliseconds -> 'HH:MM:SS.mmm' (string)
-    """
-    ms_int = int(round(ms))
-    seconds, milliseconds = divmod(ms_int, 1000)
-    hours, remainder = divmod(seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
-    return f"{hours:02}:{minutes:02}:{secs:02}.{milliseconds:03}"
-
-
 def _build_arg_parser() -> argparse.ArgumentParser:
-    # Default dataset folder = parent of script (same logic as extract_synced_videos.py)
-    try:
-        script_parent_dir = Path(__file__).resolve().parent.parent
-        default_dataset_folder = str(script_parent_dir)
-    except Exception:
-        default_dataset_folder = os.getcwd()
-
     p = argparse.ArgumentParser(
         description=(
             "Check time synchronization by extracting a single moment from ALL cameras.\n"
@@ -97,14 +57,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "overlap of all cameras, then shows the corresponding frame of each camera."
         )
     )
-    p.add_argument(
-        "--dataset-folder",
-        default=default_dataset_folder,
-        help=(
-            "Root folder containing camera videos and a 'time sync' subfolder. "
-            "Defaults to the parent folder of the script's location."
-        ),
-    )
+    add_common_args(p, __file__)
     p.add_argument(
         "--from-camera",
         required=True,
@@ -116,12 +69,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         help="Time in that camera's local time, format 'HH:MM:SS.mmm' (e.g. '00:05:00.000').",
     )
-    p.add_argument(
-        "--time-sync-json",
-        dest="time_sync_json_path",
-        help="Path to time_synchronization_*.json (optional; auto-detected if omitted).",
-    )
-
     return p
 
 
@@ -132,9 +79,9 @@ def compute_global_time_from_camera(
     Convert a time given in camera-local units to GLOBAL ms through the camera's
     fitted clock. Local time is a position in the container's own timeline, which
     is what the fit maps, so the clock_offset_ms is the correct anchor.
-    (Same math as in Clip._convert_to_real_time, but for a single time.)
+    (Same math as a Clip built with from_camera_time, but for a single time.)
     """
-    local_ms = _parse_timecode_to_milliseconds(time_string)
+    local_ms = timecode_to_ms(time_string)
     clock_rate, clock_offset_ms = affine_from_statistics(camera_time_sync_data)
     return float(clock_offset_ms + clock_rate * local_ms)
 
@@ -160,17 +107,17 @@ def validate_moment_in_overlap(
     if overlap_start >= overlap_end:
         raise ValueError(
             f"No temporal overlap between cameras:\n"
-            f"  max(first_frame)={overlap_start:.2f} ms ({_ms_to_timecode(overlap_start)}) >=\n"
-            f"  min(last_frame)={overlap_end:.2f} ms ({_ms_to_timecode(overlap_end)})."
+            f"  max(first_frame)={overlap_start:.2f} ms ({ms_to_timecode(overlap_start)}) >=\n"
+            f"  min(last_frame)={overlap_end:.2f} ms ({ms_to_timecode(overlap_end)})."
         )
 
     if not (overlap_start <= global_ms <= overlap_end):
         raise ValueError(
             "Requested moment is OUTSIDE the common overlap of all cameras.\n"
-            f"  Moment: {global_ms:.2f} ms ({_ms_to_timecode(global_ms)})\n"
+            f"  Moment: {global_ms:.2f} ms ({ms_to_timecode(global_ms)})\n"
             f"  Overlap (all cameras):\n"
-            f"    [{overlap_start:.2f} ms ({_ms_to_timecode(overlap_start)}), "
-            f"{overlap_end:.2f} ms ({_ms_to_timecode(overlap_end)})]\n\n"
+            f"    [{overlap_start:.2f} ms ({ms_to_timecode(overlap_start)}), "
+            f"{overlap_end:.2f} ms ({ms_to_timecode(overlap_end)})]\n\n"
             "Choose a different --time (in the from-camera) that maps into this overlap."
         )
 
@@ -189,7 +136,7 @@ def extract_frame_for_moment(
         return None
 
     suffix = Path(video_path).suffix.lower()
-    if suffix not in camera_formats:
+    if suffix not in VIDEO_SUFFIXES:
         print(f"[WARN] Not a recognized video format, skipping: {video_path}")
         return None
 
@@ -224,20 +171,7 @@ def main(cfg: Config) -> None:
     print(f"[INFO] Local time in that camera: {cfg.time_string}")
 
     screen_w, screen_h = get_screen_size()
-    # Load time sync JSON
-    with open(cfg.time_sync_json_path, "r", encoding="utf-8") as f:
-        raw_time_sync_data: Dict[str, dict] = json.load(f)
-
-    # Normalize keys to '<parent>/<file>' so they can be joined with dataset_folder,
-    # exactly like in extract_synced_videos.py. Image and FTK device entries land
-    # in the same JSON tagged with their own "type"; only video entries have the
-    # per-frame timeline the overlap checks below need, so anything else is
-    # dropped here.
-    time_sync_data = {
-        os.path.join(*camera.replace("\\", "/").split("/")[-2:]): data
-        for camera, data in raw_time_sync_data.items()
-        if data.get("type") == "video"
-    }
+    time_sync_data = load_video_time_sync(cfg.time_sync_json_path)
 
     # Find the time-defining camera entry by basename match
     matching_key = next(
@@ -263,7 +197,7 @@ def main(cfg: Config) -> None:
     )
     print(
         f"[INFO] Local time '{cfg.time_string}' in '{cfg.from_camera}' "
-        f"maps to global time: {global_ms:.2f} ms ({_ms_to_timecode(global_ms)})"
+        f"maps to global time: {global_ms:.2f} ms ({ms_to_timecode(global_ms)})"
     )
 
     # Validate that this moment lies in the common overlap of all cameras
@@ -319,7 +253,7 @@ def main(cfg: Config) -> None:
 
         title = (
             f"{camera_basename}  @  {cfg.time_string}  "
-            f"(global: {_ms_to_timecode(global_ms)})  "
+            f"(global: {ms_to_timecode(global_ms)})  "
             f"[{idx + 1}/{len(frames_info)}]"
         )
 
@@ -365,12 +299,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     dataset_folder = Path(args.dataset_folder)
-
-    # Auto-detect time sync JSON unless explicitly provided
-    if args.time_sync_json_path:
-        time_sync_path = Path(args.time_sync_json_path)
-    else:
-        time_sync_path = _auto_find_time_sync_json(dataset_folder)
+    time_sync_path = resolve_time_sync_json(dataset_folder, args.time_sync_json_path)
 
     cfg = Config(
         dataset_folder=str(dataset_folder),

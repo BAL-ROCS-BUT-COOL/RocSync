@@ -1,89 +1,50 @@
 import argparse
-import glob
-import json
 import os
 import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import cv2
-import numpy as np
 from tqdm import tqdm
 
 try:
-    from rocsync.clips import read_frames_at_indices
+    from rocsync.clips import (
+        Clip,
+        parse_clips_json,
+        read_frames_at_indices,
+        select_frame_indices,
+    )
+    from rocsync.dataset import (
+        VIDEO_SUFFIXES,
+        ClipExtractionConfig,
+        add_clip_args,
+        add_common_args,
+        load_video_time_sync,
+        resolve_clips_json,
+        resolve_time_sync_json,
+    )
+    from rocsync.timecode import ms_to_timecode
     from rocsync.timeline import affine_from_statistics, per_frame_times
 except ImportError:
     raise SystemExit(
         "This script needs the rocsync package: pip install -e <path to RocSync>/sw"
     )
 
-# Use lowercase, dotted suffixes; we compare with .lower()
-camera_formats = {".mp4", ".mov", ".avi", ".mkv"}
-
 
 @dataclass
-class Config:
-    dataset_folder: str  # root folder containing subfolders with raw and internal calibration videos
-    time_sync_json_path: str  # path to time sync json
-    clips_to_extract_json: str  # path to clips json
-    target_fps: float
-    from_raw_camera_time_of_camera: Optional[str] = None
-    ignore_overlap: bool = (
-        False  # if True, ignore global overlap and mark short cameras with _overlap
-    )
+class Config(ClipExtractionConfig):
+    # if True, ignore global overlap and mark short cameras with _overlap
+    ignore_overlap: bool = False
     only_for_camera: Optional[str] = None
-
-
-def _auto_find_time_sync_json(dataset_folder: Path) -> Path:
-    """
-    Look for 'time sync/time_synchronization_*.json' inside dataset_folder.
-    Prefer a single match; if multiple, pick the first in sorted order.
-    """
-    base = dataset_folder / "time sync"
-    candidates = sorted(base.glob("time_synchronization_*.json"))
-    if not candidates:
-        raise FileNotFoundError(f"No time_synchronization_*.json found under: {base}")
-    return candidates[0]
-
-
-def _auto_find_clips_json(dataset_folder: Path) -> Path:
-    """
-    Prefer 'time sync/clips_config_all.json'; otherwise any *clips*.json in 'time sync/'.
-    """
-    base = dataset_folder / "time sync"
-    preferred = base / "clips_config_all.json"
-    if preferred.exists():
-        return preferred
-    candidates = sorted(base.glob("*clips*.json"))
-    if not candidates:
-        raise FileNotFoundError(
-            f"No clips config JSON found under: {base}. "
-            f"Expected 'clips_config_all.json' or a file matching '*clips*.json'."
-        )
-    return candidates[0]
 
 
 def main(config: Config) -> None:
     print(f"Processing dataset folder: {config.dataset_folder}")
 
-    time_sync_json_path = config.time_sync_json_path
-    with open(time_sync_json_path, "r", encoding="utf-8") as f:
-        time_sync_data_raw: Dict[str, dict] = json.load(f)
-
-    # Normalize keys to '<parent>/<file>' so they can be joined with dataset_folder.
-    # Image and FTK device entries land in the same JSON tagged with their own
-    # "type"; only video entries have the per-frame timeline the overlap checks
-    # below need, so anything else is dropped here.
-    time_sync_data_all: Dict[str, dict] = {
-        os.path.join(*camera.replace("\\", "/").split("/")[-2:]): data
-        for camera, data in time_sync_data_raw.items()
-        if data.get("type") == "video"
-    }
+    time_sync_data_all = load_video_time_sync(config.time_sync_json_path)
 
     def _pretty_cam_name(cam_key: str) -> str:
         """Basename without extension; also strips a trailing '_raw'."""
@@ -140,9 +101,7 @@ def main(config: Config) -> None:
         last_frames = [float(d["last_frame"]) for d in data_dict.values()]
         return max(first_frames), min(last_frames)
 
-    def _cameras_not_covering_clip(
-        data_dict: Dict[str, dict], clip: "Clip"
-    ) -> List[str]:
+    def _cameras_not_covering_clip(data_dict: Dict[str, dict], clip: Clip) -> List[str]:
         bad = []
         for cam_key, d in data_dict.items():
             cam_first = float(d["first_frame"])
@@ -163,14 +122,14 @@ def main(config: Config) -> None:
         )
         defining = time_sync_data_all[defining_key]
         defining_clock_rate, defining_clock_offset_ms = affine_from_statistics(defining)
-        clips = _parse_clips_to_extract_json(
+        clips = parse_clips_json(
             config.clips_to_extract_json,
             from_camera_time=True,
             clock_offset_ms=defining_clock_offset_ms,
             clock_rate=defining_clock_rate,
         )
     else:
-        clips = _parse_clips_to_extract_json(config.clips_to_extract_json)
+        clips = parse_clips_json(config.clips_to_extract_json)
 
     # --- Apply optional extraction filter AFTER clip parsing ---
     if getattr(config, "only_for_camera", None):
@@ -183,7 +142,7 @@ def main(config: Config) -> None:
     else:
         time_sync_data = time_sync_data_all
 
-    to_time_str = Clip._parse_timecode_to_milliseconds_inverse
+    to_time_str = ms_to_timecode
 
     # Compute overlap for:
     # - "all cameras" (diagnostics)
@@ -268,7 +227,7 @@ def main(config: Config) -> None:
                 continue
 
             suffix = Path(raw_video_path).suffix.lower()
-            if suffix not in camera_formats:
+            if suffix not in VIDEO_SUFFIXES:
                 print(f"Not a video: {raw_video_path}. Will skip this camera.")
                 continue
 
@@ -281,8 +240,8 @@ def main(config: Config) -> None:
             # presentation timestamps, so dropped frames stay where they are
             actual_timestamps = per_frame_times(raw_video_path, camera_time_sync_data)
 
-            # Compute the EXACT number of frames we want at target_fps
-            frames_to_extract = _get_frames_to_extract(
+            # One source frame per output frame at target_fps
+            frames_to_extract = select_frame_indices(
                 config.target_fps, actual_timestamps, clip.start, clip.end
             )
 
@@ -325,117 +284,6 @@ def main(config: Config) -> None:
                 output_path=output_video_path,
                 target_fps=config.target_fps,
             )
-
-
-class Clip:
-    def __init__(
-        self,
-        start_string: str,
-        end_string: str,
-        from_camera_time: bool = False,
-        clock_offset_ms: float = None,
-        clock_rate: float = None,
-    ) -> None:
-        if from_camera_time:
-            start_string, end_string = self._convert_to_real_time(
-                start_string, end_string, clock_offset_ms, clock_rate
-            )
-        self.start = self._parse_timecode_to_milliseconds(start_string)
-        self.end = self._parse_timecode_to_milliseconds(end_string)
-        self.start_string_formatted = self._parse_timecode_to_string_formatted(
-            start_string
-        )
-        self.end_string_formatted = self._parse_timecode_to_string_formatted(end_string)
-
-    def _convert_to_real_time(
-        self,
-        start_string: str,
-        end_string: str,
-        clock_offset_ms: float,
-        clock_rate: float,
-    ) -> tuple[str, str]:
-        start = self._parse_timecode_to_milliseconds(start_string)
-        end = self._parse_timecode_to_milliseconds(end_string)
-        start_real = int(round(clock_offset_ms + clock_rate * start))
-        end_real = int(round(clock_offset_ms + clock_rate * end))
-        start_real_string = self._parse_timecode_to_milliseconds_inverse(start_real)
-        end_real_string = self._parse_timecode_to_milliseconds_inverse(end_real)
-        return start_real_string, end_real_string
-
-    @staticmethod
-    def _parse_timecode_to_milliseconds(timecode: str) -> int:
-        dt = datetime.strptime(timecode, "%H:%M:%S.%f")
-        delta = (
-            dt.hour * 3600 + dt.minute * 60 + dt.second
-        ) * 1000 + dt.microsecond // 1000
-        return delta
-
-    @staticmethod
-    def _parse_timecode_to_milliseconds_inverse(ms: int) -> str:
-        seconds, milliseconds = divmod(ms, 1000)
-        hours, remainder = divmod(seconds, 3600)
-        minutes, secs = divmod(remainder, 60)
-        return f"{hours:02}:{minutes:02}:{secs:02}.{milliseconds:03}"
-
-    @staticmethod
-    def _parse_timecode_to_string_formatted(timecode: str) -> str:
-        dt = datetime.strptime(timecode, "%H:%M:%S.%f")
-        return dt.strftime("%H_%M_%S_%f")
-
-
-def _parse_clips_to_extract_json(
-    path: str,
-    from_camera_time: bool = False,
-    clock_offset_ms: float = None,
-    clock_rate: float = None,
-) -> List[Clip]:
-    with open(path, "r", encoding="utf-8") as f:
-        clips_raw = json.load(f)
-    return [
-        Clip(clip["start"], clip["end"], from_camera_time, clock_offset_ms, clock_rate)
-        for clip in clips_raw
-    ]
-
-
-def _get_frames_to_extract(
-    target_fps: float,
-    frame_to_timestamp_map: List[float],
-    start_time: int,
-    end_time: int,
-) -> List[int]:
-    """
-    Return a list of source frame indices to sample so that the output has
-    EXACTLY round((end_time-start_time)/1000 * target_fps) frames.
-    """
-    duration_ms = max(0, end_time - start_time)
-    n_target = int(round(duration_ms / 1000.0 * target_fps))
-    if n_target <= 0:
-        return []
-
-    # Generate exactly n_target timestamps (endpoint excluded to get clean N frames)
-    dt = 1000.0 / target_fps
-    target_timestamps = start_time + np.arange(n_target) * dt
-
-    actual_timestamps = np.asarray(frame_to_timestamp_map, dtype=np.float64)
-
-    frames_to_extract: List[int] = []
-    i = 0
-    for t in tqdm(target_timestamps, desc="Matching timestamps"):
-        # advance i while the next frame is closer to t
-        while i + 1 < len(actual_timestamps) and abs(
-            actual_timestamps[i + 1] - t
-        ) <= abs(actual_timestamps[i] - t):
-            i += 1
-        frames_to_extract.append(i)
-
-    # Guarantee length = n_target
-    if len(frames_to_extract) != n_target:
-        while len(frames_to_extract) < n_target:
-            frames_to_extract.append(frames_to_extract[-1] if frames_to_extract else 0)
-        if len(frames_to_extract) > n_target:
-            frames_to_extract = frames_to_extract[:n_target]
-
-    return frames_to_extract
 
 
 def write_sampled_video_by_indices(
@@ -573,39 +421,11 @@ def _pretty_cam_name(cam_key: str) -> str:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    # Get the parent directory of the script's location
-    # This assumes the script is inside a subdirectory (like 'time sync')
-    try:
-        # Resolve the path to handle symlinks and get the absolute path
-        script_parent_dir = Path(__file__).resolve().parent.parent
-        default_dataset_folder = str(script_parent_dir)
-    except NameError:
-        # Fallback if __file__ is not defined (e.g., in some interactive environments)
-        # Using a sensible default if the dynamic path calculation fails
-        default_dataset_folder = os.getcwd()
-    except Exception:
-        # General fallback
-        default_dataset_folder = os.getcwd()
-
     p = argparse.ArgumentParser(
         description="Extract synchronized clips at a fixed target FPS."
     )
-    p.add_argument(
-        "--dataset-folder",
-        default=default_dataset_folder,
-        help="Root folder containing camera videos and a 'time sync' subfolder. Defaults to the parent folder of the script's location.",
-    )
-    p.add_argument(
-        "--target-fps",
-        type=float,
-        default=30,
-        help="Output FPS for the sampled videos (e.g., 30)",
-    )
-    p.add_argument(
-        "--from-camera",
-        dest="from_raw_camera_time_of_camera",
-        help="Camera basename that defines clip timecodes (optional)",
-    )
+    add_common_args(p, __file__)
+    add_clip_args(p)
     p.add_argument(
         "--ignore-overlap",
         action="store_true",
@@ -614,17 +434,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Cameras that do not fully cover the clip will get an '_overlap' "
             "suffix in their output filename."
         ),
-    )
-    # Optional overrides (otherwise auto-detected relative to dataset_folder)
-    p.add_argument(
-        "--time-sync-json",
-        dest="time_sync_json_path",
-        help="Path to time_synchronization_*.json (optional)",
-    )
-    p.add_argument(
-        "--clips-json",
-        dest="clips_to_extract_json",
-        help="Path to clips config JSON (optional)",
     )
     p.add_argument(
         "--only-for-camera",
@@ -642,17 +451,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     dataset_folder = Path(args.dataset_folder)
-
-    # Auto-detect relative config files unless explicitly provided
-    if args.time_sync_json_path:
-        time_sync_path = Path(args.time_sync_json_path)
-    else:
-        time_sync_path = _auto_find_time_sync_json(dataset_folder)
-
-    if args.clips_to_extract_json:
-        clips_path = Path(args.clips_to_extract_json)
-    else:
-        clips_path = _auto_find_clips_json(dataset_folder)
+    time_sync_path = resolve_time_sync_json(dataset_folder, args.time_sync_json_path)
+    clips_path = resolve_clips_json(dataset_folder, args.clips_to_extract_json)
 
     cfg = Config(
         dataset_folder=str(dataset_folder),

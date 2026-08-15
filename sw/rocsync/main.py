@@ -12,6 +12,7 @@ from tqdm import tqdm
 from rocsync.board_profiles import PROFILES_BY_NAME
 from rocsync.ftk import process_ftk_recording
 from rocsync.printer import errprint, succprint, warnprint
+from rocsync.timecode import parse_hms
 from rocsync.video import process_video
 from rocsync.vision import CameraType, process_frame
 
@@ -54,28 +55,14 @@ def mkdir_unique(name, parent_dir):
     return str(debug_dir)
 
 
-def _parse_hms(time_str: str, original: str) -> float:
-    """Seconds from an hh:mm:ss time."""
-    invalid = ValueError(
-        f"invalid time {original!r}, expected hh:mm:ss, 'end' or 'end-hh:mm:ss'"
-    )
-    fields = time_str.split(":")
-    if len(fields) != 3:
-        raise invalid
-    try:
-        h, m, s = int(fields[0]), int(fields[1]), float(fields[2])
-    except ValueError:
-        raise invalid from None
-    if h < 0 or m < 0 or s < 0:
-        raise invalid
-
-    return h * 3600 + m * 60 + s
+WINDOW_TIME_FORMATS = "hh:mm:ss, 'end' or 'end-hh:mm:ss'"
 
 
 def parse_time(time_str: str) -> float:
     """Parses a time in hh:mm:ss format, "end" for the end of the file, or
     "end-hh:mm:ss" for an offset back from it.
 
+    The seconds may be fractional, so a window can be given to the millisecond.
     An offset from the end is returned as a negative time.
     """
     text = time_str.strip().lower()
@@ -84,9 +71,9 @@ def parse_time(time_str: str) -> float:
     # A bare leading "-" means the same, but needs quoting on a command line
     for prefix in ("end-", "-"):
         if text.startswith(prefix):
-            return -_parse_hms(text[len(prefix) :], time_str)
+            return -parse_hms(text[len(prefix) :], time_str, WINDOW_TIME_FORMATS)
 
-    return _parse_hms(text, time_str)
+    return parse_hms(text, time_str, WINDOW_TIME_FORMATS)
 
 
 def main():
@@ -154,9 +141,10 @@ def main():
         nargs=2,
         action="append",
         metavar=("START", "END"),
-        help="time span to search, in hh:mm:ss format; 'end' is the end of the file and "
-        "'end-hh:mm:ss' counts back from it, e.g. --window end-0:00:30 end. Repeat for "
-        "several spans; overlapping ones are merged (default: whole file)",
+        help="time span to search, in hh:mm:ss format with optionally fractional "
+        "seconds; 'end' is the end of the file and 'end-hh:mm:ss' counts back from it, "
+        "e.g. --window end-0:00:30 end. Repeat for several spans; overlapping ones are "
+        "merged (default: whole file)",
     )
     parser.add_argument(
         "--recurse_in_dir",

@@ -11,12 +11,38 @@ This folder contains the Python application for detecting and decoding the RocSy
 6. **Timestamp fitting**: If the input was a video, perform robust linear regression on all extracted timestamps to reject outliers and estimate timestamps for all frames.
 
 ## Installation
-To install RocSync as a Python module, run the following commands:
+RocSync uses [uv](https://docs.astral.sh/uv/) as its package manager. Install it first if you
+do not have it:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Then install RocSync as a tool, which puts the `rocsync` and `rocsync-align` commands on your
+`PATH` in their own isolated environment:
+
+```bash
+git clone https://github.com/jaromeyer/RocSync.git
+uv tool install ./RocSync/sw
+```
+
+To run it once without installing anything permanently:
+
+```bash
+uvx --from ./RocSync/sw rocsync -h
+```
+
+<details>
+<summary>Installing with pip instead</summary>
 
 ```bash
 git clone https://github.com/jaromeyer/RocSync.git
 pip install ./RocSync/sw
 ```
+</details>
+
+Time-syncing videos (`--sync_video` and `rocsync-align`) additionally requires `ffmpeg` on your
+`PATH`; hardware encoding needs an `ffmpeg` built with `hevc_nvenc`.
 
 ## Usage
 ```
@@ -81,6 +107,40 @@ ffmpeg \
 	-r 30 \
 	synchronized.mp4
 ```
+
+## Development
+Everyone works against the same pinned environment, described by `pyproject.toml` and locked in
+`uv.lock`. Create it with:
+
+```bash
+cd RocSync/sw
+uv sync
+```
+
+This creates `.venv/` with the runtime dependencies plus the `dev` group (ruff, basedpyright,
+pytest) at exactly the locked versions, and installs `rocsync` itself in editable mode. Re-run
+`uv sync` after pulling; it is fast and idempotent. Prefix commands with `uv run` to use that
+environment without activating it.
+
+| Task | Command |
+| --- | --- |
+| Run the test suite | `uv run pytest` |
+| Format the code | `uv run ruff format .` |
+| Check formatting only | `uv run ruff format --check .` |
+| Lint | `uv run ruff check .` |
+| Lint and apply safe fixes | `uv run ruff check --fix .` |
+| Type-check | `uv run basedpyright` |
+
+Ruff handles both formatting and linting, so no separate formatter is needed. All three tools
+read their configuration from `pyproject.toml`; do not pass overriding flags on the command line,
+otherwise results differ between machines. Run the format, lint, and type-check commands before
+opening a pull request.
+
+Some tests synthesize video fixtures with `ffmpeg` and skip themselves automatically when it is
+not installed. Install `ffmpeg` to run the full suite.
+
+To add or change a dependency, edit `pyproject.toml` and run `uv sync`, then commit the updated
+`uv.lock` alongside it.
 
 ## Ideas for future improvements
 - [ ] Write debug images in separate thread to not slow down the main processing

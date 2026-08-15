@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -13,7 +13,13 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
-dependencies = ["matplotlib", "numpy", "opencv-python", "scikit-learn", "tqdm"]
+dependencies = [
+    "matplotlib>=3.8",
+    "numpy>=2.0",
+    "opencv-python>=4.10",
+    "scikit-learn>=1.4",
+    "tqdm>=4.66",
+]
 
 [project.urls]
 "Homepage" = "https://github.com/jaromeyer/rocsync"
@@ -22,22 +28,43 @@ dependencies = ["matplotlib", "numpy", "opencv-python", "scikit-learn", "tqdm"]
 rocsync = "rocsync.main:main"
 rocsync-align = "rocsync.helpers.align:main"
 
-[tool.setuptools]
-# This replaces find_packages()
-packages = { find = {} }
-
-[tool.black]
-line-length = 88
-target-version = ["py310", "py311", "py312"]
-include = '\.pyi?$'
-extend-exclude = '''
-(
-  | \.venv/
-)
-'''
-
 [dependency-groups]
-dev = [
-    "black>=26.5.1",
-    "pytest>=9.1.1",
+dev = ["basedpyright>=1.39", "pytest>=9.1.1", "ruff>=0.16.3"]
+
+[tool.setuptools]
+# Only the library ships; tests/ and evaluation/ stay out of site-packages
+packages = { find = { include = ["rocsync*"] } }
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E4",   # pycodestyle: imports
+    "E7",   # pycodestyle: statements
+    "E9",   # pycodestyle: syntax and IO errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "PIE",  # flake8-pie
+    "SIM",  # flake8-simplify
+    "BLE",  # flake8-blind-except
+    "PERF", # perflint
+    "FURB", # refurb
+    "RUF",  # ruff-specific
 ]
+# Non-ASCII typography in user-facing strings is deliberate
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.basedpyright]
+typeCheckingMode = "standard"
+pythonVersion = "3.10"
+include = ["rocsync", "tests", "evaluation"]
+exclude = ["**/__pycache__", ".venv", "build", "dist"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers", "--strict-config"]

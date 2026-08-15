@@ -6,7 +6,6 @@ every output frame, then reading those frames back out of the file.
 
 import json
 from collections.abc import Iterator
-from typing import List, Optional  # noqa: UP035
 
 import cv2
 import numpy as np
@@ -28,16 +27,19 @@ class Clip:
         start_string: str,
         end_string: str,
         from_camera_time: bool = False,
-        clock_offset_ms: Optional[float] = None,
-        clock_rate: Optional[float] = None,
+        clock_offset_ms: float | None = None,
+        clock_rate: float | None = None,
     ) -> None:
         if from_camera_time:
+            if clock_offset_ms is None or clock_rate is None:
+                raise ValueError(
+                    "from_camera_time needs both clock_offset_ms and clock_rate to map "
+                    "the camera's timeline onto board time."
+                )
             start_string = ms_to_timecode(
                 clock_offset_ms + clock_rate * timecode_to_ms(start_string)
             )
-            end_string = ms_to_timecode(
-                clock_offset_ms + clock_rate * timecode_to_ms(end_string)
-            )
+            end_string = ms_to_timecode(clock_offset_ms + clock_rate * timecode_to_ms(end_string))
 
         self.start = timecode_to_ms(start_string)
         self.end = timecode_to_ms(end_string)
@@ -48,11 +50,11 @@ class Clip:
 def parse_clips_json(
     path: str,
     from_camera_time: bool = False,
-    clock_offset_ms: Optional[float] = None,
-    clock_rate: Optional[float] = None,
-) -> List[Clip]:
+    clock_offset_ms: float | None = None,
+    clock_rate: float | None = None,
+) -> list[Clip]:
     """Read a clips config: a JSON list of {"start": ..., "end": ...} timecodes."""
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         clips_raw = json.load(f)
 
     return [
@@ -63,10 +65,10 @@ def parse_clips_json(
 
 def select_frame_indices(
     target_fps: float,
-    frame_times: List[float],
+    frame_times: list[float],
     start_ms: float,
     end_ms: float,
-) -> List[int]:
+) -> list[int]:
     """Source frame indices sampling [`start_ms`, `end_ms`) onto a uniform `target_fps` grid.
 
     `frame_times` holds the board time of every source frame, so the clip is
@@ -85,13 +87,13 @@ def select_frame_indices(
     dt = 1000.0 / target_fps
     target_timestamps = np.arange(start_ms, end_ms, dt)
 
-    frames_to_extract: List[int] = []
+    frames_to_extract: list[int] = []
     i = 0
     for t in tqdm(target_timestamps, desc="Matching timestamps"):
         # The grid only increases, so the search never has to walk back
-        while i + 1 < len(actual_timestamps) and abs(
-            actual_timestamps[i + 1] - t
-        ) < abs(actual_timestamps[i] - t):
+        while i + 1 < len(actual_timestamps) and abs(actual_timestamps[i + 1] - t) < abs(
+            actual_timestamps[i] - t
+        ):
             i += 1
         frames_to_extract.append(i)
 
@@ -131,7 +133,7 @@ def read_frames_at_indices(
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        raise IOError(f"Could not open video file: {video_path}")
+        raise OSError(f"Could not open video file: {video_path}")
 
     try:
         # Skipping to the first requested frame is the one seek worth doing.
@@ -166,10 +168,7 @@ def read_frames_at_indices(
                     )
                     return
 
-                while (
-                    out_index < len(frame_indices)
-                    and frame_indices[out_index] <= source_index
-                ):
+                while out_index < len(frame_indices) and frame_indices[out_index] <= source_index:
                     yield out_index, frame
                     out_index += 1
                     pbar.update(1)

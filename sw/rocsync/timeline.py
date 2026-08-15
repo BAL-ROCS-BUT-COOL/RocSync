@@ -12,10 +12,12 @@ is all any consumer needs in order to time a frame it has just decoded.
 """
 
 from dataclasses import dataclass, field
+from itertools import pairwise
+from typing import cast
 
 import cv2
 import numpy as np
-from sklearn.linear_model import RANSACRegressor
+from sklearn.linear_model import LinearRegression, RANSACRegressor
 from sklearn.metrics import root_mean_squared_error
 
 
@@ -32,8 +34,8 @@ class TimelineFit:
     r2_after: float
     rmse_after: float
     residual_threshold: float
-    source_time_min: float  # smallest source-clock value among all measurements offered to the fit
-    source_time_max: float  # largest source-clock value among all measurements offered to the fit
+    source_time_min: float  # smallest source-clock value offered to the fit
+    source_time_max: float  # largest source-clock value offered to the fit
 
     def predict(self, pts_ms):
         """Board time in ms for one or many container timestamps in ms."""
@@ -86,8 +88,8 @@ def detect_dropouts(pts, period):
         return 0, 0, 0.0, []
 
     gaps = []
-    for before, after in zip(values[:-1], values[1:]):
-        missing = int(round((after - before) / period)) - 1
+    for before, after in pairwise(values):
+        missing = round((after - before) / period) - 1
         if missing >= 1:
             gaps.append((float(before), float(after), missing))
 
@@ -120,8 +122,7 @@ def fit_timeline(
     order = sorted(k for k in timestamps if frame_times.get(k) is not None)
     if len(order) < 2:
         raise ValueError(
-            f"Need at least 2 timestamped frames with a known source "
-            f"timestamp, got {len(order)}."
+            f"Need at least 2 timestamped frames with a known source timestamp, got {len(order)}."
         )
 
     valid_source_times = [v for v in frame_times.values() if v is not None]
@@ -143,12 +144,13 @@ def fit_timeline(
     )
     model.fit(x, y)
 
-    clock_rate = float(model.estimator_.coef_[0])
-    clock_offset_ms = float(model.estimator_.intercept_)
+    # RANSACRegressor defaults to a LinearRegression base estimator
+    estimator = cast(LinearRegression, model.estimator_)
+    clock_rate = float(estimator.coef_[0])
+    clock_offset_ms = float(estimator.intercept_)
     if not np.isfinite(clock_rate) or clock_rate <= 0:
         raise ValueError(
-            f"Fitted clock_rate is {clock_rate}, but board time must advance "
-            f"with the source clock."
+            f"Fitted clock_rate is {clock_rate}, but board time must advance with the source clock."
         )
     if not np.isfinite(clock_offset_ms):
         raise ValueError(f"Fitted clock_offset_ms is {clock_offset_ms}.")

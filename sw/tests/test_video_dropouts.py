@@ -104,9 +104,7 @@ def test_reader_reports_the_presentation_timestamp_of_each_frame(gap_video):
 
     cap = cv2.VideoCapture(gap_video, cv2.CAP_FFMPEG)
     frame_queue = queue_module.Queue(maxsize=8)
-    thread = __import__("threading").Thread(
-        target=video.read_frames_async, args=(cap, frame_queue)
-    )
+    thread = __import__("threading").Thread(target=video.read_frames_async, args=(cap, frame_queue))
     thread.daemon = True
     thread.start()
 
@@ -126,6 +124,7 @@ def test_reader_reports_the_presentation_timestamp_of_each_frame(gap_video):
 
 def test_process_video_recovers_the_clock_across_a_dropout(gap_video, board_at_pts):
     statistics = video.process_video(gap_video, CameraType.RGB, stride=1)
+    assert statistics is not None, "process_video found no board"
 
     # The container clock is correct as it stands, so no rescaling is needed.
     # Fitting on the frame index instead would misplace this by the 1.5 s hole.
@@ -148,6 +147,7 @@ def test_process_video_recovers_the_clock_across_a_dropout(gap_video, board_at_p
 
 def test_last_frame_is_anchored_on_a_frame_that_exists(gap_video, board_at_pts):
     statistics = video.process_video(gap_video, CameraType.RGB, stride=1)
+    assert statistics is not None, "process_video found no board"
 
     pts = frame_pts(gap_video)
     assert statistics.last_frame == pytest.approx(pts[-1] + OFFSET, abs=1.0)
@@ -172,9 +172,7 @@ def test_window_selects_frames_by_timestamp_not_by_index(gap_video, board_at_pts
     assert max(analyzed_pts) <= window_end * 1000
 
     # Every frame the file actually has in that span was analyzed
-    expected = [
-        p for p in frame_pts(gap_video) if window_start * 1000 <= p <= window_end * 1000
-    ]
+    expected = [p for p in frame_pts(gap_video) if window_start * 1000 <= p <= window_end * 1000]
     assert sorted(analyzed_pts) == pytest.approx(sorted(expected))
 
     # Indices are shifted by the 45 removed frames, so an index-derived window
@@ -197,12 +195,11 @@ def test_a_single_window_is_the_only_span_analyzed(gap_video, board_at_pts):
     assert max(analyzed_pts) <= 3500
 
 
-def test_disjoint_windows_are_analyzed_and_the_span_between_them_is_not(
-    gap_video, board_at_pts
-):
+def test_disjoint_windows_are_analyzed_and_the_span_between_them_is_not(gap_video, board_at_pts):
     statistics = video.process_video(
         gap_video, CameraType.RGB, stride=1, windows=[(0.0, 0.5), (3.0, 3.5)]
     )
+    assert statistics is not None, "process_video found no board"
 
     analyzed_pts = [pts for _, pts in board_at_pts]
     assert any(pts <= 500 for pts in analyzed_pts)
@@ -218,6 +215,7 @@ def test_overlapping_windows_are_merged_into_one_scan(gap_video, board_at_pts):
     statistics = video.process_video(
         gap_video, CameraType.RGB, stride=1, windows=[(0.0, 2.0), (1.0, 3.0)]
     )
+    assert statistics is not None, "process_video found no board"
 
     analyzed_indices = [index for index, _ in board_at_pts]
     assert analyzed_indices, "nothing was analyzed"
@@ -231,9 +229,7 @@ def test_overlapping_windows_are_merged_into_one_scan(gap_video, board_at_pts):
 
 def test_negative_window_bounds_count_back_from_the_last_frame(gap_video, board_at_pts):
     pts = frame_pts(gap_video)
-    video.process_video(
-        gap_video, CameraType.RGB, stride=1, windows=[(-1.0, math.inf)]
-    )
+    video.process_video(gap_video, CameraType.RGB, stride=1, windows=[(-1.0, math.inf)])
 
     analyzed_pts = [p for _, p in board_at_pts]
     assert analyzed_pts, "nothing was analyzed"

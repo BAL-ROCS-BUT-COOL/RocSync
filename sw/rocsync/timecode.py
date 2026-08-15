@@ -5,20 +5,14 @@ config. Fields need no zero padding, the seconds may be fractional and the hours
 are not capped at 24, so a time can be written the way a player displays it.
 """
 
-from typing import Optional
 
-
-def parse_hms(
-    time_str: str, original: Optional[str] = None, expected: str = "hh:mm:ss"
-) -> float:
+def parse_hms(time_str: str, original: str | None = None, expected: str = "hh:mm:ss") -> float:
     """Seconds from an 'hh:mm:ss' or 'hh:mm:ss.mmm' time.
 
     `original` is the text to quote in the error when the caller has already
     stripped a prefix off it, and `expected` names the formats it accepts.
     """
-    invalid = ValueError(
-        f"invalid time {(original or time_str)!r}, expected {expected}"
-    )
+    invalid = ValueError(f"invalid time {(original or time_str)!r}, expected {expected}")
 
     fields = time_str.split(":")
     if len(fields) != 3:
@@ -40,7 +34,7 @@ def timecode_to_ms(timecode: str) -> int:
 
 def ms_to_timecode(ms: float) -> str:
     """Milliseconds since 00:00:00.000 -> 'HH:MM:SS.mmm'."""
-    seconds, milliseconds = divmod(int(round(ms)), 1000)
+    seconds, milliseconds = divmod(round(ms), 1000)
     hours, remainder = divmod(seconds, 3600)
     minutes, secs = divmod(remainder, 60)
     return f"{hours:02}:{minutes:02}:{secs:02}.{milliseconds:03}"

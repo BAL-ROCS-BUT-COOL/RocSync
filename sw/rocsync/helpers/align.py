@@ -5,6 +5,7 @@ import shlex
 import subprocess
 
 import cv2
+
 from rocsync.printer import errprint, succprint, warnprint
 from rocsync.timeline import affine_from_statistics, per_frame_times
 
@@ -12,17 +13,13 @@ from rocsync.timeline import affine_from_statistics, per_frame_times
 def hevc_nvenc_available() -> bool:
     """Whether this ffmpeg can encode with hevc_nvenc, which is far faster than libx265."""
     try:
-        encoders = subprocess.check_output(
-            ["ffmpeg", "-hide_banner", "-encoders"], text=True
-        )
+        encoders = subprocess.check_output(["ffmpeg", "-hide_banner", "-encoders"], text=True)
     except (OSError, subprocess.CalledProcessError):
         return False
     return "hevc_nvenc" in encoders
 
 
-def reap(
-    running: list[tuple[str, subprocess.Popen]], failed: list[str], block: bool
-) -> None:
+def reap(running: list[tuple[str, subprocess.Popen]], failed: list[str], block: bool) -> None:
     """Drop finished encodes from `running`, recording non-zero exits in `failed`.
 
     With `block`, waits for the oldest encode first instead of spinning.
@@ -79,15 +76,11 @@ def main():
     if args.jobs < 0:
         parser.error("--jobs must be 0 (unlimited) or a positive number")
 
-    with open(args.sync_file, "r") as file:
+    with open(args.sync_file) as file:
         stats = json.load(file)
 
     # Filter recordings, keep only videos (image and ftk cannot be processed).
-    videos = {
-        path: data
-        for path, data in stats.items()
-        if data and data.get("type") == "video"
-    }
+    videos = {path: data for path, data in stats.items() if data and data.get("type") == "video"}
     if not videos:
         errprint(
             f"No video entries found in {args.sync_file}; nothing to align. "
@@ -100,9 +93,7 @@ def main():
         print(f"Ignoring {skipped} non-video entries in {args.sync_file}")
 
     expected_fps = (
-        int(round(next(iter(videos.values()))["expected_fps"]))
-        if args.fps is None
-        else args.fps
+        round(next(iter(videos.values()))["expected_fps"]) if args.fps is None else args.fps
     )
     print(f"Syncing {len(videos)} videos to {expected_fps} FPS")
 
@@ -159,13 +150,11 @@ def main():
         print(f"Output file will be saved to {output_file}. Input file: {file}")
 
         if os.path.exists(output_file):
-            try:
-                vid = cv2.VideoCapture(output_file)
-                if not vid.isOpened():
-                    raise ValueError("Could not open video file")
-            except Exception as e:
-                pass
-            else:
+            # A readable output file means this video was already synced
+            vid = cv2.VideoCapture(output_file)
+            already_synced = vid.isOpened()
+            vid.release()
+            if already_synced:
                 print(f"Skipping {file}, already synced.")
                 continue
 

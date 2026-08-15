@@ -69,7 +69,7 @@ def test_fit_survives_many_dropouts():
     """The FusionTrack case: 4 gaps, 50.7 s of excess, 52.94% inliers before."""
     pts, t = [], 0.0
     period = 1000 / 25.77
-    for segment, gap in enumerate([12_000.0, 20_300.0, 8_400.0, 10_000.0, 0.0]):
+    for gap in [12_000.0, 20_300.0, 8_400.0, 10_000.0, 0.0]:
         for _ in range(100):
             pts.append(t)
             t += period
@@ -95,7 +95,7 @@ def test_fit_rejects_misread_board_timestamps():
         timestamps[k] = (start + shift, end + shift)
 
     fit = fit_timeline(frame_times, timestamps)
-    rejected = {k for k, ok in zip(fit.order, fit.inlier_mask) if not ok}
+    rejected = {k for k, ok in zip(fit.order, fit.inlier_mask, strict=True) if not ok}
 
     assert rejected == set(corrupted)
     assert fit.clock_rate == pytest.approx(1.0, abs=1e-9)
@@ -104,9 +104,7 @@ def test_fit_rejects_misread_board_timestamps():
 def test_fit_measures_a_drifting_clock():
     """+8.6 ppm, the drift measured on the ZED recording."""
     frame_times = {i: i * PERIOD for i in range(4000)}
-    fit = fit_timeline(
-        frame_times, board_timestamps(frame_times, clock_rate=1.0000086, stride=30)
-    )
+    fit = fit_timeline(frame_times, board_timestamps(frame_times, clock_rate=1.0000086, stride=30))
     assert fit.clock_rate == pytest.approx(1.0000086, abs=1e-9)
 
 
@@ -146,7 +144,10 @@ def test_detect_dropouts_on_a_gapless_timeline():
 
 
 def test_affine_reads_clock_rate_and_clock_offset_ms():
-    assert affine_from_statistics({"clock_rate": 1.5, "clock_offset_ms": 2.0}) == (1.5, 2.0)
+    assert affine_from_statistics({"clock_rate": 1.5, "clock_offset_ms": 2.0}) == (
+        1.5,
+        2.0,
+    )
 
 
 def test_affine_rejects_data_from_before_the_pts_fit():

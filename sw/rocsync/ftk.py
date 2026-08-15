@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.axes import Axes
 from matplotlib.patches import Circle
 from tqdm import tqdm
 
@@ -45,15 +46,12 @@ fiducial_format = [
 def read_leds(
     fiducials: list[tuple[float, float]],
     led_coords: np.ndarray,
-    ax: plt.Axes | None = None,
+    ax: Axes | None = None,
 ) -> np.ndarray:
     """LED states for the given centres: lit where a fiducial sits close enough."""
     leds = np.zeros(len(led_coords), dtype=bool)
     for i, led in enumerate(led_coords):
-        leds[i] = any(
-            np.linalg.norm(fiducial - led) < DISTANCE_THRESHOLD
-            for fiducial in fiducials
-        )
+        leds[i] = any(np.linalg.norm(fiducial - led) < DISTANCE_THRESHOLD for fiducial in fiducials)
 
         if ax is not None:
             color = "red" if leds[i] else "blue"
@@ -65,7 +63,7 @@ def read_leds(
 def read_ring(
     fiducials: list[tuple[float, float]],
     board: BoardProfile,
-    ax: plt.Axes | None = None,
+    ax: Axes | None = None,
 ) -> tuple[int, int] | None:
     """Ring reading of a board seen by the tracker: first and last lit LED, or None."""
     leds = read_leds(fiducials, board.ring_led_coords(CameraType.INFRARED), ax)
@@ -75,7 +73,7 @@ def read_ring(
 def read_counter(
     fiducials: list[tuple[float, float]],
     board: BoardProfile,
-    ax: plt.Axes | None = None,
+    ax: Axes | None = None,
 ) -> int:
     """Counter reading of a board seen by the tracker."""
     leds = read_leds(fiducials, board.counter_led_coords[CameraType.INFRARED], ax)
@@ -87,7 +85,7 @@ def process_frame(
     rotation_matrix: np.ndarray,
     fiducials: list[dict],
     board: BoardProfile,
-    ax: plt.Axes | None = None,
+    ax: Axes | None = None,
 ) -> tuple[int, int] | None:
     # Transform fiducials into local coordinate system
     transformed_fiducials = []
@@ -114,7 +112,8 @@ def process_frame(
 
     # Rotate until counter is readable
     # TODO: not required for Rev2
-    for i in range(4):
+    counter = 0
+    for _ in range(4):
         counter = read_counter(transformed_fiducials, board, ax)
         if counter > 0:
             break
@@ -171,13 +170,11 @@ def fit_ftk_timestamps(
     )
 
     period = median_frame_period(frame_times.values())
-    n_gaps, n_dropped_frames, largest_gap_ms, _ = detect_dropouts(
-        frame_times.values(), period
-    )
+    n_gaps, n_dropped_frames, largest_gap_ms, _ = detect_dropouts(frame_times.values(), period)
 
     considered = {
         k: timestamps[k]
-        for k, is_inlier in zip(fit.order, fit.inlier_mask)
+        for k, is_inlier in zip(fit.order, fit.inlier_mask, strict=True)
         if is_inlier
     }
     exposure_times = [end - start for start, end in considered.values()]
@@ -205,143 +202,138 @@ def fit_ftk_timestamps(
     return results
 
 
-def process_ftk_recording(filename: str, debug_dir=None) -> dict:
-    with open(filename, "r") as file:
+def process_ftk_recording(filename: str, debug_dir=None) -> dict | None:
+    with open(filename) as file:
         total_lines = sum(1 for _ in file)
 
     timestamps = {}
     frame_times = {}
-    with open(filename, "r") as file:
-        with tqdm(total=total_lines, desc="Processing lines") as pbar:
-            while True:
-                line = file.readline()
-                if not line:
-                    break
-                pbar.update(1)
-                fields = line.strip().split(",")
+    with open(filename) as file, tqdm(total=total_lines, desc="Processing lines") as pbar:
+        while True:
+            line = file.readline()
+            if not line:
+                break
+            pbar.update(1)
+            fields = line.strip().split(",")
 
-                # Find frame with detected marker
-                if len(fields) >= len(marker_format) and fields[2] == "m":
-                    marker = dict(zip(marker_format, fields))
+            # Find frame with detected marker
+            if len(fields) >= len(marker_format) and fields[2] == "m":
+                marker = dict(zip(marker_format, fields[: len(marker_format)], strict=True))
 
-                    # Get board profile for the PCB associated with this marker
-                    board = PROFILES_BY_FTK.get(int(marker["marker_id"]))
-                    if board is None:
-                        continue
+                # Get board profile for the PCB associated with this marker
+                board = PROFILES_BY_FTK.get(int(marker["marker_id"]))
+                if board is None:
+                    continue
 
-                    # Record every frame the tracker reported for this board,
-                    # whether or not the counter/ring below decodes: the frame
-                    # count and any dropouts are measured off this map.
-                    ftk_timestamp = int(marker["ftk_timestamp"])
-                    frame_times[ftk_timestamp] = ftk_timestamp
+                # Record every frame the tracker reported for this board,
+                # whether or not the counter/ring below decodes: the frame
+                # count and any dropouts are measured off this map.
+                ftk_timestamp = int(marker["ftk_timestamp"])
+                frame_times[ftk_timestamp] = ftk_timestamp
 
-                    # Read and collect all related fiducials (type "f") immediately after this marker
-                    fiducials = []
+                # Read and collect all related fiducials (type "f") immediately after this marker
+                fiducials = []
+                current_pos = file.tell()
+                while True:
+                    fid_line = file.readline()
+                    if not fid_line:
+                        break
+                    fid_fields = fid_line.strip().split(",")
+                    if (
+                        len(fid_fields) < len(fiducial_format)
+                        or fid_fields[2] != "f"
+                        or fid_fields[1] != marker["ftk_timestamp"]
+                    ):
+                        # Not a fiducial or not part of the marker; stop collecting and restore cursor
+                        file.seek(current_pos)
+                        break
+
+                    pbar.update(1)
+                    fiducial = dict(
+                        zip(fiducial_format, fid_fields[: len(fiducial_format)], strict=True)
+                    )
+                    fiducials.append(fiducial)
                     current_pos = file.tell()
-                    while True:
-                        fid_line = file.readline()
-                        if not fid_line:
-                            break
-                        fid_fields = fid_line.strip().split(",")
-                        if (
-                            len(fid_fields) < len(fiducial_format)
-                            or fid_fields[2] != "f"
-                            or fid_fields[1] != marker["ftk_timestamp"]
-                        ):
-                            # Not a fiducial or not part of the marker; stop collecting and restore cursor
-                            file.seek(current_pos)
-                            break
 
-                        pbar.update(1)
-                        fiducial = dict(
-                            zip(fiducial_format, fid_fields[: len(fiducial_format)])
-                        )
-                        fiducials.append(fiducial)
-                        current_pos = file.tell()
+                position = np.array(
+                    [
+                        float(marker["x_position"]),
+                        float(marker["y_position"]),
+                        float(marker["z_position"]),
+                        1.0,
+                    ]
+                )
 
-                    position = np.array(
+                # Make sure z-axis is pointing towards the camera
+                if float(marker["r22"]) < 0:
+                    rotation_matrix = np.array(
                         [
-                            float(marker["x_position"]),
-                            float(marker["y_position"]),
-                            float(marker["z_position"]),
-                            1.0,
+                            [
+                                float(marker["r01"]),
+                                float(marker["r00"]),
+                                float(marker["r02"]),
+                                0.0,
+                            ],
+                            [
+                                float(marker["r11"]),
+                                float(marker["r10"]),
+                                float(marker["r12"]),
+                                0.0,
+                            ],
+                            [
+                                float(marker["r21"]),
+                                float(marker["r20"]),
+                                float(marker["r22"]),
+                                0.0,
+                            ],
+                            [0.0, 0.0, 0.0, 1.0],
+                        ]
+                    )
+                else:
+                    rotation_matrix = np.array(
+                        [
+                            [
+                                float(marker["r00"]),
+                                float(marker["r01"]),
+                                float(marker["r02"]),
+                                0.0,
+                            ],
+                            [
+                                float(marker["r10"]),
+                                float(marker["r11"]),
+                                float(marker["r12"]),
+                                0.0,
+                            ],
+                            [
+                                float(marker["r20"]),
+                                float(marker["r21"]),
+                                float(marker["r22"]),
+                                0.0,
+                            ],
+                            [0.0, 0.0, 0.0, 1.0],
                         ]
                     )
 
-                    # Make sure z-axis is pointing towards the camera
-                    if float(marker["r22"]) < 0:
-                        rotation_matrix = np.array(
-                            [
-                                [
-                                    float(marker["r01"]),
-                                    float(marker["r00"]),
-                                    float(marker["r02"]),
-                                    0.0,
-                                ],
-                                [
-                                    float(marker["r11"]),
-                                    float(marker["r10"]),
-                                    float(marker["r12"]),
-                                    0.0,
-                                ],
-                                [
-                                    float(marker["r21"]),
-                                    float(marker["r20"]),
-                                    float(marker["r22"]),
-                                    0.0,
-                                ],
-                                [0.0, 0.0, 0.0, 1.0],
-                            ]
-                        )
-                    else:
-                        rotation_matrix = np.array(
-                            [
-                                [
-                                    float(marker["r00"]),
-                                    float(marker["r01"]),
-                                    float(marker["r02"]),
-                                    0.0,
-                                ],
-                                [
-                                    float(marker["r10"]),
-                                    float(marker["r11"]),
-                                    float(marker["r12"]),
-                                    0.0,
-                                ],
-                                [
-                                    float(marker["r20"]),
-                                    float(marker["r21"]),
-                                    float(marker["r22"]),
-                                    0.0,
-                                ],
-                                [0.0, 0.0, 0.0, 1.0],
-                            ]
-                        )
+                # Plot debug info if enabled
+                if debug_dir is not None:
+                    fig, ax = plt.subplots(figsize=(6, 6))
+                    ax.set_title("Detected Fiducials")
+                    ax.invert_yaxis()
+                    ax.grid(True)
+                    ax.set_aspect("equal")
 
-                    # Plot debug info if enabled
-                    if debug_dir is not None:
-                        fig, ax = plt.subplots(figsize=(6, 6))
-                        ax.set_title("Detected Fiducials")
-                        ax.invert_yaxis()
-                        ax.grid(True)
-                        ax.set_aspect("equal")
+                    result = process_frame(position, rotation_matrix, fiducials, board, ax)
+                    # if result is not None and result[0] > 100:
+                    fig.savefig(
+                        f"{debug_dir}/{marker['ftk_timestamp']}.png",
+                        bbox_inches="tight",
+                    )
+                    plt.close(fig)
+                else:
+                    result = process_frame(position, rotation_matrix, fiducials, board)
 
-                        result = process_frame(
-                            position, rotation_matrix, fiducials, board, ax
-                        )
-                        # if result is not None and result[0] > 100:
-                        fig.savefig(
-                            f"{debug_dir}/{marker['ftk_timestamp']}.png",
-                            bbox_inches="tight",
-                        )
-                        plt.close(fig)
-                    else:
-                        result = process_frame(
-                            position, rotation_matrix, fiducials, board
-                        )
-
-                    if result is not None:
-                        timestamps[int(marker["ftk_timestamp"])] = result
+                if result is not None:
+                    timestamps[int(marker["ftk_timestamp"])] = result
     if len(timestamps) > 0:
         try:
             return fit_ftk_timestamps(timestamps, frame_times, debug_dir)

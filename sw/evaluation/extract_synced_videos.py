@@ -2,7 +2,6 @@ import argparse
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
 
 import cv2
 
@@ -26,17 +25,17 @@ try:
     )
     from rocsync.timecode import ms_to_timecode
     from rocsync.timeline import affine_from_statistics, per_frame_times
-except ImportError:
+except ImportError as err:
     raise SystemExit(
-        "This script needs the rocsync package: pip install -e <path to RocSync>/sw"
-    )
+        f"This script needs the rocsync package: run 'uv sync' in <path to RocSync>/sw ({err})"
+    ) from None
 
 
 @dataclass
 class Config(ClipExtractionConfig):
     # if True, ignore global overlap and mark short cameras with _overlap
     ignore_overlap: bool = False
-    only_for_camera: Optional[str] = None
+    only_for_camera: str | None = None
 
 
 def main(config: Config) -> None:
@@ -44,12 +43,12 @@ def main(config: Config) -> None:
 
     time_sync_data_all = load_video_time_sync(config.time_sync_json_path)
 
-    def _compute_overlap(data_dict: Dict[str, dict]) -> tuple[float, float]:
+    def _compute_overlap(data_dict: dict[str, dict]) -> tuple[float, float]:
         first_frames = [float(d["first_frame"]) for d in data_dict.values()]
         last_frames = [float(d["last_frame"]) for d in data_dict.values()]
         return max(first_frames), min(last_frames)
 
-    def _cameras_not_covering_clip(data_dict: Dict[str, dict], clip: Clip) -> List[str]:
+    def _cameras_not_covering_clip(data_dict: dict[str, dict], clip: Clip) -> list[str]:
         bad = []
         for cam_key, d in data_dict.items():
             cam_first = float(d["first_frame"])
@@ -80,13 +79,14 @@ def main(config: Config) -> None:
         clips = parse_clips_json(config.clips_to_extract_json)
 
     # --- Apply optional extraction filter AFTER clip parsing ---
-    if getattr(config, "only_for_camera", None):
+    only_for_camera = getattr(config, "only_for_camera", None)
+    if only_for_camera:
         only_key = select_camera_key(
             time_sync_data_all,
-            config.only_for_camera,
+            only_for_camera,
             "--only-for-camera",
         )
-        time_sync_data: Dict[str, dict] = {only_key: time_sync_data_all[only_key]}
+        time_sync_data: dict[str, dict] = {only_key: time_sync_data_all[only_key]}
     else:
         time_sync_data = time_sync_data_all
 
@@ -109,9 +109,7 @@ def main(config: Config) -> None:
             raise ValueError(msg)
         else:
             print("[WARN]", msg)
-            print(
-                "[WARN] --ignore-overlap is set, proceeding anyway (per-camera brute-force)."
-            )
+            print("[WARN] --ignore-overlap is set, proceeding anyway (per-camera brute-force).")
 
     # Per-clip overlap validation
     for clip in clips:
@@ -134,9 +132,7 @@ def main(config: Config) -> None:
 
             # If we're filtering to a single camera, also show the global (all-cameras) diagnostic overlap
             if len(time_sync_data) != len(time_sync_data_all):
-                global_not_included = _cameras_not_covering_clip(
-                    time_sync_data_all, clip
-                )
+                global_not_included = _cameras_not_covering_clip(time_sync_data_all, clip)
                 global_not_included_str = (
                     ", ".join(global_not_included) if global_not_included else "None"
                 )
@@ -161,9 +157,7 @@ def main(config: Config) -> None:
                 raise ValueError(msg)
             else:
                 print("[WARN]", msg)
-                print(
-                    "[WARN] --ignore-overlap is set, continuing for per-camera extraction.\n"
-                )
+                print("[WARN] --ignore-overlap is set, continuing for per-camera extraction.\n")
 
     # --- MAIN EXTRACTION LOOP ---
     for clip in clips:
@@ -228,7 +222,7 @@ def main(config: Config) -> None:
 
 
 def write_sampled_video_by_indices(
-    video_path: str, frame_indices: List[int], output_path: str, target_fps: float
+    video_path: str, frame_indices: list[int], output_path: str, target_fps: float
 ):
     """
     Writes a video composed EXACTLY of the frames at `frame_indices`, in that order,
@@ -240,13 +234,13 @@ def write_sampled_video_by_indices(
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        raise IOError(f"Cannot open video: {video_path}")
+        raise OSError(f"Cannot open video: {video_path}")
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    fourcc = cv2.VideoWriter.fourcc(*"mp4v")
     out = cv2.VideoWriter(output_path, fourcc, target_fps, (width, height))
 
     try:
@@ -261,9 +255,7 @@ def write_sampled_video_by_indices(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Extract synchronized clips at a fixed target FPS."
-    )
+    p = argparse.ArgumentParser(description="Extract synchronized clips at a fixed target FPS.")
     add_common_args(p, __file__)
     add_clip_args(p)
     p.add_argument(

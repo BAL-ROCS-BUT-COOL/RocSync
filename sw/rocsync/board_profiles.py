@@ -157,11 +157,7 @@ class BoardProfile:
         RING_EDGE_MARGIN LEDs of one end and may already have wrapped.
         """
         start, end = ring
-        if (
-            start > end
-            or start < RING_EDGE_MARGIN
-            or self.period - 1 - end < RING_EDGE_MARGIN
-        ):
+        if start > end or start < RING_EDGE_MARGIN or self.period - 1 - end < RING_EDGE_MARGIN:
             return None
         return start + counter * self.period, end + counter * self.period
 
@@ -219,9 +215,7 @@ class RectifiedBoard:
         self.counter_led_coords = {
             ct: self._px(coords) for ct, coords in profile.counter_led_coords.items()
         }
-        self.counter_bg_y = {
-            ct: y * self.px_per_mm for ct, y in profile.counter_bg_y.items()
-        }
+        self.counter_bg_y = {ct: y * self.px_per_mm for ct, y in profile.counter_bg_y.items()}
         self.aruco_corners_coords = self._px(profile.aruco_corners())
 
     def __repr__(self):
@@ -299,9 +293,7 @@ def _build_v1():
                 dtype=np.float32,
             ),
         },
-        counter_led_coords={
-            ct: np.array(rows, dtype=np.float32) for ct, rows in counter.items()
-        },
+        counter_led_coords={ct: np.array(rows, dtype=np.float32) for ct, rows in counter.items()},
         counter_bg_y={CameraType.RGB: 43.0, CameraType.INFRARED: 38.0},
     )
 
@@ -309,8 +301,7 @@ def _build_v1():
 def _build_v2():
     # 20 counter LEDs in two rows of 10, 12 mm apart in both directions.
     counter = {
-        CameraType.RGB: _counter_row(41.0, 71.0, 12.0, 10)
-        + _counter_row(53.0, 71.0, 12.0, 10),
+        CameraType.RGB: _counter_row(41.0, 71.0, 12.0, 10) + _counter_row(53.0, 71.0, 12.0, 10),
         CameraType.INFRARED: _counter_row(47.0, 71.0, 12.0, 10)
         + _counter_row(59.0, 71.0, 12.0, 10),
     }
@@ -349,9 +340,7 @@ def _build_v2():
                 dtype=np.float32,
             ),
         },
-        counter_led_coords={
-            ct: np.array(rows, dtype=np.float32) for ct, rows in counter.items()
-        },
+        counter_led_coords={ct: np.array(rows, dtype=np.float32) for ct, rows in counter.items()},
         counter_bg_y={CameraType.RGB: 34.0, CameraType.INFRARED: 34.0},
     )
 

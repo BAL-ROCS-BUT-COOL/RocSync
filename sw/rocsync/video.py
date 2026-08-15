@@ -11,7 +11,7 @@ from matplotlib.ticker import MaxNLocator
 from tqdm import tqdm
 
 from rocsync.clips import MAX_FRAMES_IN_FLIGHT
-from rocsync.printer import *
+from rocsync.printer import errprint, print, printresult, warnprint
 from rocsync.timeline import detect_dropouts, fit_timeline, median_frame_period
 from rocsync.video_statistics import VideoStatistics
 from rocsync.vision import CameraType, process_frame
@@ -35,7 +35,7 @@ def read_frames_async(
             try:
                 frame_queue.put(item, timeout=0.1)
                 return True
-            except queue.Full:
+            except queue.Full:  # noqa: PERF203 - retrying is the point of the loop
                 continue
         return False
 
@@ -103,9 +103,7 @@ def resolve_windows(windows, video_path):
     if any(bound < 0 for window in windows for bound in window):
         last_pts_ms = probe_last_pts_ms(video_path)
         if last_pts_ms is None:
-            raise ValueError(
-                "no frame could be read to resolve a window bound given from the end"
-            )
+            raise ValueError("no frame could be read to resolve a window bound given from the end")
         last_pts_s = last_pts_ms / 1000.0
 
     resolved = []
@@ -115,9 +113,7 @@ def resolve_windows(windows, video_path):
         if end < 0:
             end = max(0.0, last_pts_s + end)
         if start >= end:
-            raise ValueError(
-                f"window [{start:.3f}s, {end:.3f}s] starts at or after it ends"
-            )
+            raise ValueError(f"window [{start:.3f}s, {end:.3f}s] starts at or after it ends")
         resolved.append((start, end))
 
     resolved.sort()
@@ -178,7 +174,7 @@ def process_video_window(
     window_start: float,
     window_end: float,
     stride=None,
-    debug_dir: str = None,
+    debug_dir: str | None = None,
     board=None,
 ):
     cap = cv2.VideoCapture(video_path)
@@ -210,9 +206,7 @@ def process_video_window(
 
     expected_frames = n_frames
     if fps > 0 and math.isfinite(window_end - window_start):
-        expected_frames = min(
-            n_frames, int(math.ceil((window_end - window_start) * fps)) + 1
-        )
+        expected_frames = min(n_frames, math.ceil((window_end - window_start) * fps) + 1)
     window_label = f"[{window_start:.3f}s, " + (
         "end]" if math.isinf(window_end) else f"{window_end:.3f}s]"
     )
@@ -315,6 +309,9 @@ def process_video(
 
     # Fit board time against the frames' own presentation timestamps, both in ms
     period = median_frame_period(frame_times.values(), fallback=nominal_period)
+    if not period:
+        errprint("Error: Unable to determine the frame period.")
+        return
     try:
         fit = fit_timeline(frame_times, timestamps, fallback_period=nominal_period)
     except ValueError as e:
@@ -362,18 +359,18 @@ def process_video(
     errors = fit.predict(x) - y
     annotated_timestamps = {
         frame_number: (*timestamps[frame_number], error)
-        for frame_number, error in zip(fit.order, errors)
+        for frame_number, error in zip(fit.order, errors, strict=True)
     }
 
     # Remove outliers
     filtered_timestamps = {
         k: annotated_timestamps[k]
-        for k, is_inlier in zip(fit.order, fit.inlier_mask)
+        for k, is_inlier in zip(fit.order, fit.inlier_mask, strict=True)
         if is_inlier
     }
     rejected_timestamps = {
         k: annotated_timestamps[k]
-        for k, is_inlier in zip(fit.order, fit.inlier_mask)
+        for k, is_inlier in zip(fit.order, fit.inlier_mask, strict=True)
         if not is_inlier
     }
 
@@ -447,11 +444,11 @@ def print_statistics(statistics: VideoStatistics):
     )
     printresult(
         "Dropped frames",
-        f"{statistics.n_dropped_frames} in {statistics.n_gaps} gap(s), max {statistics.largest_gap_ms/1000:.3f} s",
+        f"{statistics.n_dropped_frames} in {statistics.n_gaps} gap(s), max {statistics.largest_gap_ms / 1000:.3f} s",
         statistics.n_dropped_frames == 0,
     )
-    print(format_str.format("First frame:", f"{statistics.first_frame/1000:.3f} s"))
-    print(format_str.format("Last frame:", f"{statistics.last_frame/1000:.3f} s"))
+    print(format_str.format("First frame:", f"{statistics.first_frame / 1000:.3f} s"))
+    print(format_str.format("Last frame:", f"{statistics.last_frame / 1000:.3f} s"))
     print(
         format_str.format(
             "Framerate (nominal/measured):",
@@ -468,7 +465,7 @@ def print_statistics(statistics: VideoStatistics):
     print(
         format_str.format(
             f"Duration ({scope}/board):",
-            f"{statistics.expected_duration/1000:.3f}/{statistics.measured_duration/1000:.3f} s (Δ={statistics.measured_duration-statistics.expected_duration:.2f} ms)",
+            f"{statistics.expected_duration / 1000:.3f}/{statistics.measured_duration / 1000:.3f} s (Δ={statistics.measured_duration - statistics.expected_duration:.2f} ms)",
         )
     )
     print(

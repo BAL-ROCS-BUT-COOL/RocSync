@@ -2,7 +2,6 @@ import argparse
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
 
 import cv2
 import numpy as np
@@ -20,10 +19,10 @@ try:
     )
     from rocsync.timecode import ms_to_timecode, timecode_to_ms
     from rocsync.timeline import affine_from_statistics, per_frame_times
-except ImportError:
+except ImportError as err:
     raise SystemExit(
-        "This script needs the rocsync package: pip install -e <path to RocSync>/sw"
-    )
+        f"This script needs the rocsync package: run 'uv sync' in <path to RocSync>/sw ({err})"
+    ) from None
 
 
 @dataclass
@@ -39,14 +38,17 @@ def get_screen_size():
     """
     try:
         import tkinter as tk
+    except ImportError:
+        return 1920, 1080
 
+    try:
         root = tk.Tk()
         root.withdraw()
         w = root.winfo_screenwidth()
         h = root.winfo_screenheight()
         root.destroy()
         return w, h
-    except Exception:
+    except tk.TclError:  # no display available
         return 1920, 1080
 
 
@@ -74,9 +76,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def compute_global_time_from_camera(
-    time_string: str, camera_time_sync_data: dict
-) -> float:
+def compute_global_time_from_camera(time_string: str, camera_time_sync_data: dict) -> float:
     """
     Convert a time given in camera-local units to GLOBAL ms through the camera's
     fitted clock. Local time is a position in the container's own timeline, which
@@ -88,9 +88,7 @@ def compute_global_time_from_camera(
     return float(clock_offset_ms + clock_rate * local_ms)
 
 
-def validate_moment_in_overlap(
-    global_ms: float, time_sync_data: Dict[str, dict]
-) -> None:
+def validate_moment_in_overlap(global_ms: float, time_sync_data: dict[str, dict]) -> None:
     """
     Check that the chosen global moment lies inside the COMMON temporal overlap of all cameras:
         global_ms >= max(first_frame_i)
@@ -126,7 +124,7 @@ def validate_moment_in_overlap(
 
 def extract_frame_for_moment(
     video_path: str, time_sync_data: dict, global_ms: float
-) -> Optional[np.ndarray]:
+) -> np.ndarray | None:
     """
     For a given camera:
       - build its theoretical per-frame timestamps (in global ms),
@@ -179,9 +177,7 @@ def main(cfg: Config) -> None:
     time_defining_camera_data = time_sync_data[matching_key]
 
     # Convert local camera time -> global ms
-    global_ms = compute_global_time_from_camera(
-        cfg.time_string, time_defining_camera_data
-    )
+    global_ms = compute_global_time_from_camera(cfg.time_string, time_defining_camera_data)
     print(
         f"[INFO] Local time '{cfg.time_string}' in '{cfg.from_camera}' "
         f"maps to global time: {global_ms:.2f} ms ({ms_to_timecode(global_ms)})"
@@ -189,9 +185,7 @@ def main(cfg: Config) -> None:
 
     # Validate that this moment lies in the common overlap of all cameras
     validate_moment_in_overlap(global_ms, time_sync_data)
-    print(
-        "[INFO] Moment lies inside the common overlap of all cameras. Extracting frames..."
-    )
+    print("[INFO] Moment lies inside the common overlap of all cameras. Extracting frames...")
 
     # For each camera, extract and show the frame corresponding to this global time
     # Pre-extract frames for each camera for this global time
@@ -212,10 +206,7 @@ def main(cfg: Config) -> None:
         print("[WARN] No frames could be extracted for any camera.")
         return
 
-    print(
-        "[INFO] Use RIGHT arrow to go forward, LEFT arrow to go back. "
-        "Press 'q' or ESC to quit."
-    )
+    print("[INFO] Use RIGHT arrow to go forward, LEFT arrow to go back. Press 'q' or ESC to quit.")
 
     idx = 0
     window_name = "Time Sync Check"
@@ -230,9 +221,7 @@ def main(cfg: Config) -> None:
             scale = max_width / float(w)
             new_w = int(w * scale)
             new_h = int(h * scale)
-            frame_display = cv2.resize(
-                frame, (new_w, new_h), interpolation=cv2.INTER_AREA
-            )
+            frame_display = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
             h, w = new_h, new_w
         else:
             frame_display = frame.copy()
@@ -251,7 +240,7 @@ def main(cfg: Config) -> None:
         # Try to get the actual window size (OpenCV >= 4.5)
         try:
             _, _, win_w, win_h = cv2.getWindowImageRect(window_name)
-        except Exception:
+        except cv2.error:
             win_w, win_h = w, h
 
         # Center window on screen

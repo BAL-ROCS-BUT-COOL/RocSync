@@ -19,16 +19,16 @@ from rocsync.vision import CameraType, process_frame
 
 
 class NpEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, (np.bool_, bool)):
-            return bool(obj)
-        return super().default(obj)
+    def default(self, o):
+        if isinstance(o, np.integer):
+            return int(o)
+        elif isinstance(o, np.floating):
+            return float(o)
+        elif isinstance(o, np.ndarray):
+            return o.tolist()
+        elif isinstance(o, (np.bool_, bool)):
+            return bool(o)
+        return super().default(o)
 
 
 def process_image(path, camera_type, debug_dir=None, board=None):
@@ -131,7 +131,7 @@ def main():
     )
     parser.add_argument(
         "--board-version",
-        choices=["auto"] + list(PROFILES_BY_NAME.keys()),
+        choices=["auto", *PROFILES_BY_NAME],
         default="auto",
         help="board hardware revision (default: auto-detect from ArUco marker ID)",
     )
@@ -163,11 +163,7 @@ def main():
             "ArUco marker, which is not visible in IR"
         )
 
-    board = (
-        PROFILES_BY_NAME.get(args.board_version)
-        if args.board_version != "auto"
-        else None
-    )
+    board = PROFILES_BY_NAME.get(args.board_version) if args.board_version != "auto" else None
 
     # Parse the search windows; they are resolved against the video and merged later
     windows = []
@@ -177,9 +173,7 @@ def main():
         except ValueError as e:
             parser.error(f"argument --window: {e}")
         if start >= 0 and start >= end:
-            parser.error(
-                f"argument --window: start {start_str} is not before end {end_str}"
-            )
+            parser.error(f"argument --window: start {start_str} is not before end {end_str}")
         windows.append((start, end))
 
     files = set()
@@ -187,9 +181,7 @@ def main():
         path_obj = Path(path)
         if path_obj.is_dir():
             # walk dir recursively
-            for file in (
-                path_obj.rglob("*") if args.recurse_in_dir else path_obj.glob("*")
-            ):
+            for file in path_obj.rglob("*") if args.recurse_in_dir else path_obj.glob("*"):
                 if file.is_file():
                     files.add(file.resolve())
         elif path_obj.is_file():
@@ -234,9 +226,7 @@ def main():
             result = json.load(file)
         print(f"Loaded previous results from {args.output}")
 
-    for file in tqdm(
-        videos + images + ftk_recordings, desc="Processing files", position=0
-    ):
+    for file in tqdm(videos + images + ftk_recordings, desc="Processing files", position=0):
         if str(file) in result:
             print(f"Skipping {file}, already processed.")
             continue

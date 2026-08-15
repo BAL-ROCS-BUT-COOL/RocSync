@@ -56,6 +56,7 @@ def _origin(pcb_text):
             continue
         s = re.search(r"\(start ([-\d.]+) ([-\d.]+)\)", block)
         e = re.search(r"\(end ([-\d.]+) ([-\d.]+)\)", block)
+        assert s and e, "Edge.Cuts rectangle has no start/end"
         x0, y0 = float(s.group(1)), float(s.group(2))
         x1, y1 = float(e.group(1)), float(e.group(2))
         return (min(x0, x1), min(y0, y1)), (abs(x1 - x0), abs(y1 - y0))
@@ -68,13 +69,14 @@ def _led_positions(pcb_text, footprint, origin):
     for m in re.finditer(rf'\(footprint "{re.escape(footprint)}"', pcb_text):
         block = _balanced(pcb_text, m.start())
         at = re.search(r"\(at ([-\d.]+) ([-\d.]+)", block)
+        assert at, f"{footprint} instance has no anchor"
         out.append([float(at.group(1)) - origin[0], float(at.group(2)) - origin[1]])
     return np.array(out)
 
 
-CASES = [
-    pytest.param(BOARD_V1, "rev1", ct, id=f"v1-{ct.value}") for ct in CameraType
-] + [pytest.param(BOARD_V2, "rev2", ct, id=f"v2-{ct.value}") for ct in CameraType]
+CASES = [pytest.param(BOARD_V1, "rev1", ct, id=f"v1-{ct.value}") for ct in CameraType] + [
+    pytest.param(BOARD_V2, "rev2", ct, id=f"v2-{ct.value}") for ct in CameraType
+]
 
 
 @pytest.mark.parametrize("profile, rev, camera_type", CASES)
@@ -88,8 +90,7 @@ def test_layout_matches_pcb(profile, rev, camera_type):
     model = profile.layout_coords(camera_type)
 
     assert len(model) == len(pcb), (
-        f"{profile.name} {camera_type.value}: model has {len(model)} LEDs, "
-        f"PCB has {len(pcb)}"
+        f"{profile.name} {camera_type.value}: model has {len(model)} LEDs, PCB has {len(pcb)}"
     )
 
     distance = np.linalg.norm(model[:, None, :] - pcb[None, :, :], axis=2)
@@ -114,16 +115,12 @@ def test_aruco_marker_matches_pcb(profile, rev):
     assert m, f"{rev}: no marker footprint found"
     block = _balanced(text, m.start())
     at = re.search(r"\(at ([-\d.]+) ([-\d.]+)", block)
+    assert at, f"{rev}: marker footprint has no anchor"
     centre = (float(at.group(1)) - origin[0], float(at.group(2)) - origin[1])
 
     polygons = [
-        np.array(
-            [
-                [float(x), float(y)]
-                for x, y in re.findall(r"\(xy ([-\d.]+) ([-\d.]+)\)", pts)
-            ]
-        )
-        for pts in re.findall(r"\(fp_poly\s*\(pts(.*?)\)\s*\(stroke", block, re.S)
+        np.array([[float(x), float(y)] for x, y in re.findall(r"\(xy ([-\d.]+) ([-\d.]+)\)", pts)])
+        for pts in re.findall(r"\(fp_poly\s*\(pts(.*?)\)\s*\(stroke", block, re.DOTALL)
     ]
     assert polygons, f"{rev}: marker footprint has no polygons"
 
@@ -149,8 +146,7 @@ def test_aruco_marker_matches_pcb(profile, rev):
     data_centre = (lo + hi) / 2
 
     assert math.isclose(marker, profile.aruco_size_mm, abs_tol=0.15), (
-        f"{rev}: PCB implies a {marker:.3f} mm marker, "
-        f"profile says {profile.aruco_size_mm}"
+        f"{rev}: PCB implies a {marker:.3f} mm marker, profile says {profile.aruco_size_mm}"
     )
     # rev1's marker is a traced bitmap, so it lands a fraction of a millimetre off the
     # nominal centre; rev2's is exact geometry.

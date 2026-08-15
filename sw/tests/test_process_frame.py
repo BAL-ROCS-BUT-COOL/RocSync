@@ -2,6 +2,7 @@ from pathlib import Path
 
 import cv2 as cv
 import pytest
+
 from rocsync.board_profiles import BOARD_V2
 from rocsync.camera import CameraType
 from rocsync.vision import process_frame, read_counter, read_ring, rectify_board

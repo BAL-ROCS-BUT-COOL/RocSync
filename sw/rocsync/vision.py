@@ -3,14 +3,14 @@ import numpy as np
 
 from rocsync.board_profiles import (
     DEFAULT_BOARD_SIZE,
-    RING_BG_OFFSET_MM,
     PROFILES_BY_ARUCO,
+    RING_BG_OFFSET_MM,
 )
 from rocsync.camera import CameraType
-from rocsync.printer import *
+from rocsync.printer import print
 
 # Blob detector params
-params = cv2.SimpleBlobDetector_Params()
+params = cv2.SimpleBlobDetector.Params()
 
 # Detect white blobs
 params.filterByColor = True
@@ -20,7 +20,7 @@ params.blobColor = 255
 params.filterByInertia = True
 params.minInertiaRatio = 0.5
 
-blob_detector = cv2.SimpleBlobDetector_create(params)
+blob_detector = cv2.SimpleBlobDetector.create(params)
 
 # ArUco detector params
 dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
@@ -55,19 +55,17 @@ def read_ring(extracted_board, camera_type, board, draw_on=None):
 
     # Collect LED intensities relative to local background
     led_intensities = np.zeros(board.period, dtype=np.uint8)
-    for i, ((x, y), (x_bg, y_bg)) in enumerate(zip(led_coords, bg_coords)):
+    for i, ((x, y), (x_bg, y_bg)) in enumerate(zip(led_coords, bg_coords, strict=True)):
         led_intensity = read_led(extracted_board, x, y, radius)
         bg_intensity = read_led(extracted_board, x_bg, y_bg, radius)
         led_intensities[i] = np.clip(led_intensity - bg_intensity, 0, 255)
 
     # Apply Otsu's thresholding to led_intensities
-    _, otsu_thresh = cv2.threshold(
-        led_intensities, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
+    _, otsu_thresh = cv2.threshold(led_intensities, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     leds = otsu_thresh.astype(bool).flatten()
 
     if draw_on is not None:
-        for state, (x, y) in zip(leds, led_coords):
+        for state, (x, y) in zip(leds, led_coords, strict=True):
             color = (0, 0, 255) if state else (255, 0, 0)
             cv2.circle(draw_on, (x, y), radius, color, 1)
 
@@ -88,14 +86,12 @@ def read_counter(extracted_board, camera_type, board, draw_on=None):
         led_intensities[i] = np.clip(led_intensity - bg_intensity, 0, 255)
 
     # Apply Otsu's thresholding to led_intensities
-    _, otsu_thresh = cv2.threshold(
-        led_intensities, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
+    _, otsu_thresh = cv2.threshold(led_intensities, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     leds = otsu_thresh.astype(bool).squeeze()
 
     # draw optional debug output
     if draw_on is not None:
-        for state, (x, y) in zip(leds, led_coords):
+        for state, (x, y) in zip(leds, led_coords, strict=True):
             cv2.circle(
                 draw_on,
                 (x, y),
@@ -171,11 +167,10 @@ def find_corners_dots(mask, frame_number, board, debug_dir=None):
         cv2.imwrite(f"{debug_dir}/corner_{frame_number}.png", debug_image)
 
     closest_points = [
-        min(points, key=lambda p: np.linalg.norm(p.pt - target)).pt
-        for target in corner_dots
+        min(points, key=lambda p: np.linalg.norm(p.pt - target)).pt for target in corner_dots
     ]
     max_distance = max(
-        [np.linalg.norm(act - exp) for act, exp in zip(closest_points, corner_dots)]
+        [np.linalg.norm(act - exp) for act, exp in zip(closest_points, corner_dots, strict=True)]
     )
     if max_distance > 50:
         return  # Some corner is too far away from where it should be
@@ -192,7 +187,7 @@ def find_corners_aruco(mask, frame_number, debug_dir=None):
 
     if marker_ids is None:
         return {}
-    return {id.item(): marker for id, marker in zip(marker_ids, markers)}
+    return {id.item(): marker for id, marker in zip(marker_ids, markers, strict=True)}
 
 
 def rectify_board(
@@ -264,26 +259,18 @@ def rectify_board(
             # Only the four anchors define the transform; any extra always-on dots were
             # matched purely as a sanity check.
             transformation_matrix = np.dot(
-                cv2.getPerspectiveTransform(
-                    corners[:4], board.transform_corners(CameraType.RGB)
-                ),
+                cv2.getPerspectiveTransform(corners[:4], board.transform_corners(CameraType.RGB)),
                 rough_transformation_matrix,
             )
-            pcb = cv2.warpPerspective(
-                mask, transformation_matrix, (board_size, board_size)
-            )
+            pcb = cv2.warpPerspective(mask, transformation_matrix, (board_size, board_size))
 
         case CameraType.INFRARED:
             if board is None:
-                raise ValueError(
-                    "IR mode requires an explicit board version (--board-version)"
-                )
+                raise ValueError("IR mode requires an explicit board version (--board-version)")
             board = board.rectify(board_size)
 
             gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            _, mask = cv2.threshold(
-                gray_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-            )
+            _, mask = cv2.threshold(gray_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
             corners = find_corners_convexhull(mask, frame_number, debug_dir)
             if corners is None:
@@ -291,9 +278,7 @@ def rectify_board(
             transformation_matrix = cv2.getPerspectiveTransform(
                 corners, board.transform_corners(CameraType.INFRARED)
             )
-            pcb = cv2.warpPerspective(
-                mask, transformation_matrix, (board_size, board_size)
-            )
+            pcb = cv2.warpPerspective(mask, transformation_matrix, (board_size, board_size))
 
             # Find correct rotation
             for _ in range(4):
@@ -320,7 +305,7 @@ def process_frame(
     detected, pcb, board = rectify_board(
         image, camera_type, frame_number, board, debug_dir, board_size
     )
-    if pcb is None:
+    if pcb is None or board is None:
         return detected, None
 
     # Sample the pristine board; overlays go onto a separate canvas
@@ -329,7 +314,7 @@ def process_frame(
     counter = read_counter(pcb, camera_type, board, draw_on=debug_canvas)
     ring = read_ring(pcb, camera_type, board, draw_on=debug_canvas)
 
-    if debug_dir:
+    if debug_canvas is not None:
         cv2.imwrite(f"{debug_dir}/leds_{frame_number}.png", debug_canvas)
 
     if ring is None:

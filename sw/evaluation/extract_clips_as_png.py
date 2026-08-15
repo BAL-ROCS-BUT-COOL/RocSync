@@ -4,7 +4,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
 
 import cv2
 
@@ -26,10 +25,10 @@ try:
         select_camera_key,
     )
     from rocsync.timeline import affine_from_statistics, per_frame_times
-except ImportError:
+except ImportError as err:
     raise SystemExit(
-        "This script needs the rocsync package: pip install -e <path to RocSync>/sw"
-    )
+        f"This script needs the rocsync package: run 'uv sync' in <path to RocSync>/sw ({err})"
+    ) from None
 
 # -------------------------
 # Config & CLI
@@ -129,7 +128,7 @@ def main(config: Config) -> None:
 # -------------------------
 
 
-def _save_frames_as_png(video_path: str, frames: List[int], output_folder: str) -> None:
+def _save_frames_as_png(video_path: str, frames: list[int], output_folder: str) -> None:
     """
     Assumes frames is sorted ascendingly.
 
@@ -149,9 +148,7 @@ def _save_frames_as_png(video_path: str, frames: List[int], output_folder: str) 
     in_flight = threading.Semaphore(MAX_FRAMES_IN_FLIGHT)
     with ThreadPoolExecutor() as executor:
         futures = []
-        for i, frame in read_frames_at_indices(
-            video_path, frames, desc="Extracting frames"
-        ):
+        for i, frame in read_frames_at_indices(video_path, frames, desc="Extracting frames"):
             in_flight.acquire()
             # The pool outlives the iteration, so it needs its own frame.
             future = executor.submit(write_one_frame, i, frame.copy())

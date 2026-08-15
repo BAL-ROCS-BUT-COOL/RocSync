@@ -14,7 +14,6 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
 
 # Use lowercase, dotted suffixes; we compare with .lower()
 VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".avi", ".mkv"})
@@ -31,19 +30,17 @@ class ClipExtractionConfig(DatasetConfig):
     clips_to_extract_json: str  # path to clips json
     target_fps: float
     # camera basename whose local time defines the clip timecodes (optional)
-    from_raw_camera_time_of_camera: Optional[str] = None
+    from_raw_camera_time_of_camera: str | None = None
 
 
-def default_dataset_folder(script_file: Optional[str]) -> str:
+def default_dataset_folder(script_file: str | None) -> str:
     """The dataset root for a script that lives in a subfolder of it."""
     if not script_file:
         return os.getcwd()
     return str(Path(script_file).resolve().parent.parent)
 
 
-def add_common_args(
-    parser: argparse.ArgumentParser, script_file: Optional[str]
-) -> None:
+def add_common_args(parser: argparse.ArgumentParser, script_file: str | None) -> None:
     """Add the dataset-folder and time-sync-JSON flags every evaluation script takes."""
     parser.add_argument(
         "--dataset-folder",
@@ -80,9 +77,7 @@ def add_clip_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def resolve_time_sync_json(
-    dataset_folder: Path, override: Optional[str] = None
-) -> Path:
+def resolve_time_sync_json(dataset_folder: Path, override: str | None = None) -> Path:
     """The time-sync JSON to use: `override`, else 'time sync/time_synchronization_*.json'.
 
     Takes the first match in sorted order if there are several.
@@ -97,7 +92,7 @@ def resolve_time_sync_json(
     return candidates[0]
 
 
-def resolve_clips_json(dataset_folder: Path, override: Optional[str] = None) -> Path:
+def resolve_clips_json(dataset_folder: Path, override: str | None = None) -> Path:
     """The clips config to use: `override`, else 'time sync/clips_config_all.json'.
 
     Falls back to any '*clips*.json' in the same folder.
@@ -122,7 +117,7 @@ def resolve_clips_json(dataset_folder: Path, override: Optional[str] = None) -> 
 def camera_name(cam_key: str) -> str:
     """The camera's name: its basename without extension or a trailing '_raw'."""
     name = os.path.splitext(os.path.basename(cam_key))[0]
-    return name[:-4] if name.endswith("_raw") else name
+    return name.removesuffix("_raw")
 
 
 def names_camera_key(cam_key: str, user_value: str) -> bool:
@@ -144,14 +139,12 @@ def matches_camera_name(cam_key: str, user_value: str) -> bool:
     if names_camera_key(cam_key, user_value):
         return True
 
-    uv_base = os.path.splitext(os.path.basename(user_value.replace("\\", "/").strip()))[
-        0
-    ]
+    uv_base = os.path.splitext(os.path.basename(user_value.replace("\\", "/").strip()))[0]
     key_base = os.path.splitext(os.path.basename(cam_key))[0]
     return uv_base == key_base or uv_base == camera_name(cam_key)
 
 
-def select_camera_key(cameras: Dict[str, dict], user_value: str, flag: str) -> str:
+def select_camera_key(cameras: dict[str, dict], user_value: str, flag: str) -> str:
     """The one key of `cameras` that `user_value` names.
 
     Raises a ValueError naming `flag` if nothing matches or several do.
@@ -166,8 +159,7 @@ def select_camera_key(cameras: Dict[str, dict], user_value: str, flag: str) -> s
     if not matches:
         available = ", ".join(sorted({camera_name(key) for key in cameras}))
         raise ValueError(
-            f"{flag} '{user_value}' did not match any camera.\n"
-            f"Available cameras: [{available}]"
+            f"{flag} '{user_value}' did not match any camera.\nAvailable cameras: [{available}]"
         )
     if len(matches) > 1:
         options = ", ".join(sorted(matches))
@@ -178,7 +170,7 @@ def select_camera_key(cameras: Dict[str, dict], user_value: str, flag: str) -> s
     return matches[0]
 
 
-def load_video_time_sync(path: str) -> Dict[str, dict]:
+def load_video_time_sync(path: str) -> dict[str, dict]:
     """Read a time-synchronization JSON, keyed by '<parent>/<file>'.
 
     The keys are normalized to the last two path segments so they can be joined
@@ -187,8 +179,8 @@ def load_video_time_sync(path: str) -> Dict[str, dict]:
     only video entries have the per-frame timeline the callers need, so anything
     else is dropped here.
     """
-    with open(path, "r", encoding="utf-8") as f:
-        raw: Dict[str, dict] = json.load(f)
+    with open(path, encoding="utf-8") as f:
+        raw: dict[str, dict] = json.load(f)
 
     return {
         os.path.join(*camera.replace("\\", "/").split("/")[-2:]): data

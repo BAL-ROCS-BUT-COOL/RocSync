@@ -10,6 +10,7 @@ import numpy as np
 from tqdm import tqdm
 
 from rocsync.board_profiles import PROFILES_BY_NAME
+from rocsync.dataset import VIDEO_SUFFIXES
 from rocsync.ftk import process_ftk_recording
 from rocsync.printer import errprint, succprint, warnprint
 from rocsync.timecode import parse_hms
@@ -197,7 +198,7 @@ def main():
             errprint(f"Invalid path: {path}")
             return
 
-    videos = sorted([f for f in files if f.suffix.lower() in [".mp4", ".avi", ".mov"]])
+    videos = sorted([f for f in files if f.suffix.lower() in VIDEO_SUFFIXES])
     images = sorted([f for f in files if f.suffix.lower() in [".png", ".jpg", ".jpeg"]])
     ftk_recordings = sorted([f for f in files if f.suffix.lower() == ".csv"])
 

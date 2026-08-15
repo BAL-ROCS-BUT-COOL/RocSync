@@ -4,6 +4,9 @@ A dataset folder holds one subfolder per camera plus a 'time sync' folder with
 the synchronization JSON rocsync produced and the list of clips to extract. The
 scripts differ in what they emit, but they all have to locate those two files,
 read the JSON the same way and accept the same handful of flags.
+
+The video suffixes rocsync itself accepts live here too, so that what rocsync
+analyzes and what the scripts expect to find afterwards cannot drift apart.
 """
 
 import argparse

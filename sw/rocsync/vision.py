@@ -198,7 +198,7 @@ def find_corners_aruco(mask, frame_number, debug_dir=None, brightness_boost=None
     return {id.item(): marker for id, marker in zip(marker_ids, markers)}
 
 
-def process_frame(
+def rectify_board(
     image,
     camera_type,
     frame_number,
@@ -207,6 +207,12 @@ def process_frame(
     brightness_boost=None,
     board_size=DEFAULT_BOARD_SIZE,
 ):
+    """Locate the board in a frame and warp it onto a square pixel grid.
+
+    Returns (detected, pcb, board): whether the board was seen at all, the
+    rectified single-channel image or None if it could not be squared up, and the
+    RectifiedBoard the reading should be decoded against.
+    """
     match camera_type:
         case CameraType.RGB:
             # Detect ArUco markers
@@ -214,7 +220,7 @@ def process_frame(
                 image, frame_number, debug_dir, brightness_boost
             )
             if not markers:
-                return False, None
+                return False, None, None
 
             # Resolve board profile
             if board is None:
@@ -224,11 +230,11 @@ def process_frame(
                         aruco_corners = corners
                         break
                 else:
-                    return False, None
+                    return False, None, None
             else:
                 board = board.rectify(board_size)
                 if board.aruco_marker_id not in markers:
-                    return False, None
+                    return False, None, board
                 aruco_corners = markers[board.aruco_marker_id]
 
             # Check if aruco marker fills x % of the image to make sure the PCB was held close enough
@@ -245,7 +251,7 @@ def process_frame(
                 print(
                     f"Rejected {frame_number}: aruco marker only fills {area_percentage:.2%} of the image"
                 )
-                return False, None
+                return False, None, board
 
             red_channel = image[:, :, 2]
             mask = red_channel
@@ -259,7 +265,7 @@ def process_frame(
             )
             corners = find_corners_dots(rough_pcb, frame_number, board, debug_dir)
             if corners is None:
-                return True, None
+                return True, None, board
 
             # Only the four anchors define the transform; any extra always-on dots were
             # matched purely as a sanity check.
@@ -287,7 +293,7 @@ def process_frame(
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
             corners = find_corners_convexhull(mask, frame_number, debug_dir)
             if corners is None:
-                return False, None
+                return False, None, board
             transformation_matrix = cv2.getPerspectiveTransform(
                 corners, board.transform_corners(CameraType.INFRARED)
             )
@@ -300,10 +306,29 @@ def process_frame(
                 if read_counter(pcb, CameraType.INFRARED, board) == 0:
                     pcb = cv2.rotate(pcb, cv2.ROTATE_90_CLOCKWISE)
             if read_counter(pcb, CameraType.INFRARED, board) == 0:
-                return True, None  # Counter was actually 0, can't determine orientation
+                return True, None, board  # Counter was 0, orientation undeterminable
 
         case _:
             raise ValueError(f"Unsupported camera type: {camera_type!r}")
+
+    return True, pcb, board
+
+
+def process_frame(
+    image,
+    camera_type,
+    frame_number,
+    board=None,
+    debug_dir=None,
+    brightness_boost=None,
+    board_size=DEFAULT_BOARD_SIZE,
+):
+    """Board time (start_ms, end_ms) read off one frame, and whether a board was seen."""
+    detected, pcb, board = rectify_board(
+        image, camera_type, frame_number, board, debug_dir, brightness_boost, board_size
+    )
+    if pcb is None:
+        return detected, None
 
     # Sample the pristine board; overlays go onto a separate canvas
     debug_canvas = cv2.cvtColor(pcb, cv2.COLOR_GRAY2BGR) if debug_dir else None

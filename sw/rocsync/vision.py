@@ -9,6 +9,8 @@ from rocsync.board_profiles import (
 from rocsync.camera import CameraType
 from rocsync.printer import print
 
+MIN_ARUCO_AREA_FRACTION = 0.002  # smallest marker area, as a fraction of the frame
+
 # Blob detector params
 params = cv2.SimpleBlobDetector.Params()
 
@@ -172,7 +174,7 @@ def find_corners_dots(mask, frame_number, board, debug_dir=None):
     max_distance = max(
         [np.linalg.norm(act - exp) for act, exp in zip(closest_points, corner_dots, strict=True)]
     )
-    if max_distance > 50:
+    if max_distance > board.rough_corner_tol:
         return  # Some corner is too far away from where it should be
 
     return np.array(closest_points, dtype=np.float32)
@@ -236,7 +238,7 @@ def rectify_board(
             height, width = image.shape[:2]
             image_area = width * height
             area_percentage = area / image_area
-            if area_percentage < 0.002:
+            if area_percentage < MIN_ARUCO_AREA_FRACTION:
                 print(
                     f"Rejected {frame_number}: aruco marker only fills {area_percentage:.2%} of the image"
                 )

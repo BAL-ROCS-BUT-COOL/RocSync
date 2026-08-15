@@ -19,6 +19,8 @@ DEFAULT_BOARD_SIZE = 640  # rectified image dimension (px)
 LED_SAMPLE_RADIUS_MM = 3.0  # radius of the disc each LED's intensity is read from
 RING_BG_OFFSET_MM = -10.0  # background ring, measured inward from the LED ring
 LAYOUT_TOL_MM = 4.0  # how far a blob may sit from a modelled LED and still count
+ROUGH_CORNER_TOL_MM = 20.0  # corner slack in the ArUco-only rough rectification
+FIDUCIAL_TOL_PITCH_FRACTION = 0.45  # of the ring pitch; below 0.5 keeps neighbours distinct
 
 RING_EDGE_MARGIN = 1  # ring LEDs of slack required at either end of the period
 
@@ -132,6 +134,15 @@ class BoardProfile:
             self.centre_mm,
         )
 
+    def fiducial_tol_mm(self, camera_type):
+        """How far a detection may sit from a modelled LED and still match it (mm).
+
+        Derived from the ring pitch, the tightest LED spacing on the board, so a
+        detection can never be claimed by its neighbour.
+        """
+        pitch = 2 * math.pi * self.ring_radius_mm[camera_type] / self.period
+        return FIDUCIAL_TOL_PITCH_FRACTION * pitch
+
     def decode_counter(self, leds):
         """Counter value from its LED states, most significant bit first."""
         bits = np.asarray(leds, dtype=bool).reshape(-1)
@@ -208,6 +219,7 @@ class RectifiedBoard:
         self.counter_bits = profile.counter_bits
         self.aruco_marker_id = profile.aruco_marker_id
         self.led_sample_radius = max(1, round(LED_SAMPLE_RADIUS_MM * self.px_per_mm))
+        self.rough_corner_tol = ROUGH_CORNER_TOL_MM * self.px_per_mm
 
         self.always_on_leds = {
             ct: self._px(coords) for ct, coords in profile.always_on_leds.items()

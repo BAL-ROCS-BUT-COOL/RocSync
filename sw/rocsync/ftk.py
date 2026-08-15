@@ -9,7 +9,8 @@ from rocsync.camera import CameraType
 from rocsync.printer import errprint
 from rocsync.timeline import detect_dropouts, fit_timeline, median_frame_period
 
-DISTANCE_THRESHOLD = 3
+FTK_PLANE_TOL_MM = 5.0  # out-of-plane slack for a fiducial to count as on the board
+FIT_RESIDUAL_THRESHOLD_MS = 10  # RANSAC inlier band; the tracker is not frame-periodic
 
 
 marker_format = [
@@ -46,16 +47,17 @@ fiducial_format = [
 def read_leds(
     fiducials: list[tuple[float, float]],
     led_coords: np.ndarray,
+    tol_mm: float,
     ax: Axes | None = None,
 ) -> np.ndarray:
-    """LED states for the given centres: lit where a fiducial sits close enough."""
+    """LED states for the given centres: lit where a fiducial sits within tol_mm."""
     leds = np.zeros(len(led_coords), dtype=bool)
     for i, led in enumerate(led_coords):
-        leds[i] = any(np.linalg.norm(fiducial - led) < DISTANCE_THRESHOLD for fiducial in fiducials)
+        leds[i] = any(np.linalg.norm(fiducial - led) < tol_mm for fiducial in fiducials)
 
         if ax is not None:
             color = "red" if leds[i] else "blue"
-            ax.add_patch(Circle(led, DISTANCE_THRESHOLD, color=color, fill=False))
+            ax.add_patch(Circle(led, tol_mm, color=color, fill=False))
 
     return leds
 
@@ -66,7 +68,8 @@ def read_ring(
     ax: Axes | None = None,
 ) -> tuple[int, int] | None:
     """Ring reading of a board seen by the tracker: first and last lit LED, or None."""
-    leds = read_leds(fiducials, board.ring_led_coords(CameraType.INFRARED), ax)
+    tol_mm = board.fiducial_tol_mm(CameraType.INFRARED)
+    leds = read_leds(fiducials, board.ring_led_coords(CameraType.INFRARED), tol_mm, ax)
     return board.decode_ring(leds)
 
 
@@ -76,7 +79,8 @@ def read_counter(
     ax: Axes | None = None,
 ) -> int:
     """Counter reading of a board seen by the tracker."""
-    leds = read_leds(fiducials, board.counter_led_coords[CameraType.INFRARED], ax)
+    tol_mm = board.fiducial_tol_mm(CameraType.INFRARED)
+    leds = read_leds(fiducials, board.counter_led_coords[CameraType.INFRARED], tol_mm, ax)
     return board.decode_counter(leds)
 
 
@@ -104,9 +108,9 @@ def process_frame(
 
         # Filter fiducials within the PCB area
         if (
-            abs(fid_pos_marker[2]) < 5
-            and 0 < fid_pos_marker[0] < 250
-            and 0 < fid_pos_marker[1] < 250
+            abs(fid_pos_marker[2]) < FTK_PLANE_TOL_MM
+            and 0 < fid_pos_marker[0] < board.size_mm
+            and 0 < fid_pos_marker[1] < board.size_mm
         ):
             transformed_fiducials.append(fid_pos_marker[:2])
 
@@ -161,11 +165,10 @@ def fit_ftk_timestamps(
     debug_dir=None,
 ) -> dict:
     # The device reports its own clock, so regress board time directly on it.
-    # Not frame-periodic, hence an explicit residual threshold.
     fit = fit_timeline(
         frame_times,
         timestamps,
-        residual_threshold=10,
+        residual_threshold=FIT_RESIDUAL_THRESHOLD_MS,
         max_trials=10000,  # more trials for more consistent results
     )
 

@@ -43,6 +43,7 @@ def draw_polygon(points, image, color):
 
 
 def read_led(img, x, y, radius):
+    """Intensity of one LED: the 0.75 quantile over a disc, robust to partial blur."""
     led_mask = np.zeros(img.shape[:2], dtype=np.uint8)
     cv2.circle(led_mask, (x, y), radius, (255), -1)
     led_intensity = np.quantile(img[led_mask > 0], 0.75)

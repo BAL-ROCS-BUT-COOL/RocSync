@@ -330,6 +330,8 @@ class AnnotationTool:
         self.left_scale = 1.0
         self.board_scale = 1.0
         self.status_msg = ""
+        self._last_composite = None  # last frame, re-presented while work blocks the loop
+        self._pending_key: int | None = None  # key caught by _pump, consumed by _image_loop
 
         # Interaction state
         self.mode = Mode.IDLE
@@ -387,8 +389,10 @@ class AnnotationTool:
             image = cv2.imread(str(image_path))
             if image is None:
                 print(f"Cannot read {image_path}", file=sys.stderr)
+                self._pump()
                 self.current_idx += 1
                 continue
+            self._pump()
 
             # Run pipeline
             self.stats = {}
@@ -398,6 +402,7 @@ class AnnotationTool:
                 print(f"Pipeline error on {rel_path}: {e}", file=sys.stderr)
                 self.stats["rectified"] = None
                 self.stats["aruco_id"] = None
+            self._pump()
 
             # Resolve board profile from pipeline detection or saved annotation
             aruco_id = self.stats.get("aruco_id")
@@ -454,6 +459,7 @@ class AnnotationTool:
                 self.stats["rectified"] = cv2.warpPerspective(
                     mask, H, (board.board_size, board.board_size)
                 )
+            self._pump()
 
             self.mode = Mode.IDLE
             self._ring_start_candidate = None
@@ -486,19 +492,34 @@ class AnnotationTool:
 
         cv2.destroyAllWindows()
 
+    def _pump(self):
+        """Present a frame and service events so the window manager sees a live window."""
+        if self._last_composite is not None:
+            cv2.imshow(WINDOW_NAME, self._last_composite)
+        key = cv2.waitKey(1) & 0xFF
+        if key != 255 and self._pending_key is None:
+            self._pending_key = key  # hold keys typed while work blocked the loop
+
     def _image_loop(self, image, rel_path):
         composite = None
         while True:
-            if self._needs_redraw:
+            if self._needs_redraw or composite is None:
                 composite = self._render(image, rel_path)
                 if not self._window_sized:
                     h, w = composite.shape[:2]
                     cv2.resizeWindow(WINDOW_NAME, w, h)
                     self._window_sized = True
-                cv2.imshow(WINDOW_NAME, composite)
                 self._needs_redraw = False
 
-            key = cv2.waitKey(30) & 0xFF
+            # A window that stops presenting frames is flagged as not responding.
+            cv2.imshow(WINDOW_NAME, composite)
+            self._last_composite = composite
+
+            if self._pending_key is not None:
+                key = self._pending_key
+                self._pending_key = None
+            else:
+                key = cv2.waitKey(30) & 0xFF
 
             if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
                 return "quit"

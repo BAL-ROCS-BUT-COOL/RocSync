@@ -371,7 +371,9 @@ class AnnotationTool:
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.setMouseCallback(WINDOW_NAME, self._mouse_callback)
 
-        while 0 <= self.current_idx < len(self.images):
+        n_images = len(self.images)
+        unreadable = 0  # consecutive read failures; bail out rather than spin forever
+        while True:
             image_path = self.images[self.current_idx]
             rel_path = str(image_path.relative_to(self.data_dir))
 
@@ -379,8 +381,13 @@ class AnnotationTool:
             if image is None:
                 print(f"Cannot read {image_path}", file=sys.stderr)
                 self._pump()
-                self.current_idx += 1
+                unreadable += 1
+                if unreadable >= n_images:
+                    print("No readable images.", file=sys.stderr)
+                    break
+                self.current_idx = (self.current_idx + 1) % n_images
                 continue
+            unreadable = 0
             self._pump()
 
             # Run pipeline
@@ -463,11 +470,11 @@ class AnnotationTool:
             if action == "accept":
                 self.ground_truth["images"][rel_path] = self.annotation.to_dict()
                 self._save_ground_truth()
-                self.current_idx += 1
+                self.current_idx = (self.current_idx + 1) % n_images
             elif action == "skip":
-                self.current_idx += 1
+                self.current_idx = (self.current_idx + 1) % n_images
             elif action == "back":
-                self.current_idx = max(0, self.current_idx - 1)
+                self.current_idx = (self.current_idx - 1) % n_images
             elif action == "next_unannotated":
                 self.current_idx = self._find_unannotated(self.current_idx, forward=True)
             elif action == "prev_unannotated":
@@ -1198,14 +1205,17 @@ class AnnotationTool:
             json.dump(self.ground_truth, f, indent=2)
 
     def _find_unannotated(self, from_idx, forward=True):
-        """Find the next/previous unannotated image index. Returns from_idx if none found."""
+        """Find the next/previous unannotated image index, wrapping around the list.
+
+        Returns from_idx if every image is annotated.
+        """
+        n = len(self.images)
         step = 1 if forward else -1
-        idx = from_idx + step
-        while 0 <= idx < len(self.images):
+        for k in range(1, n + 1):
+            idx = (from_idx + k * step) % n
             rel = str(self.images[idx].relative_to(self.data_dir))
             if rel not in self.ground_truth["images"]:
                 return idx
-            idx += step
         return from_idx
 
 

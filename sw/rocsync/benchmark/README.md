@@ -43,9 +43,16 @@ The window shows two panels side-by-side:
 | C / Backspace | Clear annotation for current image (deletes from ground truth, re-runs pipeline) |
 | Q | Quit |
 | H | Toggle help overlay |
+| 0-9 | Select which corner the next left-panel click places |
 | Esc | Cancel ring LED selection |
 
-### Mouse Interactions (right panel only)
+### Mouse Interactions (left panel)
+
+**Placing corners** — Click a corner directly in the image to place the pending corner there. The click marks that corner visible and advances the pending corner to the next one, so clicking the corners in order (0, 1, 2, …) annotates them in one pass and then wraps back to corner 0. Press `0`-`9` to jump to a specific corner. The pending corner is ringed in green and named in the top-left of the panel. A zoom inset follows the cursor so clicks stay accurate despite the downscaled display.
+
+**Corner LEDs** — Drag a corner LED circle to refine its position.
+
+### Mouse Interactions (right panel)
 
 **Corner LEDs** — Click on a corner LED circle to toggle visible/hidden. Drag a corner LED to refine its position.
 

@@ -276,7 +276,17 @@ COLOR_BOARD_TEXT = (255, 255, 255)  # white text on dark board
 WINDOW_NAME = "RocSync Annotation"
 TARGET_HEIGHT = 800
 
+# Zoom inset shown while placing corners in the left panel.
+LOUPE_SIZE = 220  # on-screen size of the inset (px)
+LOUPE_SOURCE_PX = 70  # side of the original-image region it magnifies
+LOUPE_MARGIN = 12
+
 HELP_TEXT = [
+    "=== Mouse (left panel) ===",
+    "Click anywhere    : Place the pending corner,",
+    "                    then advance to the next",
+    "Drag corner LED   : Refine position",
+    "                    (zoom inset follows cursor)",
     "=== Mouse (right panel) ===",
     "Click corner LED  : Toggle visible / hidden",
     "Drag corner LED   : Refine position",
@@ -285,6 +295,8 @@ HELP_TEXT = [
     "Click ArUco area  : Cycle ID 0 / ID 21 / none",
     "Click ring LED    : Set first ON, then first OFF",
     "                    (same LED = undecodable)",
+    "=== Keys ===",
+    "0-N               : Place that corner next",
 ]
 
 
@@ -327,6 +339,9 @@ class AnnotationTool:
         self._drag_started = False
         self._drag_on_left = False
         self._ring_start_candidate: int | None = None
+        # Corner the next left-panel click places; advances with each placement.
+        self.placing_idx = 0
+        self._cursor_left: tuple[float, float] | None = None
         self._needs_redraw = True
         self._window_sized = False
         # (annotation, board) before board-changing ArUco cycle
@@ -442,6 +457,8 @@ class AnnotationTool:
 
             self.mode = Mode.IDLE
             self._ring_start_candidate = None
+            self.placing_idx = 0
+            self._cursor_left = None
             self.status_msg = ""
             self._needs_redraw = True
 
@@ -520,6 +537,8 @@ class AnnotationTool:
         elif key in (ord("h"), ord("H")):
             self.show_help = not self.show_help
             self._needs_redraw = True
+        elif ord("0") <= key <= ord("9"):
+            self._select_placing_corner(key - ord("0"))
         elif key == 27:  # Escape
             if self.mode == Mode.ARUCO_CONFIRM:
                 self._revert_aruco_change()
@@ -600,14 +619,20 @@ class AnnotationTool:
         # Try left panel (original image) — corners only
         ox, oy = self._display_to_original(x, y)
         if ox is not None and oy is not None:
+            self._cursor_left = (ox, oy)
+            if event == cv2.EVENT_MOUSEMOVE:
+                self._needs_redraw = True
             if event == cv2.EVENT_LBUTTONDOWN:
                 self._commit_aruco_change()
                 idx = self._hit_test_corner_original(ox, oy)
                 if idx is not None:
+                    # On a corner overlay: hold for a drag, release without one to place.
                     self._drag_idx = idx
                     self._drag_start_original = (ox, oy)
                     self._drag_started = False
                     self._drag_on_left = True
+                else:
+                    self._place_corner(ox, oy)
             elif event == cv2.EVENT_MOUSEMOVE and self._drag_on_left:
                 if (
                     self._drag_idx is not None
@@ -626,10 +651,11 @@ class AnnotationTool:
                         self._needs_redraw = True
             elif event == cv2.EVENT_LBUTTONUP and self._drag_on_left:
                 if self._drag_idx is not None:
-                    if not self._drag_started:
-                        self._cycle_corner_state(self._drag_idx)
-                    if all(c["visible"] for c in self.annotation.corners):
-                        self._recompute_homography(self._current_image)
+                    if self._drag_started:
+                        if all(c["visible"] for c in self.annotation.corners):
+                            self._recompute_homography(self._current_image)
+                    else:
+                        self._place_corner(ox, oy)
                     self._drag_idx = None
                     self._drag_started = False
                     self._drag_on_left = False
@@ -638,6 +664,10 @@ class AnnotationTool:
             return
 
         # Right panel (rectified board)
+        if self._cursor_left is not None:
+            self._cursor_left = None  # cursor left the loupe's panel
+            self._needs_redraw = True
+
         bx, by = self._display_to_board(x, y)
         if bx is None:
             return
@@ -711,6 +741,25 @@ class AnnotationTool:
             self._drag_started = False
             self.mode = Mode.IDLE
             self._needs_redraw = True
+
+    # ── Direct corner placement (left panel) ────────────────────────────
+
+    def _select_placing_corner(self, idx):
+        """Choose which corner the next left-panel click places."""
+        if not 0 <= idx < len(self.annotation.corners):
+            return
+        self.placing_idx = idx
+        self._needs_redraw = True
+
+    def _place_corner(self, ox, oy):
+        """Set the pending corner to the clicked point and advance to the next one."""
+        corner = self.annotation.corners[self.placing_idx]
+        corner["position"] = [ox, oy]
+        corner["visible"] = True
+        if all(c["visible"] for c in self.annotation.corners):
+            self._recompute_homography(self._current_image)
+        self.placing_idx = (self.placing_idx + 1) % len(self.annotation.corners)
+        self._needs_redraw = True
 
     def _cycle_corner_state(self, idx):
         c = self.annotation.corners[idx]
@@ -857,18 +906,33 @@ class AnnotationTool:
         font = cv2.FONT_HERSHEY_SIMPLEX
         ann = self.annotation
 
-        # Left panel: original image with corner LEDs
-        left = original.copy()
+        # Left panel: original image, downscaled first so the overlays are drawn
+        # at display resolution — sharp labels, and no full-res copies per redraw.
+        h = TARGET_HEIGHT
+        orig_h, orig_w = original.shape[:2]
+        self.left_scale = h / orig_h
+        left = cv2.resize(original, (round(orig_w * self.left_scale), h))
         left_h, left_w = left.shape[:2]
         corner_radius = int(max(0.01 * min(left_w, left_h), 2))
         overlay = left.copy()
         for i, c in enumerate(ann.corners):
-            cx, cy = round(c["position"][0]), round(c["position"][1])
+            cx = round(c["position"][0] * self.left_scale)
+            cy = round(c["position"][1] * self.left_scale)
             color = COLOR_ON if c["visible"] else COLOR_NOT_VIS
             cv2.circle(overlay, (cx, cy), corner_radius, (0, 255, 255), -1)
             cv2.circle(left, (cx, cy), corner_radius, color, 2)
+            if i == self.placing_idx:  # the corner the next click places
+                cv2.circle(left, (cx, cy), corner_radius + 5, COLOR_RING_SEL, 2)
             cv2.putText(left, str(i), (cx + corner_radius + 4, cy + 5), font, 0.5, color, 1)
         cv2.addWeighted(overlay, 0.35, left, 0.65, 0, dst=left)
+
+        # Which corner the next click places, and how to pick another. On a darkened
+        # strip so it stays readable over whatever the image happens to show.
+        hint = f"Click places corner {self.placing_idx}   (keys 0-{len(ann.corners) - 1})"
+        (tw, th), _ = cv2.getTextSize(hint, font, 0.55, 1)
+        strip = left[0 : th + 18, 0 : tw + 20]
+        cv2.addWeighted(strip, 0.25, np.zeros_like(strip), 0.75, 0, dst=strip)
+        cv2.putText(left, hint, (10, th + 8), font, 0.55, COLOR_RING_SEL, 1)
 
         # Right panel: rectified board with overlays
         bs = self.board.board_size
@@ -951,15 +1015,14 @@ class AnnotationTool:
             board_img, annotation_label, (tx, ty), font, font_scale, annotation_color, thickness
         )
 
-        # Scale both to common height
-        h = TARGET_HEIGHT
-        left_h, left_w = left.shape[:2]
-        left_scaled = cv2.resize(left, (int(left_w * h / left_h), h))
-        board_scaled = cv2.resize(board_img, (int(bs * h / bs), h))
+        # The left panel is already at the common height; scale the board to match.
+        left_scaled = left
+        board_scaled = cv2.resize(board_img, (h, h))
 
         self.left_panel_w = left_scaled.shape[1]
-        self.left_scale = h / left_h
         self.board_scale = h / bs
+
+        self._draw_loupe(left_scaled, original)
 
         # Status bar (3 rows: info, shortcuts, legend)
         row_h = 22
@@ -986,7 +1049,8 @@ class AnnotationTool:
 
         # Row 2: keyboard shortcuts
         shortcuts = (
-            "Enter=Accept  Left/Right=Prev/Next  N/B=Skip to unannotated  C=Clear  Q=Quit  H=Help"
+            "Enter=Accept  Left/Right=Prev/Next  N/B=Skip to unannotated  "
+            "0-N=Pick corner  C=Clear  Q=Quit  H=Help"
         )
         cv2.putText(
             status_bar,
@@ -1026,6 +1090,47 @@ class AnnotationTool:
 
         return composite
 
+    def _draw_loupe(self, panel, original):
+        """Overlay a magnified inset of the region under the cursor on the scaled left panel."""
+        if self._cursor_left is None:
+            return
+        ph, pw = panel.shape[:2]
+        if pw < LOUPE_SIZE + 2 * LOUPE_MARGIN or ph < LOUPE_SIZE + 2 * LOUPE_MARGIN:
+            return
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cx, cy = self._cursor_left
+        # getRectSubPix replicates the border, so cursors near the edge still work.
+        patch = cv2.getRectSubPix(
+            original, (LOUPE_SOURCE_PX, LOUPE_SOURCE_PX), (float(cx), float(cy))
+        )
+        loupe = cv2.resize(patch, (LOUPE_SIZE, LOUPE_SIZE), interpolation=cv2.INTER_NEAREST)
+        zoom = LOUPE_SIZE / LOUPE_SOURCE_PX
+        mid = LOUPE_SIZE // 2
+
+        # Corner markers falling inside the magnified region
+        for i, c in enumerate(self.annotation.corners):
+            px = round((c["position"][0] - cx) * zoom + mid)
+            py = round((c["position"][1] - cy) * zoom + mid)
+            if 0 <= px < LOUPE_SIZE and 0 <= py < LOUPE_SIZE:
+                color = COLOR_ON if c["visible"] else COLOR_NOT_VIS
+                cv2.circle(loupe, (px, py), 8, color, 1)
+                if i == self.placing_idx:
+                    cv2.circle(loupe, (px, py), 12, COLOR_RING_SEL, 1)
+                cv2.putText(loupe, str(i), (px + 14, py + 4), font, 0.4, color, 1)
+
+        # Crosshair marking the exact click point, with a gap so the pixel stays visible
+        for dx0, dy0, dx1, dy1 in ((-16, 0, -4, 0), (4, 0, 16, 0), (0, -16, 0, -4), (0, 4, 0, 16)):
+            cv2.line(loupe, (mid + dx0, mid + dy0), (mid + dx1, mid + dy1), COLOR_RING_SEL, 1)
+        cv2.rectangle(loupe, (0, 0), (LOUPE_SIZE - 1, LOUPE_SIZE - 1), COLOR_RING_SEL, 2)
+
+        # Park the inset opposite the cursor so it never hides the target
+        dx = cx * self.left_scale
+        dy = cy * self.left_scale
+        x0 = LOUPE_MARGIN if dx > pw / 2 else pw - LOUPE_SIZE - LOUPE_MARGIN
+        y0 = LOUPE_MARGIN if dy > ph / 2 else ph - LOUPE_SIZE - LOUPE_MARGIN
+        panel[y0 : y0 + LOUPE_SIZE, x0 : x0 + LOUPE_SIZE] = loupe
+
     @staticmethod
     def _led_in_ring_arc(idx, start, end):
         """Check if LED idx is ON in the half-open arc [start, end).
@@ -1048,7 +1153,10 @@ class AnnotationTool:
         overlay = img.copy()
         h, w = img.shape[:2]
         pad = 20
-        box_w, box_h = 380, len(HELP_TEXT) * 22 + 2 * pad
+        text_w = max(
+            cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0][0] for line in HELP_TEXT
+        )
+        box_w, box_h = text_w + 2 * pad, len(HELP_TEXT) * 22 + 2 * pad
         x0 = (w - box_w) // 2
         y0 = (h - box_h) // 2
         cv2.rectangle(overlay, (x0, y0), (x0 + box_w, y0 + box_h), (30, 30, 30), -1)

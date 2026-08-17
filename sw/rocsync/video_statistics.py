@@ -15,9 +15,9 @@ class VideoStatistics:
     rmse_after: float
 
     # Duration and FPS
-    expected_duration: float  # container span of the analyzed frames
-    measured_duration: float  # board time between the first and last frame
-    expected_fps: float  # nominal rate reported by the container
+    container_duration: float  # container span of the analyzed frames
+    board_duration: float  # board time between the first and last frame
+    nominal_fps: float  # rate reported by the container
     measured_fps: float  # 1000 / median frame period
 
     # Affine map from source clock time to board time, in ms:

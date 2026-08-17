@@ -187,6 +187,7 @@ def fit_ftk_timestamps(
         {
             "n_frames": len(frame_times),
             "median_frame_period": period,
+            "measured_fps": 1000 / period if period else None,
             "n_gaps": n_gaps,
             "n_dropped_frames": n_dropped_frames,
             "largest_gap_ms": largest_gap_ms,

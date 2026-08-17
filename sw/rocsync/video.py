@@ -380,9 +380,9 @@ def process_video(
     exposure_times = [end - start for start, end, _ in filtered_timestamps.values()]
     statistics = VideoStatistics(
         n_frames=n_frames,
-        expected_duration=pts_max - pts_min,
-        measured_duration=fit_stats["last_frame"] - fit_stats["first_frame"],
-        expected_fps=fps,
+        container_duration=pts_max - pts_min,
+        board_duration=fit_stats["last_frame"] - fit_stats["first_frame"],
+        nominal_fps=fps,
         measured_fps=1000 / period,
         median_frame_period=period,
         n_gaps=n_gaps,
@@ -452,7 +452,7 @@ def print_statistics(statistics: VideoStatistics):
     print(
         format_str.format(
             "Framerate (nominal/measured):",
-            f"{statistics.expected_fps:.3f}/{statistics.measured_fps:.3f} fps",
+            f"{statistics.nominal_fps:.3f}/{statistics.measured_fps:.3f} fps",
         )
     )
     print(
@@ -465,7 +465,7 @@ def print_statistics(statistics: VideoStatistics):
     print(
         format_str.format(
             f"Duration ({scope}/board):",
-            f"{statistics.expected_duration / 1000:.3f}/{statistics.measured_duration / 1000:.3f} s (Δ={statistics.measured_duration - statistics.expected_duration:.2f} ms)",
+            f"{statistics.container_duration / 1000:.3f}/{statistics.board_duration / 1000:.3f} s (Δ={statistics.board_duration - statistics.container_duration:.2f} ms)",
         )
     )
     print(

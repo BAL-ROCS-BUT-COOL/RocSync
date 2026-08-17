@@ -35,8 +35,9 @@ def process_image(path, camera_type, debug_dir=None, board=None):
     image = cv2.imread(path)
     _, timestamp = process_frame(image, camera_type, 0, board, debug_dir)
     if timestamp is not None:
-        succprint(f"start: {timestamp[0]} ms, end {timestamp[1]} ms")
-        return {"start": timestamp[0], "end": timestamp[1]}
+        succprint(f"first frame: {timestamp[0]} ms, last frame: {timestamp[1]} ms")
+        # Interpret an image as a single-frame recording: its exposure window is its board-time span
+        return {"first_frame": timestamp[0], "last_frame": timestamp[1]}
     else:
         errprint("Error: Unable to decode timestamp.")
 

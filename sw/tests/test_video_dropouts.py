@@ -151,12 +151,12 @@ def test_last_frame_is_anchored_on_a_frame_that_exists(gap_video, board_at_pts):
 
     pts = frame_pts(gap_video)
     assert statistics.last_frame == pytest.approx(pts[-1] + OFFSET, abs=1.0)
-    assert statistics.expected_duration == pytest.approx(pts[-1] - pts[0], abs=1e-6)
+    assert statistics.container_duration == pytest.approx(pts[-1] - pts[0], abs=1e-6)
 
     # The recording is longer than its frames account for, so walking n_frames
     # forward at the true frame period stops well short of the real last frame
-    assert statistics.measured_duration > statistics.n_frames * PERIOD
-    assert statistics.measured_duration == pytest.approx(pts[-1] - pts[0], abs=1e-6)
+    assert statistics.board_duration > statistics.n_frames * PERIOD
+    assert statistics.board_duration == pytest.approx(pts[-1] - pts[0], abs=1e-6)
 
 
 def test_window_selects_frames_by_timestamp_not_by_index(gap_video, board_at_pts):

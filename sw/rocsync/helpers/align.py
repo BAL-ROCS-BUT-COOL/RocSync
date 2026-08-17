@@ -92,10 +92,10 @@ def main():
     if skipped:
         print(f"Ignoring {skipped} non-video entries in {args.sync_file}")
 
-    expected_fps = (
-        round(next(iter(videos.values()))["expected_fps"]) if args.fps is None else args.fps
+    nominal_fps = (
+        round(next(iter(videos.values()))["nominal_fps"]) if args.fps is None else args.fps
     )
-    print(f"Syncing {len(videos)} videos to {expected_fps} FPS")
+    print(f"Syncing {len(videos)} videos to {nominal_fps} FPS")
 
     use_nvenc = args.compensate_drift and hevc_nvenc_available()
     if args.compensate_drift and not use_nvenc:
@@ -176,7 +176,7 @@ def main():
                     duration,
                     clock_rate,
                     output_file=output_file,
-                    frame_rate=expected_fps,
+                    frame_rate=nominal_fps,
                     compensate_drift=args.compensate_drift,
                     use_nvenc=use_nvenc,
                 ),

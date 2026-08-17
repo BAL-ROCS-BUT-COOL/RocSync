@@ -11,24 +11,32 @@ from rocsync.printer import print
 
 MIN_ARUCO_AREA_FRACTION = 0.002  # smallest marker area, as a fraction of the frame
 
-# Blob detector params
-params = cv2.SimpleBlobDetector.Params()
 
-# Detect white blobs
-params.filterByColor = True
-params.blobColor = 255
+def _make_blob_detector():
+    """Blob detector tuned for the board's lit LEDs."""
+    params = cv2.SimpleBlobDetector.Params()
 
-# Exclude elongated blobs caused by motion blur
-params.filterByInertia = True
-params.minInertiaRatio = 0.5
+    # Detect white blobs
+    params.filterByColor = True
+    params.blobColor = 255
 
-blob_detector = cv2.SimpleBlobDetector.create(params)
+    # Exclude elongated blobs caused by motion blur
+    params.filterByInertia = True
+    params.minInertiaRatio = 0.5
 
-# ArUco detector params
-dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-parameters = cv2.aruco.DetectorParameters()
-parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
-aruco_detector = cv2.aruco.ArucoDetector(dictionary, parameters)
+    return cv2.SimpleBlobDetector.create(params)
+
+
+def _make_aruco_detector():
+    """ArUco detector for the board's identifying marker."""
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    parameters = cv2.aruco.DetectorParameters()
+    parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
+    return cv2.aruco.ArucoDetector(dictionary, parameters)
+
+
+blob_detector = _make_blob_detector()
+aruco_detector = _make_aruco_detector()
 
 
 def draw_polygon(points, image, color):

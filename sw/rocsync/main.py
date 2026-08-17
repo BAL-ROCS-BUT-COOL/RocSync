@@ -200,14 +200,15 @@ def main():
         )
         for file in videos + images + ftk_recordings:
             print(f"    {file}")
-        while True and not args.yes:
-            response = input("Do you want to continue (Y/n): ").strip().lower()
-            if response in ["y", "yes", ""]:
-                break
-            elif response in ["n", "no"]:
-                return
-            else:
-                print("Please enter 'y' or 'n'.")
+        if not args.yes:
+            while True:
+                response = input("Do you want to continue (Y/n): ").strip().lower()
+                if response in ["y", "yes", ""]:
+                    break
+                elif response in ["n", "no"]:
+                    return
+                else:
+                    print("Please enter 'y' or 'n'.")
 
     if args.debug:
         os.makedirs(args.debug, exist_ok=True)

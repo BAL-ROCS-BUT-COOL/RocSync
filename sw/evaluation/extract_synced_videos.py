@@ -79,11 +79,10 @@ def main(config: Config) -> None:
         clips = parse_clips_json(config.clips_to_extract_json)
 
     # --- Apply optional extraction filter AFTER clip parsing ---
-    only_for_camera = getattr(config, "only_for_camera", None)
-    if only_for_camera:
+    if config.only_for_camera:
         only_key = select_camera_key(
             time_sync_data_all,
-            only_for_camera,
+            config.only_for_camera,
             "--only-for-camera",
         )
         time_sync_data: dict[str, dict] = {only_key: time_sync_data_all[only_key]}

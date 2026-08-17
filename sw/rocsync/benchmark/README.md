@@ -1,6 +1,12 @@
 # Benchmark Tools
 
-Tools for evaluating and annotating the RocSync vision pipeline against validation images.
+Tools for evaluating and annotating the RocSync vision pipeline against validation images and
+videos.
+
+Inputs are collected recursively: images (`.png`, `.jpg`, `.jpeg`) and videos (`.mp4`, `.mov`,
+`.avi`, `.mkv`). **Every frame of a video is a benchmark frame** — video frames are decoded on
+demand, so nothing is extracted to disk. A dataset should hold a video *or* its extracted frames,
+not both, or the same content is benchmarked twice under two sets of keys.
 
 These are development tools: they run against a checkout, not an installed copy. Create the
 environment once with `uv sync` from `RocSync/sw`, then prefix each command with `uv run` to use
@@ -9,7 +15,7 @@ main README.
 
 ## Annotation Tool
 
-Interactive GUI for creating ground truth annotations. Runs the pipeline on each image, displays the result with LED overlays, and lets you verify or correct the decoded values. Produces a `ground_truth.json` file for benchmark evaluation.
+Interactive GUI for creating ground truth annotations. Runs the pipeline on each frame, displays the result with LED overlays, and lets you verify or correct the decoded values. Produces a `ground_truth.json` file for benchmark evaluation.
 
 ### Usage
 
@@ -17,10 +23,10 @@ Interactive GUI for creating ground truth annotations. Runs the pipeline on each
 uv run rocsync-annotate [data_dir] [-o ground_truth.json]
 ```
 
-- `data_dir`: Directory containing validation images (default: `validation_data/`). Images are collected recursively (`.png`, `.jpg`, `.jpeg`).
+- `data_dir`: Directory containing validation images and videos (default: `validation_data/`).
 - `-o`: Output file (default: `<data_dir>/ground_truth.json`).
 
-The tool resumes from the first unannotated image on restart.
+The tool resumes from the first unannotated frame on restart.
 
 ### Display
 
@@ -35,12 +41,14 @@ The window shows two panels side-by-side:
 
 | Key | Action |
 |-----|--------|
-| Enter / Space | Accept annotation, save, advance to next image |
-| D / Right arrow | Skip to next image without saving |
-| A / Left arrow | Go back to previous image |
-| N | Jump to next unannotated image |
-| B | Jump to previous unannotated image |
-| C / Backspace | Clear annotation for current image (deletes from ground truth, re-runs pipeline) |
+| Enter / Space | Accept annotation, save, advance to next frame |
+| D / Right arrow | Skip to next frame without saving |
+| A / Left arrow | Go back to previous frame |
+| N | Jump to next unannotated frame |
+| B | Jump to previous unannotated frame |
+| . | Jump to the first frame of the next input file |
+| , | Jump to the first frame of the previous input file |
+| C / Backspace | Clear annotation for current frame (deletes from ground truth, re-runs pipeline) |
 | Q | Quit |
 | H | Toggle help overlay |
 | 0-9 | Select which corner the next left-panel click places |
@@ -66,6 +74,11 @@ The window shows two panels side-by-side:
 
 Annotations are saved to a JSON file with the following structure:
 
+Each key under `images` names one benchmark frame. A still image is keyed by its path relative to
+`data_dir`; a video frame adds `#` and its absolute frame index, zero-padded to six digits, so a
+video's frames sort in playback order next to the file itself. The index is the frame's position in
+the file rather than a presentation timestamp, which would shift with the decoder.
+
 ```json
 {
   "images": {
@@ -80,6 +93,9 @@ Annotations are saved to a JSON file with the following structure:
       "homography": [[...], [...], [...]],
       "counter": {"visible": true, "value": 42},
       "ring": {"start": 10, "end": 55}
+    },
+    "subdir/clip.mp4#000042": {
+      "...": "same fields; frame 42 of subdir/clip.mp4"
     }
   }
 }
@@ -94,19 +110,21 @@ Fields:
 
 ## Validation Benchmark
 
-Runs the pipeline on all images in a directory and saves per-image results in a structure mirroring the ground truth format, plus per-step timing.
+Runs the pipeline on every frame in a directory and saves per-frame results in a structure mirroring the ground truth format, plus per-step timing.
 
 ```bash
 uv run rocsync-validate [data_dir] [-o results.json] [--debug DIR]
 ```
 
-- `data_dir`: Directory containing validation images (default: `validation_data/`).
+- `data_dir`: Directory containing validation images and videos (default: `validation_data/`).
 - `-o`: Output JSON file (default: `benchmark_results.json`).
 - `--debug`: Directory for debug images.
 
-Results JSON contains a `config` section and an `images` section with per-image aruco, corners, counter, ring, timestamp, success flag, and timing breakdown. Corner positions are in original image coordinates, matching the ground truth: the pipeline detects them in the rough-rectified grid, whose scale is a property of the checkout being measured, so they are un-warped through that grid's own homography before being stored.
+Results JSON contains a `config` section and an `images` section with per-frame aruco, corners, counter, ring, timestamp, success flag, and timing breakdown. Keys match the ground truth's, so `n_images` in `config` counts benchmark frames rather than files. Corner positions are in original image coordinates, matching the ground truth: the pipeline detects them in the rough-rectified grid, whose scale is a property of the checkout being measured, so they are un-warped through that grid's own homography before being stored.
 
 `config` records which checkout produced the file — branch, commit, whether the tree was dirty, run time, and the OpenCV and NumPy versions — because `rocsync-evaluate` labels its columns by filename alone.
+
+Video frames are decoded in the order they are walked, so a run never seeks backwards through a file.
 
 ## Benchmark Evaluation
 
@@ -163,9 +181,17 @@ uv run rocsync-evaluate output/benchmark/other.json output/benchmark/current.jso
     -g <data_dir>/ground_truth.json -t
 ```
 
-Running a checkout under the benchmark needs `rocsync/benchmark/{__init__,common,validate}.py`, the
-`stats` hooks in `vision.py`, and a `rocsync-validate` entry point. `annotate.py` and `evaluate.py`
-need geometry that older checkouts lack, so they are not portable and are not needed there.
+Running a checkout under the benchmark needs `rocsync/benchmark/{__init__,common,validate}.py`,
+`rocsync/dataset.py` for the suffix sets `common.py` collects inputs by, the `stats` hooks in
+`vision.py`, and a `rocsync-validate` entry point. `dataset.py` imports nothing from `rocsync`, so
+an older checkout only needs the file copied in. `annotate.py` and `evaluate.py` need geometry that
+older checkouts lack, so they are not portable and are not needed there.
+
+`rocsync-evaluate` prints how many ground truth frames each column actually scores. A column that
+scores fewer was run over a different set of inputs, and its rates describe that subset — a
+prediction the run never made is skipped rather than counted as a miss.
 
 Timing columns are only comparable when the environments agree — check the OpenCV and NumPy
-versions that `rocsync-evaluate` prints per column before reading `-t` output.
+versions that `rocsync-evaluate` prints per column before reading `-t` output. Video decoding is
+part of that: annotations are in decoded coordinates, and OpenCV applies a container's rotation
+metadata itself, so a backend that did not would put every position in a transposed frame.

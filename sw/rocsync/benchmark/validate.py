@@ -19,7 +19,12 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
-from rocsync.benchmark.common import STEP_ORDER, collect_images, corner_positions_in_image
+from rocsync.benchmark.common import (
+    STEP_ORDER,
+    FrameSource,
+    collect_frames,
+    corner_positions_in_image,
+)
 from rocsync.board_profiles import PROFILES_BY_ARUCO
 from rocsync.camera import CameraType
 from rocsync.vision import process_frame
@@ -119,33 +124,33 @@ def run_provenance(data_dir, n_images):
     }
 
 
-def run_benchmark(data_dir, images, debug_dir=None):
-    """Run pipeline on all images, returning results dict keyed by relative path."""
+def run_benchmark(frames, debug_dir=None):
+    """Run pipeline on all frames, returning results dict keyed by frame key."""
     results = {}
-    for i, path in enumerate(tqdm(images)):
-        image = cv2.imread(str(path))
-        if image is None:
-            print(f"  WARNING: could not read {path}", file=sys.stderr)
-            continue
+    with FrameSource() as source:
+        for i, ref in enumerate(tqdm(frames)):
+            image = source.read(ref)
+            if image is None:
+                print(f"  WARNING: could not read {ref.key}", file=sys.stderr)
+                continue
 
-        stats = {}
-        success, timestamp = process_frame(
-            image,
-            CameraType.RGB,
-            i,
-            debug_dir=debug_dir,
-            stats=stats,
-        )
+            stats = {}
+            success, timestamp = process_frame(
+                image,
+                CameraType.RGB,
+                i,
+                debug_dir=debug_dir,
+                stats=stats,
+            )
 
-        rel_path = str(path.relative_to(data_dir))
-        result = extract_pipeline_result(stats)
-        timing = extract_pipeline_timing(stats)
+            result = extract_pipeline_result(stats)
+            timing = extract_pipeline_timing(stats)
 
-        results[rel_path] = {
-            **result,
-            "success": success and timestamp is not None,
-            "timing": timing,
-        }
+            results[ref.key] = {
+                **result,
+                "success": success and timestamp is not None,
+                "timing": timing,
+            }
 
     return results
 
@@ -168,16 +173,21 @@ def main():
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
-    images = collect_images(data_dir)
-    if not images:
-        print(f"No images found in {data_dir}", file=sys.stderr)
+    frames = collect_frames(data_dir)
+    if not frames:
+        print(f"No images or videos found in {data_dir}", file=sys.stderr)
         sys.exit(1)
 
     if args.debug:
         Path(args.debug).mkdir(parents=True, exist_ok=True)
 
-    print(f"Found {len(images)} images")
-    results = run_benchmark(data_dir, images, debug_dir=args.debug)
+    n_stills = sum(1 for ref in frames if ref.index is None)
+    n_videos = len({ref.path for ref in frames if ref.index is not None})
+    print(
+        f"Found {len(frames)} frames: {n_stills} images and "
+        f"{len(frames) - n_stills} frames from {n_videos} videos"
+    )
+    results = run_benchmark(frames, debug_dir=args.debug)
 
     n_success = sum(1 for r in results.values() if r["success"])
     print(f"Detection rate: {n_success}/{len(results)} ({n_success / len(results):.1%})")

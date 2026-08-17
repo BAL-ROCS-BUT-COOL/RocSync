@@ -148,12 +148,13 @@ They expect a dataset folder containing `raw_videos/` and a `time sync/` subfold
 [`evaluation/README.md`](evaluation/README.md) for the dataset layout and the full argument list.
 
 ## Benchmarking
-`rocsync/benchmark/` measures the vision pipeline against a folder of validation images:
+`rocsync/benchmark/` measures the vision pipeline against a folder of validation images and videos,
+every frame of a video counting as one benchmark frame:
 
 | Tool | Purpose |
 | --- | --- |
-| `annotate.py` | Interactive GUI for building a `ground_truth.json` from validation images |
-| `validate.py` | Run the pipeline over every image and record what it decoded, with per-step timings |
+| `annotate.py` | Interactive GUI for building a `ground_truth.json` from validation frames |
+| `validate.py` | Run the pipeline over every frame and record what it decoded, with per-step timings |
 | `evaluate.py` | Score a validation run against the ground truth and report where it fails |
 
 See [`rocsync/benchmark/README.md`](rocsync/benchmark/README.md) for the annotation shortcuts and

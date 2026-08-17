@@ -712,10 +712,13 @@ def main():
     col_width = max(14, max(len(m) for m in methods) + 2)
 
     n_images = len(gt_images)
-    print(f"Ground truth: {args.ground_truth} ({n_images} images)")
+    print(f"Ground truth: {args.ground_truth} ({n_images} frames)")
     print(f"Methods: {', '.join(methods)}")
     for m in methods:
-        print(f"  {m}: {_describe_run(benchmarks[m].get('config', {}))}")
+        # A prediction the run never made is skipped silently, so say how many it covers
+        n_scored = len(set(gt_images) & set(benchmarks[m]["images"]))
+        scope = f"scores {n_scored}/{n_images}"
+        print(f"  {m}: {_describe_run(benchmarks[m].get('config', {}))}, {scope}")
 
     # Compute all metrics per method
     all_metrics = {}

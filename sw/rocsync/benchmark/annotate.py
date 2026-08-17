@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Interactive annotation and verification tool for RocSync benchmark images.
+"""Interactive annotation and verification tool for RocSync benchmark frames.
 
-Runs the rocsync pipeline on validation images, displays results with LED
-overlays, and lets the user verify or correct the decoded values. Produces
-a ground_truth.json file for benchmark evaluation.
+Runs the rocsync pipeline on validation images and videos, displays results
+with LED overlays, and lets the user verify or correct the decoded values.
+Produces a ground_truth.json file for benchmark evaluation.
 
 Usage:
     python -m rocsync.benchmark.annotate [data_dir] [-o ground_truth.json]
@@ -20,7 +20,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from rocsync.benchmark.common import collect_images, corner_positions_in_image
+from rocsync.benchmark.common import FrameSource, collect_frames, corner_positions_in_image
 from rocsync.board_profiles import BOARD_V1, PROFILES_BY_ARUCO, RectifiedBoard
 from rocsync.camera import CameraType
 from rocsync.vision import ARUCO_DICTIONARY, process_frame
@@ -286,6 +286,7 @@ HELP_TEXT = [
     "                    (same LED = undecodable)",
     "=== Keys ===",
     "0-N               : Place that corner next",
+    ". / ,             : Next / previous input file",
 ]
 
 
@@ -299,7 +300,8 @@ class AnnotationTool:
         self.data_dir = Path(data_dir)
         self.output_path = Path(output_path) if output_path else self.data_dir / "ground_truth.json"
         self.ground_truth = {"images": {}}
-        self.images = []
+        self.frames = []
+        self.source = FrameSource()
         self.current_idx = 0
 
         # Board profile and derived geometry (set per-image)
@@ -353,39 +355,40 @@ class AnnotationTool:
     # ── Main loop ───────────────────────────────────────────────────────
 
     def run(self):
-        self.images = sorted(collect_images(self.data_dir))
-        if not self.images:
-            print("No images found.", file=sys.stderr)
+        self.frames = collect_frames(self.data_dir)
+        if not self.frames:
+            print("No images or videos found.", file=sys.stderr)
             return
 
         self._load_ground_truth()
         first = self._find_unannotated(-1, forward=True)
         if first == -1:
-            print("All images already annotated. Starting from the beginning.")
+            print("All frames already annotated. Starting from the beginning.")
             self.current_idx = 0
         else:
             self.current_idx = first
-            rel = str(self.images[first].relative_to(self.data_dir))
-            print(f"Resuming at image {first + 1}/{len(self.images)}: {rel}")
+            print(f"Resuming at frame {first + 1}/{len(self.frames)}: {self.frames[first].key}")
 
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.setMouseCallback(WINDOW_NAME, self._mouse_callback)
 
-        n_images = len(self.images)
+        n_frames = len(self.frames)
         unreadable = 0  # consecutive read failures; bail out rather than spin forever
         while True:
-            image_path = self.images[self.current_idx]
-            rel_path = str(image_path.relative_to(self.data_dir))
+            ref = self.frames[self.current_idx]
+            frame_key = ref.key
 
-            image = cv2.imread(str(image_path))
+            # Decoding a video frame can seek, so present a frame before blocking on it
+            self._pump()
+            image = self.source.read(ref)
             if image is None:
-                print(f"Cannot read {image_path}", file=sys.stderr)
+                print(f"Cannot read {frame_key}", file=sys.stderr)
                 self._pump()
                 unreadable += 1
-                if unreadable >= n_images:
-                    print("No readable images.", file=sys.stderr)
+                if unreadable >= n_frames:
+                    print("No readable frames.", file=sys.stderr)
                     break
-                self.current_idx = (self.current_idx + 1) % n_images
+                self.current_idx = (self.current_idx + 1) % n_frames
                 continue
             unreadable = 0
             self._pump()
@@ -395,15 +398,15 @@ class AnnotationTool:
             try:
                 process_frame(image, CameraType.RGB, 0, stats=self.stats)
             except Exception as e:  # noqa: BLE001 — a bad frame must not kill the session
-                print(f"Pipeline error on {rel_path}: {e}", file=sys.stderr)
+                print(f"Pipeline error on {frame_key}: {e}", file=sys.stderr)
                 self.stats["rectified"] = None
                 self.stats["aruco_id"] = None
             self._pump()
 
             # Resolve board profile from pipeline detection or saved annotation
             aruco_id = self.stats.get("aruco_id")
-            if rel_path in self.ground_truth["images"]:
-                saved_id = self.ground_truth["images"][rel_path].get("aruco", {}).get("id")
+            if frame_key in self.ground_truth["images"]:
+                saved_id = self.ground_truth["images"][frame_key].get("aruco", {}).get("id")
                 if saved_id is not None:
                     aruco_id = saved_id
             profile = (
@@ -413,9 +416,9 @@ class AnnotationTool:
             self._set_board(board)
 
             # Load existing annotation or create from pipeline
-            if rel_path in self.ground_truth["images"]:
+            if frame_key in self.ground_truth["images"]:
                 self.annotation = ImageAnnotation.from_dict(
-                    self.ground_truth["images"][rel_path], board
+                    self.ground_truth["images"][frame_key], board
                 )
             else:
                 self.annotation = ImageAnnotation.from_stats(self.stats, board)
@@ -465,27 +468,32 @@ class AnnotationTool:
             self._needs_redraw = True
 
             self._current_image = image
-            action = self._image_loop(image, rel_path)
+            action = self._image_loop(image, frame_key)
 
             if action == "accept":
-                self.ground_truth["images"][rel_path] = self.annotation.to_dict()
+                self.ground_truth["images"][frame_key] = self.annotation.to_dict()
                 self._save_ground_truth()
-                self.current_idx = (self.current_idx + 1) % n_images
+                self.current_idx = (self.current_idx + 1) % n_frames
             elif action == "skip":
-                self.current_idx = (self.current_idx + 1) % n_images
+                self.current_idx = (self.current_idx + 1) % n_frames
             elif action == "back":
-                self.current_idx = (self.current_idx - 1) % n_images
+                self.current_idx = (self.current_idx - 1) % n_frames
             elif action == "next_unannotated":
                 self.current_idx = self._find_unannotated(self.current_idx, forward=True)
             elif action == "prev_unannotated":
                 self.current_idx = self._find_unannotated(self.current_idx, forward=False)
+            elif action == "next_source":
+                self.current_idx = self._find_source_boundary(self.current_idx, forward=True)
+            elif action == "prev_source":
+                self.current_idx = self._find_source_boundary(self.current_idx, forward=False)
             elif action == "clear":
-                self.ground_truth["images"].pop(rel_path, None)
+                self.ground_truth["images"].pop(frame_key, None)
                 self._save_ground_truth()
-                # stay on current image — re-runs pipeline on next iteration
+                # stay on current frame — re-runs pipeline on next iteration
             elif action == "quit":
                 break
 
+        self.source.close()
         cv2.destroyAllWindows()
 
     def _pump(self):
@@ -496,11 +504,11 @@ class AnnotationTool:
         if key != 255 and self._pending_key is None:
             self._pending_key = key  # hold keys typed while work blocked the loop
 
-    def _image_loop(self, image, rel_path):
+    def _image_loop(self, image, frame_key):
         composite = None
         while True:
             if self._needs_redraw or composite is None:
-                composite = self._render(image, rel_path)
+                composite = self._render(image, frame_key)
                 if not self._window_sized:
                     h, w = composite.shape[:2]
                     cv2.resizeWindow(WINDOW_NAME, w, h)
@@ -545,6 +553,12 @@ class AnnotationTool:
         elif key in (ord("b"), ord("B")):
             self._commit_aruco_change()
             return "prev_unannotated"
+        elif key == ord("."):
+            self._commit_aruco_change()
+            return "next_source"
+        elif key == ord(","):
+            self._commit_aruco_change()
+            return "prev_source"
         elif key in (ord("c"), ord("C"), 8, 127):  # C or Backspace
             self._commit_aruco_change()
             return "clear"
@@ -918,7 +932,7 @@ class AnnotationTool:
 
     # ── Rendering ───────────────────────────────────────────────────────
 
-    def _render(self, original, rel_path):
+    def _render(self, original, frame_key):
         """Build the composite side-by-side display image."""
         font = cv2.FONT_HERSHEY_SIMPLEX
         ann = self.annotation
@@ -1020,7 +1034,7 @@ class AnnotationTool:
             cv2.circle(board_img, (rx, ry), LED_RADIUS_PX, color, 1)
 
         # Annotation status label in top-right corner
-        is_annotated = rel_path in self.ground_truth["images"]
+        is_annotated = frame_key in self.ground_truth["images"]
         annotation_label = "Annotated" if is_annotated else "UNANNOTATED"
         font_scale, thickness = 0.6, (1 if is_annotated else 2)
         (tw, th), _ = cv2.getTextSize(annotation_label, font, font_scale, thickness)
@@ -1049,8 +1063,8 @@ class AnnotationTool:
 
         # Row 1: progress + file path
         n_annotated = len(self.ground_truth["images"])
-        progress = f"[{self.current_idx + 1}/{len(self.images)}] ({n_annotated} annotated)"
-        info = f"{progress}  {rel_path}"
+        progress = f"[{self.current_idx + 1}/{len(self.frames)}] ({n_annotated} annotated)"
+        info = f"{progress}  {frame_key}"
         cv2.putText(status_bar, info, (8, row_h - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_TEXT, 1)
 
         if self.status_msg:
@@ -1067,7 +1081,7 @@ class AnnotationTool:
         # Row 2: keyboard shortcuts
         shortcuts = (
             "Enter=Accept  Left/Right=Prev/Next  N/B=Skip to unannotated  "
-            "0-N=Pick corner  C=Clear  Q=Quit  H=Help"
+            ",/.=Prev/Next file  0-N=Pick corner  C=Clear  Q=Quit  H=Help"
         )
         cv2.putText(
             status_bar,
@@ -1205,17 +1219,39 @@ class AnnotationTool:
             json.dump(self.ground_truth, f, indent=2)
 
     def _find_unannotated(self, from_idx, forward=True):
-        """Find the next/previous unannotated image index, wrapping around the list.
+        """Find the next/previous unannotated frame index, wrapping around the list.
 
-        Returns from_idx if every image is annotated.
+        Returns from_idx if every frame is annotated.
         """
-        n = len(self.images)
+        n = len(self.frames)
         step = 1 if forward else -1
         for k in range(1, n + 1):
             idx = (from_idx + k * step) % n
-            rel = str(self.images[idx].relative_to(self.data_dir))
-            if rel not in self.ground_truth["images"]:
+            if self.frames[idx].key not in self.ground_truth["images"]:
                 return idx
+        return from_idx
+
+    def _find_source_boundary(self, from_idx, forward=True):
+        """First frame of the next/previous input file, wrapping around the list.
+
+        A video contributes one frame per key, so stepping past one otherwise costs a
+        keypress per frame, and jump-to-unannotated only helps while frames are still
+        unannotated.
+        """
+        n = len(self.frames)
+        current = self.frames[from_idx].path
+        step = 1 if forward else -1
+        for k in range(1, n + 1):
+            idx = (from_idx + k * step) % n
+            if self.frames[idx].path == current:
+                continue
+            if forward:
+                return idx
+            # Going back lands on that file's last frame; rewind to its first
+            found = self.frames[idx].path
+            while self.frames[(idx - 1) % n].path == found:
+                idx = (idx - 1) % n
+            return idx
         return from_idx
 
 
@@ -1223,7 +1259,7 @@ class AnnotationTool:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Annotate and verify RocSync benchmark images")
+    parser = argparse.ArgumentParser(description="Annotate and verify RocSync benchmark frames")
     parser.add_argument(
         "data_dir",
         nargs="?",

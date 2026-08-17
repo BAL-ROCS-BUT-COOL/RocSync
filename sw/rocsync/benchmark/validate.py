@@ -15,10 +15,10 @@ from pathlib import Path
 import cv2
 from tqdm import tqdm
 
+from rocsync.benchmark.common import STEP_ORDER, collect_images
 from rocsync.board_profiles import PROFILES_BY_ARUCO
 from rocsync.camera import CameraType
 from rocsync.vision import process_frame
-from rocsync.benchmark.common import STEP_ORDER, collect_images
 
 
 def extract_pipeline_result(stats):
@@ -100,7 +100,9 @@ def run_benchmark(data_dir, images, debug_dir=None):
 
         stats = {}
         success, timestamp = process_frame(
-            image, CameraType.RGB, i,
+            image,
+            CameraType.RGB,
+            i,
             debug_dir=debug_dir,
             stats=stats,
         )
@@ -120,12 +122,19 @@ def run_benchmark(data_dir, images, debug_dir=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark rocsync on validation data")
-    parser.add_argument("data_dir", nargs="?", default="validation_data",
-                        help="Path to validation data directory (default: validation_data)")
-    parser.add_argument("-o", "--output", default="benchmark_results.json",
-                        help="Output JSON file (default: benchmark_results.json)")
-    parser.add_argument("--debug", default=None,
-                        help="Directory for debug images")
+    parser.add_argument(
+        "data_dir",
+        nargs="?",
+        default="validation_data",
+        help="Path to validation data directory (default: validation_data)",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="benchmark_results.json",
+        help="Output JSON file (default: benchmark_results.json)",
+    )
+    parser.add_argument("--debug", default=None, help="Directory for debug images")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -141,7 +150,7 @@ def main():
     results = run_benchmark(data_dir, images, debug_dir=args.debug)
 
     n_success = sum(1 for r in results.values() if r["success"])
-    print(f"Detection rate: {n_success}/{len(results)} ({n_success/len(results):.1%})")
+    print(f"Detection rate: {n_success}/{len(results)} ({n_success / len(results):.1%})")
 
     output = {
         "config": {"data_dir": str(data_dir)},

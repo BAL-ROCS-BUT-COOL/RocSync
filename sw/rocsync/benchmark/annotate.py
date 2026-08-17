@@ -20,16 +20,17 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from rocsync.vision import ARUCO_DICTIONARY, process_frame
-from rocsync.camera import CameraType
-from rocsync.board_profiles import BOARD_V1, PROFILES_BY_ARUCO
 from rocsync.benchmark.common import collect_images
+from rocsync.board_profiles import BOARD_V1, PROFILES_BY_ARUCO, RectifiedBoard
+from rocsync.camera import CameraType
+from rocsync.vision import ARUCO_DICTIONARY, process_frame
 
 # Every board rectifies to the same pixel grid, so one radius serves the whole GUI.
 LED_RADIUS_PX = BOARD_V1.rectify().led_sample_radius
 
 
 # ── Board geometry helpers ──────────────────────────────────────────────────
+
 
 def ring_led_positions(board):
     """Return list of (x, y) tuples for ring LEDs in rectified board coords."""
@@ -71,6 +72,7 @@ DRAG_THRESHOLD = 3  # px before a click becomes a drag
 
 # ── Annotation data ────────────────────────────────────────────────────────
 
+
 @dataclass
 class ImageAnnotation:
     """Mutable annotation state for a single image.
@@ -82,7 +84,8 @@ class ImageAnnotation:
     Ring uses half-open semantics: ring_start = first ON LED,
     ring_end = first OFF LED.  ring_start == ring_end means undecodable.
     """
-    board: object = None  # BoardProfile (not serialized)
+
+    board: RectifiedBoard  # not serialized
 
     aruco_visible: bool = False
     aruco_id: int = 0
@@ -99,15 +102,13 @@ class ImageAnnotation:
     counter_value: int = 0
 
     ring_start: int = 0  # first ON LED index
-    ring_end: int = 0    # first OFF LED index (exclusive); == start → undecodable
+    ring_end: int = 0  # first OFF LED index (exclusive); == start → undecodable
 
     def __post_init__(self):
-        if not self.corners and self.board is not None:
+        if not self.corners:
             corner_pos = corner_led_positions(self.board)
-            self.corners = [
-                {"visible": False, "position": list(p)} for p in corner_pos
-            ]
-        if not self.counter_leds and self.board is not None:
+            self.corners = [{"visible": False, "position": list(p)} for p in corner_pos]
+        if not self.counter_leds:
             self.counter_leds = [False] * self.board.counter_bits
 
     @classmethod
@@ -182,11 +183,11 @@ class ImageAnnotation:
     def to_board(self, orig_x, orig_y):
         """Transform a point from original image coords to rectified board coords."""
         if self.homography is None:
-            return int(round(orig_x)), int(round(orig_y))
+            return round(orig_x), round(orig_y)
         H = np.array(self.homography, dtype=np.float64)
         pt = np.array([[[orig_x, orig_y]]], dtype=np.float64)
         board = cv2.perspectiveTransform(pt, H).reshape(2)
-        return int(round(board[0])), int(round(board[1]))
+        return round(board[0]), round(board[1])
 
     def to_dict(self):
         """Serialize annotation. Invisible components are stripped to visibility only."""
@@ -244,9 +245,7 @@ class ImageAnnotation:
         ann.counter_visible = counter.get("visible", False)
         ann.counter_value = counter.get("value", 0)
         n = board.counter_bits
-        ann.counter_leds = [
-            bool(ann.counter_value & (2 ** (n - 1 - i))) for i in range(n)
-        ]
+        ann.counter_leds = [bool(ann.counter_value & (2 ** (n - 1 - i))) for i in range(n)]
 
         ring = data.get("ring", {})
         ann.ring_start = ring.get("start", 0)
@@ -255,6 +254,7 @@ class ImageAnnotation:
 
 
 # ── Interaction state ───────────────────────────────────────────────────────
+
 
 class Mode(Enum):
     IDLE = "idle"
@@ -265,11 +265,11 @@ class Mode(Enum):
 
 # ── Display and interaction ─────────────────────────────────────────────────
 
-COLOR_ON = (0, 0, 255)           # red  — LED is ON
-COLOR_OFF = (255, 0, 0)          # blue — LED is OFF
+COLOR_ON = (0, 0, 255)  # red  — LED is ON
+COLOR_OFF = (255, 0, 0)  # blue — LED is OFF
 COLOR_NOT_VIS = (128, 128, 128)  # gray — component hidden/undecodable
-COLOR_RING_SEL = (0, 255, 0)     # green — ring selection highlight
-COLOR_TEXT = (0, 0, 0)           # black text on bright bg
+COLOR_RING_SEL = (0, 255, 0)  # green — ring selection highlight
+COLOR_TEXT = (0, 0, 0)  # black text on bright bg
 COLOR_STATUS_BG = (220, 220, 220)  # light gray
 COLOR_BOARD_TEXT = (255, 255, 255)  # white text on dark board
 
@@ -289,6 +289,11 @@ HELP_TEXT = [
 
 
 class AnnotationTool:
+    # Per-image state. Set by run() before any handler can fire, so it is never None.
+    annotation: ImageAnnotation
+    stats: dict
+    _current_image: np.ndarray
+
     def __init__(self, data_dir, output_path=None):
         self.data_dir = Path(data_dir)
         self.output_path = Path(output_path) if output_path else self.data_dir / "ground_truth.json"
@@ -316,18 +321,16 @@ class AnnotationTool:
 
         # Interaction state
         self.mode = Mode.IDLE
-        self.annotation = None
-        self.stats = None
-        self._current_image = None
-        self._drag_idx = None
-        self._drag_start = None
-        self._drag_start_original = None
+        self._drag_idx: int | None = None
+        self._drag_start: tuple[float, float] | None = None
+        self._drag_start_original: tuple[float, float] | None = None
         self._drag_started = False
         self._drag_on_left = False
-        self._ring_start_candidate = None
+        self._ring_start_candidate: int | None = None
         self._needs_redraw = True
         self._window_sized = False
-        self._aruco_snapshot = None   # (annotation, board) before board-changing ArUco cycle
+        # (annotation, board) before board-changing ArUco cycle
+        self._aruco_snapshot: tuple[ImageAnnotation, RectifiedBoard] | None = None
 
     def _set_board(self, board):
         """Update board profile and recompute derived geometry."""
@@ -376,7 +379,7 @@ class AnnotationTool:
             self.stats = {}
             try:
                 process_frame(image, CameraType.RGB, 0, stats=self.stats)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 — a bad frame must not kill the session
                 print(f"Pipeline error on {rel_path}: {e}", file=sys.stderr)
                 self.stats["rectified"] = None
                 self.stats["aruco_id"] = None
@@ -387,13 +390,17 @@ class AnnotationTool:
                 saved_id = self.ground_truth["images"][rel_path].get("aruco", {}).get("id")
                 if saved_id is not None:
                     aruco_id = saved_id
-            board = PROFILES_BY_ARUCO.get(aruco_id, BOARD_V1).rectify()
+            profile = (
+                PROFILES_BY_ARUCO.get(aruco_id, BOARD_V1) if aruco_id is not None else BOARD_V1
+            )
+            board = profile.rectify()
             self._set_board(board)
 
             # Load existing annotation or create from pipeline
             if rel_path in self.ground_truth["images"]:
                 self.annotation = ImageAnnotation.from_dict(
-                    self.ground_truth["images"][rel_path], board)
+                    self.ground_truth["images"][rel_path], board
+                )
             else:
                 self.annotation = ImageAnnotation.from_stats(self.stats, board)
                 # Use the pipeline homography for new annotations
@@ -430,7 +437,8 @@ class AnnotationTool:
                 H = np.array(self.annotation.homography, dtype=np.float64)
                 mask = image[:, :, 2]
                 self.stats["rectified"] = cv2.warpPerspective(
-                    mask, H, (board.board_size, board.board_size))
+                    mask, H, (board.board_size, board.board_size)
+                )
 
             self.mode = Mode.IDLE
             self._ring_start_candidate = None
@@ -491,25 +499,25 @@ class AnnotationTool:
         if key in (13, 10, 32):  # Enter or Space
             self._commit_aruco_change()
             return "accept"
-        elif key == 83 or key == ord('d'):  # Right arrow
+        elif key == 83 or key == ord("d"):  # Right arrow
             self._commit_aruco_change()
             return "skip"
-        elif key == 81 or key == ord('a'):  # Left arrow
+        elif key == 81 or key == ord("a"):  # Left arrow
             self._commit_aruco_change()
             return "back"
-        elif key in (ord('n'), ord('N')):
+        elif key in (ord("n"), ord("N")):
             self._commit_aruco_change()
             return "next_unannotated"
-        elif key in (ord('b'), ord('B')):
+        elif key in (ord("b"), ord("B")):
             self._commit_aruco_change()
             return "prev_unannotated"
-        elif key in (ord('c'), ord('C'), 8, 127):  # C or Backspace
+        elif key in (ord("c"), ord("C"), 8, 127):  # C or Backspace
             self._commit_aruco_change()
             return "clear"
-        elif key in (ord('q'), ord('Q')):
+        elif key in (ord("q"), ord("Q")):
             self._commit_aruco_change()
             return "quit"
-        elif key in (ord('h'), ord('H')):
+        elif key in (ord("h"), ord("H")):
             self.show_help = not self.show_help
             self._needs_redraw = True
         elif key == 27:  # Escape
@@ -549,12 +557,12 @@ class AnnotationTool:
         # 1. Corner LEDs
         for i, c in enumerate(self.annotation.corners):
             cx, cy = self.annotation.to_board(*c["position"])
-            if (bx - cx) ** 2 + (by - cy) ** 2 <= HIT_CORNER ** 2:
+            if (bx - cx) ** 2 + (by - cy) ** 2 <= HIT_CORNER**2:
                 return "corner", i
 
         # 2. Counter LEDs (individual)
         for i, (cx, cy) in enumerate(self.counter_pos):
-            if (bx - cx) ** 2 + (by - cy) ** 2 <= HIT_COUNTER ** 2:
+            if (bx - cx) ** 2 + (by - cy) ** 2 <= HIT_COUNTER**2:
                 return "counter", i
 
         # 3. Counter bounding box (outside LED circles → toggle visibility)
@@ -567,13 +575,13 @@ class AnnotationTool:
             return "aruco", 0
 
         # 5. Ring LEDs (nearest within radius)
-        best_i, best_d = 0, float('inf')
+        best_i, best_d = 0, float("inf")
         for i, (rx, ry) in enumerate(self.ring_pos):
             d = (bx - rx) ** 2 + (by - ry) ** 2
             if d < best_d:
                 best_d = d
                 best_i = i
-        if best_d <= HIT_RING ** 2:
+        if best_d <= HIT_RING**2:
             return "ring", best_i
 
         return None, None
@@ -584,14 +592,14 @@ class AnnotationTool:
         hit_r = 2 * int(max(0.01 * min(img_w, img_h), 2))
         for i, c in enumerate(self.annotation.corners):
             cx, cy = c["position"]
-            if (ox - cx) ** 2 + (oy - cy) ** 2 <= hit_r ** 2:
+            if (ox - cx) ** 2 + (oy - cy) ** 2 <= hit_r**2:
                 return i
         return None
 
     def _mouse_callback(self, event, x, y, flags, param):
         # Try left panel (original image) — corners only
         ox, oy = self._display_to_original(x, y)
-        if ox is not None:
+        if ox is not None and oy is not None:
             if event == cv2.EVENT_LBUTTONDOWN:
                 self._commit_aruco_change()
                 idx = self._hit_test_corner_original(ox, oy)
@@ -601,12 +609,16 @@ class AnnotationTool:
                     self._drag_started = False
                     self._drag_on_left = True
             elif event == cv2.EVENT_MOUSEMOVE and self._drag_on_left:
-                if self._drag_idx is not None and (flags & cv2.EVENT_FLAG_LBUTTON):
+                if (
+                    self._drag_idx is not None
+                    and self._drag_start_original is not None
+                    and (flags & cv2.EVENT_FLAG_LBUTTON)
+                ):
                     dx = ox - self._drag_start_original[0]
                     dy = oy - self._drag_start_original[1]
                     img_h, img_w = self._current_image.shape[:2]
                     threshold = int(max(0.01 * min(img_w, img_h), DRAG_THRESHOLD))
-                    if not self._drag_started and (dx * dx + dy * dy) > threshold ** 2:
+                    if not self._drag_started and (dx * dx + dy * dy) > threshold**2:
                         self._drag_started = True
                         self.mode = Mode.DRAGGING_CORNER
                     if self._drag_started:
@@ -641,7 +653,7 @@ class AnnotationTool:
     def _on_left_down(self, bx, by):
         if self.mode == Mode.RING_AWAITING_END:
             elem, idx = self._hit_test(bx, by)
-            if elem == "ring":
+            if elem == "ring" and idx is not None and self._ring_start_candidate is not None:
                 # Convert CW clicks to ascending [start, end):
                 # CW first ON  → ascending end (exclusive)
                 # CW first OFF → ascending start
@@ -670,18 +682,23 @@ class AnnotationTool:
             self._handle_ring_first_click(idx)
 
     def _on_mouse_move(self, bx, by, flags):
-        if self._drag_idx is not None and (flags & cv2.EVENT_FLAG_LBUTTON):
+        if (
+            self._drag_idx is not None
+            and self._drag_start is not None
+            and (flags & cv2.EVENT_FLAG_LBUTTON)
+        ):
             dx = bx - self._drag_start[0]
             dy = by - self._drag_start[1]
-            if not self._drag_started and (dx * dx + dy * dy) > DRAG_THRESHOLD ** 2:
+            if not self._drag_started and (dx * dx + dy * dy) > DRAG_THRESHOLD**2:
                 self._drag_started = True
                 self.mode = Mode.DRAGGING_CORNER
             if self._drag_started:
                 bs = self.board.board_size
                 cbx = max(0, min(bs - 1, bx))
                 cby = max(0, min(bs - 1, by))
-                self.annotation.corners[self._drag_idx]["position"] = \
-                    self.annotation.to_original(cbx, cby)
+                self.annotation.corners[self._drag_idx]["position"] = self.annotation.to_original(
+                    cbx, cby
+                )
                 self._needs_redraw = True
 
     def _on_left_up(self, bx, by):
@@ -735,8 +752,11 @@ class AnnotationTool:
         if self._aruco_snapshot is None:
             self._aruco_snapshot = (copy.deepcopy(self.annotation), self.board)
 
-        # Check if the board profile changes
-        new_board = PROFILES_BY_ARUCO.get(new_id, self.board) if new_visible else self.board
+        # Check if the board profile changes. Rectified boards are cached per profile,
+        # so identity comparison is enough to spot a change.
+        new_board = self.board
+        if new_visible and new_id in PROFILES_BY_ARUCO:
+            new_board = PROFILES_BY_ARUCO[new_id].rectify()
         board_changes = new_board is not self.board
 
         if board_changes:
@@ -769,7 +789,7 @@ class AnnotationTool:
                     c["visible"] = False
                 self.annotation = new_ann
 
-            self.status_msg = f"Board changed to {new_board.name} — Esc to undo"
+            self.status_msg = f"Board changed to {new_board.profile.name} — Esc to undo"
         else:
             ann.aruco_visible = new_visible
             ann.aruco_id = new_id
@@ -806,7 +826,14 @@ class AnnotationTool:
         if len(visible) < 4:
             return
         src = np.array([c["position"] for c in ann.corners if c["visible"]], dtype=np.float32)
-        dst = np.array([board.always_on_leds[CameraType.RGB][i] for i, c in enumerate(ann.corners) if c["visible"]], dtype=np.float32)
+        dst = np.array(
+            [
+                board.always_on_leds[CameraType.RGB][i]
+                for i, c in enumerate(ann.corners)
+                if c["visible"]
+            ],
+            dtype=np.float32,
+        )
         if len(src) == 4:
             H = cv2.getPerspectiveTransform(src, dst)
         else:
@@ -836,12 +863,11 @@ class AnnotationTool:
         corner_radius = int(max(0.01 * min(left_w, left_h), 2))
         overlay = left.copy()
         for i, c in enumerate(ann.corners):
-            cx, cy = int(round(c["position"][0])), int(round(c["position"][1]))
+            cx, cy = round(c["position"][0]), round(c["position"][1])
             color = COLOR_ON if c["visible"] else COLOR_NOT_VIS
             cv2.circle(overlay, (cx, cy), corner_radius, (0, 255, 255), -1)
             cv2.circle(left, (cx, cy), corner_radius, color, 2)
-            cv2.putText(left, str(i), (cx + corner_radius + 4, cy + 5),
-                        font, 0.5, color, 1)
+            cv2.putText(left, str(i), (cx + corner_radius + 4, cy + 5), font, 0.5, color, 1)
         cv2.addWeighted(overlay, 0.35, left, 0.65, 0, dst=left)
 
         # Right panel: rectified board with overlays
@@ -863,7 +889,8 @@ class AnnotationTool:
             marker = cv2.aruco.generateImageMarker(ARUCO_DICTIONARY, ann.aruco_id, marker_size)
             marker_bgr = cv2.cvtColor(marker, cv2.COLOR_GRAY2BGR)
             board_img[ay1:ay2, ax1:ax2] = cv2.addWeighted(
-                board_img[ay1:ay2, ax1:ax2], 0.5, marker_bgr, 0.5, 0)
+                board_img[ay1:ay2, ax1:ax2], 0.5, marker_bgr, 0.5, 0
+            )
         else:
             # Grey box with diagonal cross
             cv2.rectangle(board_img, (ax1, ay1), (ax2, ay2), COLOR_NOT_VIS, 2)
@@ -871,10 +898,7 @@ class AnnotationTool:
             cv2.line(board_img, (ax2, ay1), (ax1, ay2), COLOR_NOT_VIS, 2)
 
         # ArUco label
-        if ann.aruco_visible:
-            aruco_label = f"ArUco ID {ann.aruco_id}"
-        else:
-            aruco_label = "ArUco: none"
+        aruco_label = f"ArUco ID {ann.aruco_id}" if ann.aruco_visible else "ArUco: none"
         cv2.putText(board_img, aruco_label, (ax1, ay1 - 8), font, 0.5, (128, 128, 128), 1)
 
         # Corner LEDs (positions stored in original image space, transform to board)
@@ -900,10 +924,7 @@ class AnnotationTool:
             cv2.circle(board_img, (cx, cy), LED_RADIUS_PX, color, 1)
 
         # Counter value text
-        if ann.counter_visible:
-            counter_text = f"Counter: {ann.counter_value}"
-        else:
-            counter_text = "Counter: n/a"
+        counter_text = f"Counter: {ann.counter_value}" if ann.counter_visible else "Counter: n/a"
         cv2.putText(board_img, counter_text, (bx1, by1 - 8), font, 0.5, COLOR_BOARD_TEXT, 1)
 
         # Ring LEDs
@@ -926,7 +947,9 @@ class AnnotationTool:
         tx = bs - tw - margin
         ty = th + margin
         annotation_color = (0, 255, 0) if is_annotated else (0, 0, 255)
-        cv2.putText(board_img, annotation_label, (tx, ty), font, font_scale, annotation_color, thickness)
+        cv2.putText(
+            board_img, annotation_label, (tx, ty), font, font_scale, annotation_color, thickness
+        )
 
         # Scale both to common height
         h = TARGET_HEIGHT
@@ -948,17 +971,32 @@ class AnnotationTool:
         n_annotated = len(self.ground_truth["images"])
         progress = f"[{self.current_idx + 1}/{len(self.images)}] ({n_annotated} annotated)"
         info = f"{progress}  {rel_path}"
-        cv2.putText(status_bar, info, (8, row_h - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_TEXT, 1)
+        cv2.putText(status_bar, info, (8, row_h - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_TEXT, 1)
 
         if self.status_msg:
-            cv2.putText(status_bar, self.status_msg, (total_w - 380, row_h - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 128, 0), 1)
+            cv2.putText(
+                status_bar,
+                self.status_msg,
+                (total_w - 380, row_h - 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 128, 0),
+                1,
+            )
 
         # Row 2: keyboard shortcuts
-        shortcuts = "Enter=Accept  Left/Right=Prev/Next  N/B=Skip to unannotated  C=Clear  Q=Quit  H=Help"
-        cv2.putText(status_bar, shortcuts, (8, row_h * 2 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (80, 80, 80), 1)
+        shortcuts = (
+            "Enter=Accept  Left/Right=Prev/Next  N/B=Skip to unannotated  C=Clear  Q=Quit  H=Help"
+        )
+        cv2.putText(
+            status_bar,
+            shortcuts,
+            (8, row_h * 2 - 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (80, 80, 80),
+            1,
+        )
 
         # Row 3: color legend
         legend_y = row_h * 3 - 4
@@ -971,14 +1009,17 @@ class AnnotationTool:
         lx = 8
         for color, label in legend_items:
             cv2.circle(status_bar, (lx + 6, legend_y - 4), 5, color, -1)
-            cv2.putText(status_bar, label, (lx + 16, legend_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            cv2.putText(
+                status_bar, label, (lx + 16, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1
+            )
             lx += 16 + len(label) * 10 + 15
 
-        composite = np.vstack([
-            np.hstack([left_scaled, board_scaled]),
-            status_bar,
-        ])
+        composite = np.vstack(
+            [
+                np.hstack([left_scaled, board_scaled]),
+                status_bar,
+            ]
+        )
 
         if self.show_help:
             self._draw_help(composite)
@@ -1013,8 +1054,15 @@ class AnnotationTool:
         cv2.rectangle(overlay, (x0, y0), (x0 + box_w, y0 + box_h), (30, 30, 30), -1)
         cv2.addWeighted(overlay, 0.85, img, 0.15, 0, dst=img)
         for i, line in enumerate(HELP_TEXT):
-            cv2.putText(img, line, (x0 + pad, y0 + pad + 18 + i * 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+            cv2.putText(
+                img,
+                line,
+                (x0 + pad, y0 + pad + 18 + i * 22),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 255),
+                1,
+            )
 
     # ── Persistence ─────────────────────────────────────────────────────
 
@@ -1028,7 +1076,7 @@ class AnnotationTool:
             print(f"Loaded {n} existing annotations from {self.output_path}")
 
     def _save_ground_truth(self):
-        with open(self.output_path, 'w') as f:
+        with open(self.output_path, "w") as f:
             json.dump(self.ground_truth, f, indent=2)
 
     def _find_unannotated(self, from_idx, forward=True):
@@ -1043,16 +1091,23 @@ class AnnotationTool:
         return from_idx
 
 
-
 # ── CLI entry point ─────────────────────────────────────────────────────────
 
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="Annotate and verify RocSync benchmark images")
-    parser.add_argument("data_dir", nargs="?", default="validation_data",
-                        help="Path to validation data directory (default: validation_data)")
-    parser.add_argument("-o", "--output", default=None,
-                        help="Output ground truth JSON (default: <data_dir>/ground_truth.json)")
+    parser = argparse.ArgumentParser(description="Annotate and verify RocSync benchmark images")
+    parser.add_argument(
+        "data_dir",
+        nargs="?",
+        default="validation_data",
+        help="Path to validation data directory (default: validation_data)",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="Output ground truth JSON (default: <data_dir>/ground_truth.json)",
+    )
     args = parser.parse_args()
 
     tool = AnnotationTool(args.data_dir, output_path=args.output)

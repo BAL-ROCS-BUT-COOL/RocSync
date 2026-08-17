@@ -18,8 +18,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from rocsync.board_profiles import BOARD_V1, PROFILES_BY_ARUCO
-from rocsync.camera import CameraType
 from rocsync.benchmark.common import (
     STEP_ORDER,
     confusion_metrics,
@@ -27,6 +25,8 @@ from rocsync.benchmark.common import (
     reconstruct_timestamp,
     ring_visible,
 )
+from rocsync.board_profiles import BOARD_V1, PROFILES_BY_ARUCO
+from rocsync.camera import CameraType
 
 CORNER_IMAGE_SPACE_THRESHOLD_PX = 3
 # A corner counts as found when it lands within one LED sampling disc of where it belongs.
@@ -37,21 +37,20 @@ LABEL_WIDTH_DEFAULT = 40
 # Map pipeline steps to ground truth visibility checks.
 # Each returns True if the ground truth considers that step's output "positive".
 STEP_GT_POSITIVE = {
-    "aruco":   lambda gt: gt.get("aruco", {}).get("visible", False),
+    "aruco": lambda gt: gt.get("aruco", {}).get("visible", False),
     "corners": lambda gt: any(c.get("visible", False) for c in gt.get("corners", [])),
     "counter": lambda gt: gt.get("counter", {}).get("visible", False),
-    "ring":    ring_visible,
+    "ring": ring_visible,
     # Overall: a timestamp is extractable when both counter and ring are visible
-    "overall": lambda gt: (gt.get("counter", {}).get("visible", False)
-                           and ring_visible(gt)),
+    "overall": lambda gt: gt.get("counter", {}).get("visible", False) and ring_visible(gt),
 }
 
 # Map pipeline steps to prediction visibility checks.
 STEP_PRED_POSITIVE = {
-    "aruco":   lambda p: p.get("aruco", {}).get("visible", False),
+    "aruco": lambda p: p.get("aruco", {}).get("visible", False),
     "corners": lambda p: any(c.get("visible", False) for c in p.get("corners", [])),
     "counter": lambda p: p.get("counter", {}).get("visible", False),
-    "ring":    ring_visible,
+    "ring": ring_visible,
     "overall": lambda p: p.get("success", False),
 }
 
@@ -80,6 +79,7 @@ def load_ground_truth(path):
 
 
 # ── Geometry helpers ─────────────────────────────────────────────────────────
+
 
 def _board_for_gt(gt):
     """Rectified board for a ground truth entry's ArUco marker ID.
@@ -152,6 +152,7 @@ def _pred_corner_positions_image(pred, gt):
 
 # ── Per-step metric computation ──────────────────────────────────────────────
 
+
 def compute_step_detection(benchmark_images, gt_images, step):
     """Compute TP/FP/FN/TN and derived rates for a single step.
 
@@ -183,8 +184,7 @@ def compute_step_detection(benchmark_images, gt_images, step):
                     pred_vis = pred_corners[i].get("visible", False)
 
                     if gt_vis and pred_vis and pred_img[i] is not None:
-                        err = np.linalg.norm(
-                            np.array(pred_img[i]) - np.array(gt_positions[i]))
+                        err = np.linalg.norm(np.array(pred_img[i]) - np.array(gt_positions[i]))
                         if err <= CORNER_IMAGE_SPACE_THRESHOLD_PX:
                             any_tp = True
 
@@ -269,15 +269,15 @@ def compute_corner_metrics(benchmark_images, gt_images):
 
             # Image-space pixel error (on TPs where both are visible with positions)
             if gt_vis and pred_vis and pred_img[i] is not None and gt_positions is not None:
-                err_img = np.linalg.norm(
-                    np.array(pred_img[i]) - np.array(gt_positions[i]))
+                err_img = np.linalg.norm(np.array(pred_img[i]) - np.array(gt_positions[i]))
                 errors_image.append(float(err_img))
 
             # Board-space detection + pixel error
             # Predicted positions are already in board space (from rough rectification)
             if gt_vis and pred_vis and pred_pos is not None and board is not None:
                 err_board = np.linalg.norm(
-                    np.array(pred_pos) - np.array(board.always_on_leds[CameraType.RGB][i]))
+                    np.array(pred_pos) - np.array(board.always_on_leds[CameraType.RGB][i])
+                )
                 errors_board.append(float(err_board))
                 if err_board <= CORNER_BOARD_SPACE_THRESHOLD_PX:
                     tp_board += 1
@@ -397,14 +397,15 @@ def compute_overall_metrics(benchmark_images, gt_images):
 
 # ── Timing statistics ────────────────────────────────────────────────────────
 
+
 def compute_timing(benchmark_images, gt_images):
     """Compute per-step timing statistics for all / positive / negative subsets."""
     step_to_gt_key = {
-        "aruco_detection":   "aruco",
-        "corner_detection":  "corners",
+        "aruco_detection": "aruco",
+        "corner_detection": "corners",
         "fine_rectification": "corners",
-        "counter_reading":   "counter",
-        "ring_reading":      "ring",
+        "counter_reading": "counter",
+        "ring_reading": "ring",
     }
 
     def collect_values(timing_key, gt_positive_fn, subset):
@@ -428,15 +429,18 @@ def compute_timing(benchmark_images, gt_images):
         for step in STEP_ORDER:
             gt_key = step_to_gt_key[step]
             step_stats[step] = descriptive_stats(
-                collect_values(f"{step}_ms", STEP_GT_POSITIVE[gt_key], subset))
+                collect_values(f"{step}_ms", STEP_GT_POSITIVE[gt_key], subset)
+            )
         step_stats["total"] = descriptive_stats(
-            collect_values("total_ms", STEP_GT_POSITIVE["overall"], subset))
+            collect_values("total_ms", STEP_GT_POSITIVE["overall"], subset)
+        )
         result[subset] = step_stats
 
     return result
 
 
 # ── Printing ─────────────────────────────────────────────────────────────────
+
 
 def format_value(val, width=10):
     if val is None:
@@ -470,10 +474,12 @@ def _print_detection(methods, get_det, col_width, label_width=LABEL_WIDTH_DEFAUL
         for m in methods:
             print(f"  {format_value(get_det(m)[key], col_width)}", end="")
         print()
-    for key, label, formatter in [("recall", "TPR (Recall)", format_percent),
-                                   ("fpr", "FPR", format_percent),
-                                   ("precision", "Precision", format_percent),
-                                   ("f1", "F1 Score", format_percent)]:
+    for key, label, formatter in [
+        ("recall", "TPR (Recall)", format_percent),
+        ("fpr", "FPR", format_percent),
+        ("precision", "Precision", format_percent),
+        ("f1", "F1 Score", format_percent),
+    ]:
         print(f"  {label:>{label_width}}", end="")
         for m in methods:
             print(f"  {formatter(get_det(m)[key], col_width)}", end="")
@@ -489,13 +495,15 @@ def _print_error_stats(methods, get_stats, col_width, label_width=LABEL_WIDTH_DE
         print()
 
 
-def _print_value_accuracy(methods, get_n, get_correct, label, col_width, label_width=LABEL_WIDTH_DEFAULT):
+def _print_value_accuracy(
+    methods, get_n, get_correct, label, col_width, label_width=LABEL_WIDTH_DEFAULT
+):
     """Print a single value accuracy row (e.g. '5/7 (71%)')."""
     print(f"  {label:>{label_width}}", end="")
     for m in methods:
         n = get_n(m)
         nc = get_correct(m)
-        text = f"{nc}/{n} ({nc/n:.0%})" if n > 0 else "-"
+        text = f"{nc}/{n} ({nc / n:.0%})" if n > 0 else "-"
         print(f"  {text:>{col_width}}", end="")
     print()
 
@@ -505,50 +513,67 @@ def print_report(methods, all_metrics, col_width, label_width=LABEL_WIDTH_DEFAUL
 
     # ── ArUco detection ──────────────────────────────────────────────────
     print(f"{'=' * 100}")
-    print(f"  ARUCO DETECTION")
+    print("  ARUCO DETECTION")
     print(f"{'=' * 100}")
 
     print_header(methods, col_width, label_width, "Detection")
-    _print_detection(methods, lambda m: all_metrics[m]["aruco"]["detection"],
-                     col_width, label_width)
+    _print_detection(
+        methods, lambda m: all_metrics[m]["aruco"]["detection"], col_width, label_width
+    )
 
     print()
     print_header(methods, col_width, label_width, "Corner error (px, image space)")
-    _print_error_stats(methods, lambda m: all_metrics[m]["aruco"]["corner_error_px"],
-                       col_width, label_width)
+    _print_error_stats(
+        methods, lambda m: all_metrics[m]["aruco"]["corner_error_px"], col_width, label_width
+    )
 
     # ── Corner LED detection ─────────────────────────────────────────────
     print(f"{'=' * 100}")
-    print(f"  CORNER LED DETECTION")
+    print("  CORNER LED DETECTION")
     print(f"{'=' * 100}")
 
-    print_header(methods, col_width, label_width, f"Detection (thres: {CORNER_IMAGE_SPACE_THRESHOLD_PX}px in image space)")
-    _print_detection(methods, lambda m: all_metrics[m]["corners"]["detection_image"],
-                     col_width, label_width)
+    print_header(
+        methods,
+        col_width,
+        label_width,
+        f"Detection (thres: {CORNER_IMAGE_SPACE_THRESHOLD_PX}px in image space)",
+    )
+    _print_detection(
+        methods, lambda m: all_metrics[m]["corners"]["detection_image"], col_width, label_width
+    )
 
     print()
-    print_header(methods, col_width, label_width, f"Detection (thres: {CORNER_BOARD_SPACE_THRESHOLD_PX}px in board space)")
-    _print_detection(methods, lambda m: all_metrics[m]["corners"]["detection_board"],
-                     col_width, label_width)
+    print_header(
+        methods,
+        col_width,
+        label_width,
+        f"Detection (thres: {CORNER_BOARD_SPACE_THRESHOLD_PX}px in board space)",
+    )
+    _print_detection(
+        methods, lambda m: all_metrics[m]["corners"]["detection_board"], col_width, label_width
+    )
 
     print()
     print_header(methods, col_width, label_width, "Pixel error — image space")
-    _print_error_stats(methods, lambda m: all_metrics[m]["corners"]["error_image_px"],
-                       col_width, label_width)
+    _print_error_stats(
+        methods, lambda m: all_metrics[m]["corners"]["error_image_px"], col_width, label_width
+    )
 
     print()
     print_header(methods, col_width, label_width, "Pixel error — board space")
-    _print_error_stats(methods, lambda m: all_metrics[m]["corners"]["error_board_px"],
-                       col_width, label_width)
+    _print_error_stats(
+        methods, lambda m: all_metrics[m]["corners"]["error_board_px"], col_width, label_width
+    )
 
     # ── Counter reading ──────────────────────────────────────────────────
     print(f"{'=' * 100}")
-    print(f"  COUNTER READING")
+    print("  COUNTER READING")
     print(f"{'=' * 100}")
 
     print_header(methods, col_width, label_width, "Detection")
-    _print_detection(methods, lambda m: all_metrics[m]["counter"]["detection"],
-                     col_width, label_width)
+    _print_detection(
+        methods, lambda m: all_metrics[m]["counter"]["detection"], col_width, label_width
+    )
 
     print()
     print_header(methods, col_width, label_width, "Value accuracy")
@@ -556,16 +581,18 @@ def print_report(methods, all_metrics, col_width, label_width=LABEL_WIDTH_DEFAUL
         methods,
         lambda m: all_metrics[m]["counter"]["value_compared"],
         lambda m: all_metrics[m]["counter"]["value_correct"],
-        "counter.value correct", col_width, label_width)
+        "counter.value correct",
+        col_width,
+        label_width,
+    )
 
     # ── Ring reading ─────────────────────────────────────────────────────
     print(f"{'=' * 100}")
-    print(f"  RING READING")
+    print("  RING READING")
     print(f"{'=' * 100}")
 
     print_header(methods, col_width, label_width, "Detection")
-    _print_detection(methods, lambda m: all_metrics[m]["ring"]["detection"],
-                     col_width, label_width)
+    _print_detection(methods, lambda m: all_metrics[m]["ring"]["detection"], col_width, label_width)
 
     print()
     print_header(methods, col_width, label_width, "Value accuracy")
@@ -573,21 +600,28 @@ def print_report(methods, all_metrics, col_width, label_width=LABEL_WIDTH_DEFAUL
         methods,
         lambda m: all_metrics[m]["ring"]["value_compared"],
         lambda m: all_metrics[m]["ring"]["start_correct"],
-        "ring.start correct", col_width, label_width)
+        "ring.start correct",
+        col_width,
+        label_width,
+    )
     _print_value_accuracy(
         methods,
         lambda m: all_metrics[m]["ring"]["value_compared"],
         lambda m: all_metrics[m]["ring"]["end_correct"],
-        "ring.end correct", col_width, label_width)
+        "ring.end correct",
+        col_width,
+        label_width,
+    )
 
     # ── Overall ──────────────────────────────────────────────────────────
     print(f"{'=' * 100}")
-    print(f"  OVERALL (timestamp)")
+    print("  OVERALL (timestamp)")
     print(f"{'=' * 100}")
 
     print_header(methods, col_width, label_width, "Detection")
-    _print_detection(methods, lambda m: all_metrics[m]["overall"]["detection"],
-                     col_width, label_width)
+    _print_detection(
+        methods, lambda m: all_metrics[m]["overall"]["detection"], col_width, label_width
+    )
 
     print()
     print_header(methods, col_width, label_width, "Timestamp accuracy")
@@ -595,13 +629,18 @@ def print_report(methods, all_metrics, col_width, label_width=LABEL_WIDTH_DEFAUL
         methods,
         lambda m: all_metrics[m]["overall"]["timestamp_compared"],
         lambda m: all_metrics[m]["overall"]["timestamp_correct"],
-        "timestamp exact match", col_width, label_width)
+        "timestamp exact match",
+        col_width,
+        label_width,
+    )
 
     print()
     print_header(methods, col_width, label_width, "Timestamp error (ms)")
-    for err_key, err_label in [("start", "start error"),
-                                ("end", "end error"),
-                                ("exposure", "exposure error")]:
+    for err_key, err_label in [
+        ("start", "start error"),
+        ("end", "end error"),
+        ("exposure", "exposure error"),
+    ]:
         print(f"  {err_label.upper():>{label_width}}")
         for stat in ["mean", "std", "min", "median", "max"]:
             print(f"  {'  ' + stat:>{label_width}}", end="")
@@ -620,10 +659,7 @@ def print_timing(methods, timing, col_width, label_width=LABEL_WIDTH_DEFAULT):
     stat_keys = ["mean", "std", "min", "median", "max"]
 
     for subset_name in ["all", "positive", "negative"]:
-        any_data = any(
-            timing[m][subset_name].get("total", {}).get("n", 0) > 0
-            for m in methods
-        )
+        any_data = any(timing[m][subset_name].get("total", {}).get("n", 0) > 0 for m in methods)
         if not any_data:
             continue
 
@@ -632,7 +668,7 @@ def print_timing(methods, timing, col_width, label_width=LABEL_WIDTH_DEFAULT):
         print(f"{'=' * 100}")
         print_header(methods, col_width, label_width, STEP_ORDER[0])
 
-        for i, step in enumerate(STEP_ORDER + ["total"]):
+        for i, step in enumerate([*STEP_ORDER, "total"]):
             if i > 0:
                 print(f"  {step.upper():-^{label_width}}")
             for stat in stat_keys:
@@ -645,13 +681,22 @@ def print_timing(methods, timing, col_width, label_width=LABEL_WIDTH_DEFAULT):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate benchmark results against ground truth")
-    parser.add_argument("paths", nargs="*", default=["output/benchmark"],
-                        help="Directory with benchmark .json files, or one or more .json filepaths "
-                             "(default: output/benchmark)")
-    parser.add_argument("-g", "--ground-truth", default="validation_data/ground_truth.json",
-                        help="Path to ground truth JSON (default: validation_data/ground_truth.json)")
-    parser.add_argument("-t", "--timing", action="store_true",
-                        help="Include per-step timing statistics")
+    parser.add_argument(
+        "paths",
+        nargs="*",
+        default=["output/benchmark"],
+        help="Directory with benchmark .json files, or one or more .json filepaths "
+        "(default: output/benchmark)",
+    )
+    parser.add_argument(
+        "-g",
+        "--ground-truth",
+        default="validation_data/ground_truth.json",
+        help="Path to ground truth JSON (default: validation_data/ground_truth.json)",
+    )
+    parser.add_argument(
+        "-t", "--timing", action="store_true", help="Include per-step timing statistics"
+    )
     args = parser.parse_args()
 
     gt = load_ground_truth(args.ground_truth)
@@ -659,7 +704,7 @@ def main():
 
     benchmarks = load_benchmarks(args.paths)
     if not benchmarks:
-        print(f"No benchmark .json files found", file=sys.stderr)
+        print("No benchmark .json files found", file=sys.stderr)
         sys.exit(1)
 
     methods = list(benchmarks.keys())

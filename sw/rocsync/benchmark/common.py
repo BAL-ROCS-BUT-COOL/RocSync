@@ -1,6 +1,7 @@
 """Shared utilities for RocSync benchmark tools."""
 
 from pathlib import Path
+
 import numpy as np
 
 STEP_ORDER = [
@@ -16,9 +17,7 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 
 def collect_images(root_dir):
     """Collect all image files recursively, sorted by path."""
-    return sorted(
-        p for p in Path(root_dir).rglob("*") if p.suffix.lower() in IMAGE_EXTENSIONS
-    )
+    return sorted(p for p in Path(root_dir).rglob("*") if p.suffix.lower() in IMAGE_EXTENSIONS)
 
 
 def ring_visible(image_data):
@@ -63,6 +62,12 @@ def confusion_metrics(tp, fp, fn, tn):
     fpr = fp / (fp + tn) if (fp + tn) > 0 else None
     f1 = 2 * precision * recall / (precision + recall) if precision and recall else None
     return {
-        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
-        "precision": precision, "recall": recall, "fpr": fpr, "f1": f1,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "tn": tn,
+        "precision": precision,
+        "recall": recall,
+        "fpr": fpr,
+        "f1": f1,
     }

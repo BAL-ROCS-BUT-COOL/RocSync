@@ -37,7 +37,7 @@ except ImportError as err:
 
 @dataclass
 class Config(ClipExtractionConfig):
-    only_specified: bool = False  # if True, only process from_raw_camera_time_of_camera
+    only_for_camera: str | None = None  # if set, only process this camera
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -47,9 +47,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     add_common_args(p, __file__)
     add_clip_args(p)
     p.add_argument(
-        "--only-specified",
-        action="store_true",
-        help="If set, only produce PNGs for the camera given by --from-camera.",
+        "--only-for-camera",
+        dest="only_for_camera",
+        help="Only produce PNGs for this camera (basename without extension, e.g. Cam1).",
     )
     return p
 
@@ -62,23 +62,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(config: Config) -> None:
     print(f"Processing dataset folder: {config.dataset_folder}")
 
-    if config.only_specified and not config.from_raw_camera_time_of_camera:
-        raise ValueError(
-            "--only-specified was set but no --from-camera was provided. "
-            "Please specify which camera to process."
-        )
-
     output_folder_name = "synced_clips_pngs"
 
     time_sync_data = load_video_time_sync(config.time_sync_json_path)
 
+    only_key = None
+    if config.only_for_camera:
+        only_key = select_camera_key(time_sync_data, config.only_for_camera, "--only-for-camera")
+
     # Parse clips, optionally using camera time to derive global times
-    matching_key = None
     if config.from_raw_camera_time_of_camera is not None:
-        matching_key = select_camera_key(
+        defining_key = select_camera_key(
             time_sync_data, config.from_raw_camera_time_of_camera, "--from-camera"
         )
-        time_defining_camera_time_sync_data = time_sync_data[matching_key]
+        time_defining_camera_time_sync_data = time_sync_data[defining_key]
         defining_clock_rate, defining_clock_offset_ms = affine_from_statistics(
             time_defining_camera_time_sync_data
         )
@@ -94,8 +91,8 @@ def main(config: Config) -> None:
     # For each clip and each camera, compute frames and save PNGs
     for clip in clips:
         for camera, camera_time_sync_data in time_sync_data.items():
-            # If --only-specified is set, skip all other cameras
-            if config.only_specified and camera != matching_key:
+            # If --only-for-camera is set, skip all other cameras
+            if only_key is not None and camera != only_key:
                 continue
 
             raw_video_path = os.path.join(config.dataset_folder, camera)
@@ -177,7 +174,7 @@ if __name__ == "__main__":
         clips_to_extract_json=str(clips_path),
         target_fps=float(args.target_fps),
         from_raw_camera_time_of_camera=args.from_raw_camera_time_of_camera,
-        only_specified=args.only_specified,
+        only_for_camera=args.only_for_camera,
     )
 
     main(cfg)

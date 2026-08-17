@@ -197,8 +197,7 @@ def affine_from_statistics(statistics):
     clock_offset_ms = statistics.get("clock_offset_ms")
     if clock_rate is None or clock_offset_ms is None:
         raise KeyError(
-            "Time-sync data has no clock_rate/clock_offset_ms; it predates the "
-            "presentation-timestamp fit. Re-run rocsync to regenerate it."
+            "Time-sync entry has no clock_rate/clock_offset_ms; re-run rocsync to regenerate it."
         )
     return float(clock_rate), float(clock_offset_ms)
 

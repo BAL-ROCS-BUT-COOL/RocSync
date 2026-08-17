@@ -49,8 +49,16 @@ encoding needs an `ffmpeg` built with `hevc_nvenc`.
 rocsync [OPTIONS] PATH [PATH ...]
 ```
 
-Each `PATH` is a video, an image, or a directory containing them. Results for every input are
-collected into a single JSON file.
+Each `PATH` is a video, an image, an FTK tracker recording (`.csv`), or a directory containing
+them. Results for every input are collected into a single JSON file, keyed by path, with a
+`type` of `video`, `image`, or `ftk`.
+
+Infrared input needs an explicit `--board-version`: auto-detection identifies the board from its
+ArUco marker, which is not visible in IR.
+
+```bash
+rocsync -c ir --board-version v2 ir_recording.mp4
+```
 
 | Option | Description |
 | --- | --- |
@@ -93,6 +101,25 @@ In the terminal the five checked statistics — from `Number of considered frame
 they do not. All times are board times, which is why the first frame here is negative: the
 recording started before the board's clock reached zero.
 
+## Time-syncing videos
+`rocsync-align` turns the JSON that `rocsync` wrote into actually aligned video files. It reads
+each entry's fitted clock and trims every video to a common start, so the outputs can be played
+back side by side. Entries that are not videos are ignored.
+
+```bash
+rocsync-align output.json --output_dir synced
+```
+
+| Option | Description |
+| --- | --- |
+| `--output_dir DIR` | Where synchronized videos are written (default: `synced`) |
+| `--compensate-drift` | Compensate clock drift by re-encoding; significantly slower but more accurate |
+| `--fps FPS` | Target frame rate (default: the source rate of the first video) |
+| `--jobs N` | Maximum concurrent `ffmpeg` processes, or `0` for no limit (default: `4`) |
+
+This needs `ffmpeg` on your `PATH`; `--compensate-drift` uses `hevc_nvenc` when the available
+`ffmpeg` provides it.
+
 ### FFmpeg
 To visually inspect the synchronization you can use FFmpeg to combine the aligned videos side-by-side:
 ```bash
@@ -105,6 +132,19 @@ ffmpeg \
 	-r 30 \
 	synchronized.mp4
 ```
+
+## Evaluation toolkit
+`evaluation/` holds scripts for working with a whole multi-camera dataset once every camera has
+been time-synced:
+
+| Script | Purpose |
+| --- | --- |
+| `check_time_sync_all.py` | Extract one moment from every camera to verify the sync holds, including at the end of a long recording |
+| `extract_synced_videos.py` | Cut time-aligned video clips across all cameras |
+| `extract_clips_as_png.py` | Cut the same clips as PNG frame sequences |
+
+They expect a dataset folder containing `raw_videos/` and a `time sync/` subfolder. See
+[`evaluation/README.md`](evaluation/README.md) for the dataset layout and the full argument list.
 
 ## Development
 Everyone works against the same pinned environment, described by `pyproject.toml` and locked in

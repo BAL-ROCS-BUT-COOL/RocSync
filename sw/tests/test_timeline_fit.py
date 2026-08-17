@@ -150,6 +150,6 @@ def test_affine_reads_clock_rate_and_clock_offset_ms():
     )
 
 
-def test_affine_rejects_data_from_before_the_pts_fit():
-    with pytest.raises(KeyError, match="Re-run rocsync"):
+def test_affine_rejects_entries_without_a_complete_clock_fit():
+    with pytest.raises(KeyError, match="clock_rate/clock_offset_ms"):
         affine_from_statistics({"clock_rate": 0.858, "first_frame": -5593.0})

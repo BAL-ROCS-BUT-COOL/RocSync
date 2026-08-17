@@ -116,7 +116,7 @@ def main():
         default="output.json",
         type=str,
         metavar="FILE",
-        help="JSON file to store results",
+        help="JSON file to store results (default: output.json)",
     )
     parser.add_argument(
         "-y",

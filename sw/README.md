@@ -41,59 +41,57 @@ pip install ./RocSync/sw
 ```
 </details>
 
-Time-syncing videos (`--sync_video` and `rocsync-align`) additionally requires `ffmpeg` on your
-`PATH`; hardware encoding needs an `ffmpeg` built with `hevc_nvenc`.
+Time-syncing videos with `rocsync-align` additionally requires `ffmpeg` on your `PATH`; hardware
+encoding needs an `ffmpeg` built with `hevc_nvenc`.
 
 ## Usage
+```bash
+rocsync [OPTIONS] PATH [PATH ...]
 ```
-$ rocsync -h
-usage: rocsync [-h] [-c {rgb,ir}] [-s N] [-e DIRECTORY] [-o FILE] [--debug DIRECTORY] PATH [PATH ...]
 
-Extract timestamps from images and videos showing the RocSync device.
+Each `PATH` is a video, an image, or a directory containing them. Results for every input are
+collected into a single JSON file.
 
-positional arguments:
-  PATH                  path to a video, image, or directory containing videos and/or images
+| Option | Description |
+| --- | --- |
+| `-c, --camera_type {rgb,ir}` | Type of camera (default: `rgb`) |
+| `-s, --stride N` | Scan every N-th frame only (default: same as framerate, videos only) |
+| `-e, --export_frames DIRECTORY` | Directory to store all raw frames as PNGs with timestamp (videos only) |
+| `-o, --output FILE` | JSON file to store results (default: `output.json`) |
+| `-y, --yes` | Do not ask for confirmation when processing multiple files |
+| `--debug DIRECTORY` | Directory to store debug images (very slow) |
+| `--board-version {auto,v1,v2}` | Board hardware revision (default: `auto`, detected from the ArUco marker ID) |
+| `--window START END` | Time span to search, in `hh:mm:ss` format with optionally fractional seconds; `end` is the end of the file and `end-hh:mm:ss` counts back from it, e.g. `--window end-0:00:30 end`. Repeat for several spans; overlapping ones are merged (default: whole file) |
+| `--recurse_in_dir` | Recursively search for videos and images in directories |
 
-options:
-  -h, --help            show this help message and exit
-  -c, --camera_type {rgb,ir}
-                        specify the type of camera (default: rgb)
-  -s, --stride N        scan every N-th frame only (default: same as framerate, only applies to videos)
-  -e, --export_frames DIRECTORY
-                        directory to store all raw frames as PNGs with timestamp (only applies to videos)
-  -o, --output FILE     JSON file to store results (default: output.json)
-  -y, --yes             automatically run yes for all prompts (potentially overwrites existing files)
-  --debug DIRECTORY     directory to store debug images (very slow)
-
-  --window START END    time span to search, in hh:mm:ss format; 'end' is the end of the file and
-                        'end-hh:mm:ss' counts back from it, e.g. --window end-0:00:30 end. Repeat
-                        for several spans; overlapping ones are merged (default: whole file)
-
-  --sync_video          automatically time-sync the videos using the estimated timestamps (requires ffmpeg)
-  --synced_folder FOLDER 
-                        output folder for time-synced videos
-  --fps FPS             desired FPS for time-synced videos (default: desired FPS determined from input videos)
-  ```
+Run `rocsync -h` for the authoritative list.
 
 
 ## Example
 ```
-$ rocsync ./examples/h10.MP4 ./examples
-Working on ./examples/h10.MP4
+$ rocsync recording.MP4
+Working on recording.MP4
 Analyzing frames: 100%|████████████████████| 6520/6520 [02:21<00:00, 45.93it/s]
-Number of considered frames:                             1888
-Number of rejected outliers:                                0
-R2 score:                                              1.0000
-RMSE:                                                 0.44 ms
-First frame:                                       -4333.4 ms
-Last frame:                                        22858.4 ms
-Expected duration (fps):              27189.7 ms (239.76 fps)
-Actual duration (fps):                27191.7 ms (239.74 fps)
-Delta (actual - expected)              2.08 ms (0.010% speed)
-Exposure time (mean/min/max):               3.97/3.00/5.00 ms
--------------------------------------------------------------
+-----------------------------------------------------------------------
+Number of considered frames:                                       1885
+Number of rejected outliers:                                          3
+R2 (before/after outlier rejection):                      0.9998/1.0000
+RMSE (before/after outlier rejection):                     1.83/0.44 ms
+Dropped frames:                              0 in 0 gap(s), max 0.000 s
+First frame:                                                   -4.333 s
+Last frame:                                                    22.858 s
+Framerate (nominal/measured):                       239.760/239.740 fps
+Clock rate (board/container):                                 1.000074x
+Duration (container/board):                 27.190/27.192 s (Δ=2.00 ms)
+Exposure time (mean/min/max/std):                3.97/3.00/5.00/0.42 ms
+-----------------------------------------------------------------------
 Processing files: 100%|█████████████████████████| 1/1 [02:22<00:00, 142.04s/it]
 ```
+
+In the terminal the five checked statistics — from `Number of considered frames` down to
+`Dropped frames` — are colour-coded green when they pass their sanity threshold and red when
+they do not. All times are board times, which is why the first frame here is negative: the
+recording started before the board's clock reached zero.
 
 ### FFmpeg
 To visually inspect the synchronization you can use FFmpeg to combine the aligned videos side-by-side:

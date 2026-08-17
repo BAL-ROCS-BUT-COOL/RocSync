@@ -2,6 +2,11 @@
 
 Tools for evaluating and annotating the RocSync vision pipeline against validation images.
 
+These are development tools: they run against a checkout, not an installed copy. Create the
+environment once with `uv sync` from `RocSync/sw`, then prefix each command with `uv run` to use
+it without activating anything. See the [Development section](../../README.md#development) of the
+main README.
+
 ## Annotation Tool
 
 Interactive GUI for creating ground truth annotations. Runs the pipeline on each image, displays the result with LED overlays, and lets you verify or correct the decoded values. Produces a `ground_truth.json` file for benchmark evaluation.
@@ -9,7 +14,7 @@ Interactive GUI for creating ground truth annotations. Runs the pipeline on each
 ### Usage
 
 ```bash
-python -m rocsync.benchmark.annotate [data_dir] [-o ground_truth.json]
+uv run rocsync-annotate [data_dir] [-o ground_truth.json]
 ```
 
 - `data_dir`: Directory containing validation images (default: `validation_data/`). Images are collected recursively (`.png`, `.jpg`, `.jpeg`).
@@ -85,7 +90,7 @@ Fields:
 Runs the pipeline on all images in a directory and saves per-image results in a structure mirroring the ground truth format, plus per-step timing.
 
 ```bash
-python -m rocsync.benchmark.validate [data_dir] [-o results.json] [--debug DIR]
+uv run rocsync-validate [data_dir] [-o results.json] [--debug DIR]
 ```
 
 - `data_dir`: Directory containing validation images (default: `validation_data/`).
@@ -99,7 +104,7 @@ Results JSON contains a `config` section and an `images` section with per-image 
 Compares benchmark results against ground truth annotations. Reports per-step detection metrics (TPR, FPR, precision, F1), value accuracy, and position errors.
 
 ```bash
-python -m rocsync.benchmark.evaluate [paths...] [-g ground_truth.json] [-t]
+uv run rocsync-evaluate [paths...] [-g ground_truth.json] [-t]
 ```
 
 - `paths`: Directory with benchmark `.json` files, or one or more explicit `.json` filepaths (default: `output/benchmark/`).

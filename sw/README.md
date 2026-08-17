@@ -19,7 +19,8 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 Then install RocSync as a tool, which puts the `rocsync` and `rocsync-align` commands on your
-`PATH` in their own isolated environment:
+`PATH` in their own isolated environment (the `rocsync-annotate`, `rocsync-validate`, and
+`rocsync-evaluate` benchmark tools come along with them):
 
 ```bash
 git clone https://github.com/jaromeyer/RocSync.git

@@ -20,7 +20,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from rocsync.benchmark.common import collect_images
+from rocsync.benchmark.common import collect_images, corner_positions_in_image
 from rocsync.board_profiles import BOARD_V1, PROFILES_BY_ARUCO, RectifiedBoard
 from rocsync.camera import CameraType
 from rocsync.vision import ARUCO_DICTIONARY, process_frame
@@ -127,22 +127,11 @@ class ImageAnnotation:
         ann.aruco_visible = aruco_id is not None
         ann.aruco_id = aruco_id if aruco_id is not None else 0
 
-        # Corner LEDs — stats positions are in rough-rectified space,
-        # convert to original image space via the rough homography inverse.
-        corner_positions = stats.get("corner_positions")
-        aruco_corners = stats.get("aruco_corners")
-        if corner_positions is not None and aruco_corners is not None:
-            rough_H = cv2.getPerspectiveTransform(
-                np.array(aruco_corners, dtype=np.float32),
-                board.aruco_corners_coords,
-            )
-            inv_rough = np.linalg.inv(rough_H)
-            for i, pos in enumerate(corner_positions):
-                if i < len(ann.corners) and pos is not None:
-                    pt = np.array([[pos]], dtype=np.float64)
-                    orig_pt = cv2.perspectiveTransform(pt, inv_rough).reshape(2)
-                    ann.corners[i]["visible"] = True
-                    ann.corners[i]["position"] = [float(orig_pt[0]), float(orig_pt[1])]
+        # Corner LEDs — the pipeline detects them in rough-rectified space
+        for i, pos in enumerate(corner_positions_in_image(stats)):
+            if i < len(ann.corners) and pos is not None:
+                ann.corners[i]["visible"] = True
+                ann.corners[i]["position"] = [float(pos[0]), float(pos[1])]
 
         # Counter
         counter_leds = stats.get("counter_leds")

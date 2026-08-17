@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 STEP_ORDER = [
@@ -18,6 +19,23 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 def collect_images(root_dir):
     """Collect all image files recursively, sorted by path."""
     return sorted(p for p in Path(root_dir).rglob("*") if p.suffix.lower() in IMAGE_EXTENSIONS)
+
+
+def corner_positions_in_image(stats):
+    """Detected corner LED positions in original image coordinates.
+
+    The pipeline detects corners in the rough-rectified grid, whose scale is a
+    property of the branch under test. Un-warping through that grid's own
+    homography yields the annotated quantity, comparable across branches.
+    """
+    positions = stats.get("corner_positions")
+    rough_H = stats.get("rough_homography")
+    if positions is None or rough_H is None:
+        return [None] * 4
+
+    inv_rough = np.linalg.inv(np.array(rough_H, dtype=np.float64))
+    pts = np.array([positions], dtype=np.float64)
+    return cv2.perspectiveTransform(pts, inv_rough).reshape(-1, 2).tolist()
 
 
 def ring_visible(image_data):

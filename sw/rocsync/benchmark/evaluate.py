@@ -26,7 +26,6 @@ from rocsync.benchmark.common import (
     ring_visible,
 )
 from rocsync.board_profiles import BOARD_V1, PROFILES_BY_ARUCO
-from rocsync.camera import CameraType
 
 CORNER_IMAGE_SPACE_THRESHOLD_PX = 3
 # A corner counts as found when it lands within one LED sampling disc of where it belongs.
@@ -109,45 +108,32 @@ def _gt_aruco_corners(gt):
     return cv2.perspectiveTransform(pts, inv_H).reshape(4, 2)
 
 
-def _gt_corner_positions(gt):
-    """Derive ground-truth corner LED positions in original image space.
+def _corner_positions(entry):
+    """Annotated or predicted corner LED positions in image space, None per invisible corner."""
+    return [
+        c["position"] if c.get("visible") and c.get("position") is not None else None
+        for c in entry.get("corners", [])
+    ]
 
-    Inverse-transforms the known board-space corner LED coordinates through
-    the ground-truth homography.  Returns list of [x, y] or None.
+
+def _to_board_space(positions, gt):
+    """Map image-space positions into the reference board grid via the GT homography.
+
+    Both sides of the comparison go through the same transform, so a board-space
+    error stays meaningful against a threshold expressed in LED sample radii.
     """
     H = gt.get("homography")
     if H is None:
-        return None
-    board = _board_for_gt(gt)
-    if board is None:
-        return None
-    inv_H = np.linalg.inv(np.array(H, dtype=np.float64))
-    pts = np.array([board.always_on_leds[CameraType.RGB]], dtype=np.float64)
-    return cv2.perspectiveTransform(pts, inv_H).reshape(-1, 2).tolist()
-
-
-def _pred_corner_positions_image(pred, gt):
-    """Transform predicted corner positions from board space to image space.
-
-    The pipeline detects corners in the rough-rectified (board-space) image,
-    so positions need to be inverse-transformed through the GT homography to
-    get image-space coordinates for comparison with GT image-space positions.
-
-    Returns a list of 4 image-space [x, y] positions (or None per corner).
-    """
-    H = gt.get("homography")
-    if H is None:
-        return [None] * 4
-    inv_H = np.linalg.inv(np.array(H, dtype=np.float64))
-    result = []
-    for c in pred.get("corners", []):
-        if c.get("visible") and c.get("position") is not None:
-            pt = np.array([[c["position"]]], dtype=np.float64)
-            img_pt = cv2.perspectiveTransform(pt, inv_H).reshape(2)
-            result.append(img_pt.tolist())
+        return [None] * len(positions)
+    H = np.array(H, dtype=np.float64)
+    out = []
+    for pos in positions:
+        if pos is None:
+            out.append(None)
         else:
-            result.append(None)
-    return result
+            pt = np.array([[pos]], dtype=np.float64)
+            out.append(cv2.perspectiveTransform(pt, H).reshape(2).tolist())
+    return out
 
 
 # ── Per-step metric computation ──────────────────────────────────────────────
@@ -156,8 +142,8 @@ def _pred_corner_positions_image(pred, gt):
 def compute_step_detection(benchmark_images, gt_images, step):
     """Compute TP/FP/FN/TN and derived rates for a single step.
 
-    Corner detection uses per-corner matching with a position error threshold
-    of CORNER_MAX_ERROR_PX in image coordinates.
+    Corner detection uses per-corner matching against the annotated positions,
+    with a threshold of CORNER_IMAGE_SPACE_THRESHOLD_PX in image coordinates.
     """
     gt_pos_fn = STEP_GT_POSITIVE[step]
     pred_pos_fn = STEP_PRED_POSITIVE[step]
@@ -171,22 +157,19 @@ def compute_step_detection(benchmark_images, gt_images, step):
         if step == "corners":
             gt_corners = gt.get("corners", [])
             pred_corners = pred.get("corners", [])
-            gt_positions = _gt_corner_positions(gt)
+            gt_positions = _corner_positions(gt)
+            pred_positions = _corner_positions(pred)
 
             gt_any_visible = any(c.get("visible", False) for c in gt_corners)
             pred_any_visible = any(c.get("visible", False) for c in pred_corners)
             any_tp = False
 
-            if gt_positions is not None:
-                pred_img = _pred_corner_positions_image(pred, gt)
-                for i in range(min(len(gt_corners), len(pred_corners), 4)):
-                    gt_vis = gt_corners[i].get("visible", False)
-                    pred_vis = pred_corners[i].get("visible", False)
-
-                    if gt_vis and pred_vis and pred_img[i] is not None:
-                        err = np.linalg.norm(np.array(pred_img[i]) - np.array(gt_positions[i]))
-                        if err <= CORNER_IMAGE_SPACE_THRESHOLD_PX:
-                            any_tp = True
+            for i in range(min(len(gt_positions), len(pred_positions), 4)):
+                if gt_positions[i] is None or pred_positions[i] is None:
+                    continue
+                err = np.linalg.norm(np.array(pred_positions[i]) - np.array(gt_positions[i]))
+                if err <= CORNER_IMAGE_SPACE_THRESHOLD_PX:
+                    any_tp = True
 
             if gt_any_visible and any_tp:
                 tp += 1
@@ -258,26 +241,25 @@ def compute_corner_metrics(benchmark_images, gt_images):
         board = _board_for_gt(gt)
         gt_corners = gt.get("corners", [])
         pred_corners = pred.get("corners", [])
-        gt_positions = _gt_corner_positions(gt)
-        pred_img = _pred_corner_positions_image(pred, gt)
+        gt_positions = _corner_positions(gt)
+        pred_positions = _corner_positions(pred)
+        # Board space normalises the threshold to LED sample radii, independent of apparent board size
+        gt_board = _to_board_space(gt_positions, gt)
+        pred_board = _to_board_space(pred_positions, gt)
         n_corners = min(len(gt_corners), len(pred_corners))
 
         for i in range(n_corners):
             gt_vis = gt_corners[i].get("visible", False)
             pred_vis = pred_corners[i].get("visible", False)
-            pred_pos = pred_corners[i].get("position") if pred_vis else None
+            both = gt_positions[i] is not None and pred_positions[i] is not None
 
             # Image-space pixel error (on TPs where both are visible with positions)
-            if gt_vis and pred_vis and pred_img[i] is not None and gt_positions is not None:
-                err_img = np.linalg.norm(np.array(pred_img[i]) - np.array(gt_positions[i]))
+            if both:
+                err_img = np.linalg.norm(np.array(pred_positions[i]) - np.array(gt_positions[i]))
                 errors_image.append(float(err_img))
 
-            # Board-space detection + pixel error
-            # Predicted positions are already in board space (from rough rectification)
-            if gt_vis and pred_vis and pred_pos is not None and board is not None:
-                err_board = np.linalg.norm(
-                    np.array(pred_pos) - np.array(board.always_on_leds[CameraType.RGB][i])
-                )
+            if both and board is not None and gt_board[i] is not None:
+                err_board = np.linalg.norm(np.array(pred_board[i]) - np.array(gt_board[i]))
                 errors_board.append(float(err_board))
                 if err_board <= CORNER_BOARD_SPACE_THRESHOLD_PX:
                     tp_board += 1
@@ -679,6 +661,25 @@ def print_timing(methods, timing, col_width, label_width=LABEL_WIDTH_DEFAULT):
                 print()
 
 
+def _describe_run(config):
+    """One-line provenance for a result file, so a column says which checkout produced it."""
+    if not config:
+        return "no provenance recorded"
+    branch = config.get("branch") or "?"
+    commit = config.get("commit") or "?"
+    dirty = "+dirty" if config.get("dirty") else ""
+    parts = [f"{branch}@{commit}{dirty}"]
+    if config.get("run_at"):
+        parts.append(config["run_at"])
+    if config.get("opencv"):
+        parts.append(f"cv2 {config['opencv']}")
+    if config.get("numpy"):
+        parts.append(f"numpy {config['numpy']}")
+    if config.get("n_images") is not None:
+        parts.append(f"{config['n_images']} images")
+    return "  ".join(parts)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate benchmark results against ground truth")
     parser.add_argument(
@@ -713,6 +714,8 @@ def main():
     n_images = len(gt_images)
     print(f"Ground truth: {args.ground_truth} ({n_images} images)")
     print(f"Methods: {', '.join(methods)}")
+    for m in methods:
+        print(f"  {m}: {_describe_run(benchmarks[m].get('config', {}))}")
 
     # Compute all metrics per method
     all_metrics = {}

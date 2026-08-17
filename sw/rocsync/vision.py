@@ -20,6 +20,7 @@ _STATS_KEYS = (
     "aruco_id",
     "aruco_corners",
     "corner_positions",
+    "rough_homography",
     "homography",
     "rectified",
     "counter_leds",
@@ -47,7 +48,8 @@ def _finalize_stats(stats, t0, success, timestamp):
     if stats is not None:
         stats["total_time_ms"] = (time.perf_counter() - t0) * 1000
         stats["success"] = success
-        stats["timestamp"] = list(timestamp) if timestamp else None
+        # int(): the readers work in numpy scalars, which json cannot serialize
+        stats["timestamp"] = [int(v) for v in timestamp] if timestamp else None
 
 
 def _make_blob_detector():
@@ -320,6 +322,9 @@ def rectify_board(
             rough_pcb = cv2.warpPerspective(
                 mask, rough_transformation_matrix, (board_size, board_size)
             )
+            if stats is not None:
+                # Corners are detected in this grid; the benchmark needs it to get back to image space
+                stats["rough_homography"] = rough_transformation_matrix
             t0 = time.perf_counter()
             corners = find_corners_dots(rough_pcb, frame_number, board, debug_dir)
             _record_step(

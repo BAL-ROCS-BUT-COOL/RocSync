@@ -3,19 +3,23 @@
 
 Runs process_frame on all images, collects per-image results in a structure
 mirroring the ground truth format (aruco, corners, counter, ring), plus
-per-step timing. Saves results as JSON without aggregate statistics — those
-are computed by the evaluate tool.
+per-step timing. Positions are in original image coordinates, matching the
+annotations. Saves results as JSON without aggregate statistics — those are
+computed by the evaluate tool.
 """
 
 import argparse
 import json
+import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
+import numpy as np
 from tqdm import tqdm
 
-from rocsync.benchmark.common import STEP_ORDER, collect_images
+from rocsync.benchmark.common import STEP_ORDER, collect_images, corner_positions_in_image
 from rocsync.board_profiles import PROFILES_BY_ARUCO
 from rocsync.camera import CameraType
 from rocsync.vision import process_frame
@@ -40,11 +44,10 @@ def extract_pipeline_result(stats):
     }
     board = PROFILES_BY_ARUCO[aruco_id] if aruco_id is not None else None
 
-    # -- Corners --
-    corner_positions = stats.get("corner_positions")
-    if corner_positions is None:
-        corner_positions = [None] * 4
-    corners = [{"visible": pos is not None, "position": pos} for pos in corner_positions]
+    # -- Corners (original image coordinates, as annotated) --
+    corners = [
+        {"visible": pos is not None, "position": pos} for pos in corner_positions_in_image(stats)
+    ]
 
     # -- Counter --
     counter_step = steps.get("counter_reading", {})
@@ -87,6 +90,33 @@ def extract_pipeline_timing(stats):
             timing[f"{step}_ms"] = steps[step]["time_ms"]
     timing["total_ms"] = stats.get("total_time_ms")
     return timing
+
+
+def run_provenance(data_dir, n_images):
+    """Identify the checkout that produced a result file, so columns are self-describing."""
+
+    def git(*args):
+        try:
+            return subprocess.run(
+                ["git", *args],
+                cwd=Path(__file__).parent,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            return None
+
+    return {
+        "data_dir": str(data_dir),
+        "n_images": n_images,
+        "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+        "commit": git("rev-parse", "--short", "HEAD"),
+        "dirty": bool(git("status", "--porcelain")),
+        "run_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "opencv": cv2.__version__,
+        "numpy": np.__version__,
+    }
 
 
 def run_benchmark(data_dir, images, debug_dir=None):
@@ -153,7 +183,7 @@ def main():
     print(f"Detection rate: {n_success}/{len(results)} ({n_success / len(results):.1%})")
 
     output = {
-        "config": {"data_dir": str(data_dir)},
+        "config": run_provenance(data_dir, len(results)),
         "images": results,
     }
     with open(args.output, "w") as f:

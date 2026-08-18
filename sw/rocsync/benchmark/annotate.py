@@ -319,6 +319,13 @@ COLOR_BOARD_TEXT = (255, 255, 255)  # white text on dark board
 WINDOW_NAME = "RocSync Annotation"
 TARGET_HEIGHT = 800
 
+# Every label uses one size, and is drawn at display resolution so it never gets
+# magnified along with the panel it sits on.
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+FONT_SCALE = 0.75
+LINE_H = 32  # baseline spacing for stacked text rows
+
+
 # Zoom inset shown while placing corners in the left panel.
 LOUPE_SIZE = 220  # on-screen size of the inset (px)
 LOUPE_SOURCE_PX = 70  # side of the original-image region it magnifies
@@ -342,6 +349,17 @@ HELP_TEXT = [
     "0-N               : Place that corner next",
     ". / ,             : Next / previous input file",
 ]
+
+
+def draw_text(img, text, org, color, scale=FONT_SCALE, thickness=1):
+    """Draw a label in the one global font. Hershey strokes look ragged without LINE_AA."""
+    cv2.putText(img, text, org, FONT, scale, color, thickness, cv2.LINE_AA)
+
+
+def fit_scale(text, max_w, scale=FONT_SCALE):
+    """Largest font scale up to `scale` at which `text` still fits `max_w` pixels."""
+    w = cv2.getTextSize(text, FONT, scale, 1)[0][0]
+    return scale if w <= max_w else scale * max_w / w
 
 
 class AnnotationTool:
@@ -1000,7 +1018,6 @@ class AnnotationTool:
 
     def _render(self, original, frame_key):
         """Build the composite side-by-side display image."""
-        font = cv2.FONT_HERSHEY_SIMPLEX
         ann = self.annotation
 
         # Left panel: original image, downscaled first so the overlays are drawn
@@ -1020,16 +1037,16 @@ class AnnotationTool:
             cv2.circle(left, (cx, cy), corner_radius, color, 2)
             if i == self.placing_idx:  # the corner the next click places
                 cv2.circle(left, (cx, cy), corner_radius + 5, COLOR_RING_SEL, 2)
-            cv2.putText(left, str(i), (cx + corner_radius + 4, cy + 5), font, 0.5, color, 1)
+            draw_text(left, str(i), (cx + corner_radius + 6, cy + 7), color, thickness=2)
         cv2.addWeighted(overlay, 0.35, left, 0.65, 0, dst=left)
 
         # Which corner the next click places, and how to pick another. On a darkened
         # strip so it stays readable over whatever the image happens to show.
         hint = f"Click places corner {self.placing_idx}   (keys 0-{len(ann.corners) - 1})"
-        (tw, th), _ = cv2.getTextSize(hint, font, 0.55, 1)
-        strip = left[0 : th + 18, 0 : tw + 20]
+        (tw, th), _ = cv2.getTextSize(hint, FONT, FONT_SCALE, 2)
+        strip = left[0 : th + 20, 0 : tw + 24]
         cv2.addWeighted(strip, 0.25, np.zeros_like(strip), 0.75, 0, dst=strip)
-        cv2.putText(left, hint, (10, th + 8), font, 0.55, COLOR_RING_SEL, 1)
+        draw_text(left, hint, (12, th + 9), COLOR_RING_SEL, thickness=2)
 
         # Right panel: rectified board with overlays
         bs = self.board.board_size
@@ -1058,16 +1075,13 @@ class AnnotationTool:
             cv2.line(board_img, (ax1, ay1), (ax2, ay2), COLOR_NOT_VIS, 2)
             cv2.line(board_img, (ax2, ay1), (ax1, ay2), COLOR_NOT_VIS, 2)
 
-        # ArUco label
-        aruco_label = f"ArUco ID {ann.aruco_id}" if ann.aruco_visible else "ArUco: none"
-        cv2.putText(board_img, aruco_label, (ax1, ay1 - 8), font, 0.5, (128, 128, 128), 1)
-
         # Corner LEDs (positions stored in original image space, transform to board)
+        corner_labels = []
         for i, c in enumerate(ann.corners):
             cx, cy = ann.to_board(*c["position"])
             color = COLOR_ON if c["visible"] else COLOR_NOT_VIS
             cv2.circle(board_img, (cx, cy), LED_RADIUS_PX + 4, color, 2)
-            cv2.putText(board_img, str(i), (cx + 14, cy + 5), font, 0.4, color, 1)
+            corner_labels.append((str(i), cx + LED_RADIUS_PX + 8, cy + 6, color))
 
         # Counter bounding box
         bx1, by1, bx2, by2 = self.counter_box
@@ -1084,10 +1098,6 @@ class AnnotationTool:
                 color = COLOR_OFF
             cv2.circle(board_img, (cx, cy), LED_RADIUS_PX, color, 1)
 
-        # Counter value text
-        counter_text = f"Counter: {ann.counter_value}" if ann.counter_visible else "Counter: n/a"
-        cv2.putText(board_img, counter_text, (bx1, by1 - 8), font, 0.5, COLOR_BOARD_TEXT, 1)
-
         # Ring LEDs
         for i, (rx, ry) in enumerate(self.ring_pos):
             if ann.ring_start == ann.ring_end:
@@ -1099,26 +1109,6 @@ class AnnotationTool:
                 color = COLOR_RING_SEL
             cv2.circle(board_img, (rx, ry), LED_RADIUS_PX, color, 1)
 
-        # Annotation status label in top-right corner
-        is_annotated = frame_key in self.ground_truth["images"]
-        annotation_label = "Annotated" if is_annotated else "UNANNOTATED"
-        font_scale, thickness = 0.6, (1 if is_annotated else 2)
-        (tw, th), _ = cv2.getTextSize(annotation_label, font, font_scale, thickness)
-        margin = 10
-        tx = bs - tw - margin
-        ty = th + margin
-        annotation_color = (0, 255, 0) if is_annotated else (0, 0, 255)
-        cv2.putText(
-            board_img, annotation_label, (tx, ty), font, font_scale, annotation_color, thickness
-        )
-
-        # How this frame's timestamp sits against the clock the rest of its video implies
-        for i, (text, color) in enumerate(self._clock_overlay(frame_key), start=1):
-            (lw, lh), _ = cv2.getTextSize(text, font, 0.45, 1)
-            cv2.putText(
-                board_img, text, (bs - lw - margin, ty + i * (lh + 10)), font, 0.45, color, 1
-            )
-
         # The left panel is already at the common height; scale the board to match.
         left_scaled = left
         board_scaled = cv2.resize(board_img, (h, h))
@@ -1126,48 +1116,63 @@ class AnnotationTool:
         self.left_panel_w = left_scaled.shape[1]
         self.board_scale = h / bs
 
+        # Board labels go on after the resize, so they are drawn at display
+        # resolution rather than magnified along with the board.
+        def board_text(text, x, y, color):
+            pos = (round(x * self.board_scale), round(y * self.board_scale))
+            draw_text(board_scaled, text, pos, color)
+
+        aruco_label = f"ArUco ID {ann.aruco_id}" if ann.aruco_visible else "ArUco: none"
+        board_text(aruco_label, ax1, ay1 - 8, (128, 128, 128))
+        counter_text = f"Counter: {ann.counter_value}" if ann.counter_visible else "Counter: n/a"
+        board_text(counter_text, bx1, by1 - 8, COLOR_BOARD_TEXT)
+        for text, cx, cy, color in corner_labels:
+            board_text(text, cx, cy, color)
+
+        # Annotation status label in top-right corner
+        is_annotated = frame_key in self.ground_truth["images"]
+        annotation_label = "Annotated" if is_annotated else "UNANNOTATED"
+        thickness = 1 if is_annotated else 2
+        (tw, th), _ = cv2.getTextSize(annotation_label, FONT, FONT_SCALE, thickness)
+        draw_text(
+            board_scaled,
+            annotation_label,
+            (h - tw - 10, th + 10),
+            (0, 255, 0) if is_annotated else (0, 0, 255),
+            thickness=thickness,
+        )
+
         self._draw_loupe(left_scaled, original)
 
-        # Status bar (3 rows: info, shortcuts, legend)
-        row_h = 22
-        status_h = row_h * 3 + 8
+        # Status bar (3 rows). Left of the panel split: progress, shortcuts, legend.
+        # Right of it, under the board: the reference-clock fit and status messages.
+        row_h = LINE_H
+        status_h = row_h * 3 + 10
         total_w = left_scaled.shape[1] + board_scaled.shape[1]
         status_bar = np.full((status_h, total_w, 3), COLOR_STATUS_BG, dtype=np.uint8)
+        right_x = left_scaled.shape[1] + 8
 
         # Row 1: progress + file path
         n_annotated = len(self.ground_truth["images"])
         progress = f"[{self.current_idx + 1}/{len(self.frames)}] ({n_annotated} annotated)"
         info = f"{progress}  {frame_key}"
-        cv2.putText(status_bar, info, (8, row_h - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_TEXT, 1)
+        draw_text(status_bar, info, (8, row_h - 10), COLOR_TEXT, fit_scale(info, left_w - 16))
 
-        if self.status_msg:
-            cv2.putText(
-                status_bar,
-                self.status_msg,
-                (total_w - 380, row_h - 4),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (0, 128, 0),
-                1,
-            )
-
-        # Row 2: keyboard shortcuts
+        # Row 2: keyboard shortcuts, shrunk if they would reach past the panel split
         shortcuts = (
             "Enter=Accept  Left/Right=Prev/Next  N/B=Skip to unannotated  "
             ",/.=Prev/Next file  0-N=Pick corner  C=Clear  Q=Quit  H=Help"
         )
-        cv2.putText(
+        draw_text(
             status_bar,
             shortcuts,
-            (8, row_h * 2 - 4),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.4,
+            (8, row_h * 2 - 10),
             (80, 80, 80),
-            1,
+            fit_scale(shortcuts, left_w - 16),
         )
 
         # Row 3: color legend
-        legend_y = row_h * 3 - 4
+        legend_y = row_h * 3 - 10
         legend_items = [
             (COLOR_ON, "ON"),
             (COLOR_OFF, "OFF"),
@@ -1176,11 +1181,22 @@ class AnnotationTool:
         ]
         lx = 8
         for color, label in legend_items:
-            cv2.circle(status_bar, (lx + 6, legend_y - 4), 5, color, -1)
-            cv2.putText(
-                status_bar, label, (lx + 16, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1
+            cv2.circle(status_bar, (lx + 8, legend_y - 6), 7, color, -1)
+            draw_text(status_bar, label, (lx + 24, legend_y), color)
+            lx += 24 + cv2.getTextSize(label, FONT, FONT_SCALE, 1)[0][0] + 22
+
+        # How this frame's timestamp sits against the clock the rest of its video implies
+        for i, (text, color) in enumerate(self._clock_overlay(frame_key), start=1):
+            draw_text(status_bar, text, (right_x, row_h * i - 10), color)
+
+        if self.status_msg:
+            draw_text(
+                status_bar,
+                self.status_msg,
+                (right_x, row_h * 3 - 10),
+                (0, 128, 0),
+                fit_scale(self.status_msg, board_scaled.shape[1] - 16),
             )
-            lx += 16 + len(label) * 10 + 15
 
         composite = np.vstack(
             [
@@ -1202,7 +1218,6 @@ class AnnotationTool:
         if pw < LOUPE_SIZE + 2 * LOUPE_MARGIN or ph < LOUPE_SIZE + 2 * LOUPE_MARGIN:
             return
 
-        font = cv2.FONT_HERSHEY_SIMPLEX
         cx, cy = self._cursor_left
         # getRectSubPix replicates the border, so cursors near the edge still work.
         patch = cv2.getRectSubPix(
@@ -1221,7 +1236,7 @@ class AnnotationTool:
                 cv2.circle(loupe, (px, py), 8, color, 1)
                 if i == self.placing_idx:
                     cv2.circle(loupe, (px, py), 12, COLOR_RING_SEL, 1)
-                cv2.putText(loupe, str(i), (px + 14, py + 4), font, 0.4, color, 1)
+                draw_text(loupe, str(i), (px + 14, py + 6), color)
 
         # Crosshair marking the exact click point, with a gap so the pixel stays visible
         for dx0, dy0, dx1, dy1 in ((-16, 0, -4, 0), (4, 0, 16, 0), (0, -16, 0, -4), (0, 4, 0, 16)):
@@ -1257,24 +1272,14 @@ class AnnotationTool:
         overlay = img.copy()
         h, w = img.shape[:2]
         pad = 20
-        text_w = max(
-            cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0][0] for line in HELP_TEXT
-        )
-        box_w, box_h = text_w + 2 * pad, len(HELP_TEXT) * 22 + 2 * pad
+        text_w = max(cv2.getTextSize(line, FONT, FONT_SCALE, 1)[0][0] for line in HELP_TEXT)
+        box_w, box_h = text_w + 2 * pad, len(HELP_TEXT) * LINE_H + 2 * pad
         x0 = (w - box_w) // 2
         y0 = (h - box_h) // 2
         cv2.rectangle(overlay, (x0, y0), (x0 + box_w, y0 + box_h), (30, 30, 30), -1)
         cv2.addWeighted(overlay, 0.85, img, 0.15, 0, dst=img)
         for i, line in enumerate(HELP_TEXT):
-            cv2.putText(
-                img,
-                line,
-                (x0 + pad, y0 + pad + 18 + i * 22),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (255, 255, 255),
-                1,
-            )
+            draw_text(img, line, (x0 + pad, y0 + pad + 22 + i * LINE_H), (255, 255, 255))
 
     # ── Persistence ─────────────────────────────────────────────────────
 
@@ -1364,14 +1369,14 @@ class AnnotationTool:
         )
         if residual is not None:
             within = abs(residual) <= REFERENCE_RESIDUAL_THRESHOLD_MS
-            lines.append((f"dt {residual:+.2f} ms", (0, 255, 0) if within else (0, 0, 255)))
+            lines.append((f"dt {residual:+.2f} ms", (0, 128, 0) if within else (0, 0, 200)))
         clock = fit_reference_clock(starts, pts)
         if clock is not None:
             lines.append(
                 (
                     f"fit {clock.n_frames_fitted} frames  RMSE {clock.rmse_ms:.2f}"
                     f"  max {clock.max_residual_ms:.2f} ms",
-                    COLOR_BOARD_TEXT,
+                    COLOR_TEXT,
                 )
             )
         elif len(starts) < MIN_REFERENCE_FRAMES:

@@ -12,6 +12,7 @@ visible flags, not from a global status field.
 
 import argparse
 import json
+import os
 import sys
 from collections import Counter
 from pathlib import Path
@@ -629,6 +630,45 @@ def compute_timing(benchmark_images, gt_images):
 
 # ── Printing ─────────────────────────────────────────────────────────────────
 
+GREEN = "\033[32m"
+RESET = "\033[0m"
+
+# Which direction wins a row. LOWER ranks by magnitude, so a signed error is judged by
+# how far from zero it sits rather than by its sign.
+LOWER, HIGHER = "lower", "higher"
+
+_use_color = False
+
+
+def set_color(mode, stream=None):
+    """Turn ANSI coloring on, off, or on only when a terminal is reading."""
+    global _use_color
+    stream = stream or sys.stdout
+    if mode == "always":
+        _use_color = True
+    elif mode == "never":
+        _use_color = False
+    else:
+        _use_color = stream.isatty() and not os.environ.get("NO_COLOR")
+
+
+def highlight(text):
+    return f"{GREEN}{text}{RESET}" if _use_color else text
+
+
+def _best_index(values, better):
+    """The one method that beats every other on this row, or None if none stands alone.
+
+    A tie leaves the row unmarked rather than painting every column: the mark says
+    "pick this one", which a tie cannot. So does a row where only one method has a
+    value — there is nothing it won against.
+    """
+    rank = abs if better == LOWER else (lambda v: -v)
+    candidates = sorted((rank(v), i) for i, v in enumerate(values) if v is not None)
+    if better is None or len(candidates) < 2 or candidates[0][0] == candidates[1][0]:
+        return None
+    return candidates[0][1]
+
 
 def format_value(val, width=10):
     if val is None:
@@ -644,6 +684,24 @@ def format_percent(val, width=10):
     return f"{val:.1%}".rjust(width)
 
 
+def print_row(
+    label,
+    values,
+    col_width,
+    label_width=LABEL_WIDTH_DEFAULT,
+    formatter=format_value,
+    better=None,
+    texts=None,
+):
+    """Print one labelled row of per-method values, the leading method in green."""
+    best = _best_index(values, better)
+    print(f"  {label:>{label_width}}", end="")
+    for i, value in enumerate(values):
+        text = texts[i].rjust(col_width) if texts else formatter(value, col_width)
+        print(f"  {highlight(text) if i == best else text}", end="")
+    print()
+
+
 def print_header(methods, col_width, label_width=LABEL_WIDTH_DEFAULT, label=""):
     print(f"  {'':>{label_width}}", end="")
     for m in methods:
@@ -657,73 +715,96 @@ def print_header(methods, col_width, label_width=LABEL_WIDTH_DEFAULT, label=""):
 
 def _print_detection(methods, get_det, col_width, label_width=LABEL_WIDTH_DEFAULT):
     """Print TP/FP/FN/TN and derived rates from a detection dict."""
-    for key, label in [("tp", "TP"), ("fp", "FP"), ("fn", "FN"), ("tn", "TN")]:
-        print(f"  {label:>{label_width}}", end="")
-        for m in methods:
-            print(f"  {format_value(get_det(m)[key], col_width)}", end="")
-        print()
-    for key, label, formatter in [
-        ("recall", "TPR (Recall)", format_percent),
-        ("fpr", "FPR", format_percent),
-        ("precision", "Precision", format_percent),
-        ("f1", "F1 Score", format_percent),
+    for key, label, better in [
+        ("tp", "TP", HIGHER),
+        ("fp", "FP", LOWER),
+        ("fn", "FN", LOWER),
+        ("tn", "TN", HIGHER),
     ]:
-        print(f"  {label:>{label_width}}", end="")
-        for m in methods:
-            print(f"  {formatter(get_det(m)[key], col_width)}", end="")
-        print()
+        print_row(label, [get_det(m)[key] for m in methods], col_width, label_width, better=better)
+    for key, label, better in [
+        ("recall", "TPR (Recall)", HIGHER),
+        ("fpr", "FPR", LOWER),
+        ("precision", "Precision", HIGHER),
+        ("f1", "F1 Score", HIGHER),
+    ]:
+        print_row(
+            label,
+            [get_det(m)[key] for m in methods],
+            col_width,
+            label_width,
+            formatter=format_percent,
+            better=better,
+        )
 
 
 def _print_error_stats(methods, get_stats, col_width, label_width=LABEL_WIDTH_DEFAULT):
     """Print descriptive statistics (mean/median/std/min/max/n)."""
     for stat in ["mean", "std", "min", "median", "max", "n"]:
-        print(f"  {stat:>{label_width}}", end="")
-        for m in methods:
-            print(f"  {format_value(get_stats(m).get(stat), col_width)}", end="")
-        print()
+        print_row(
+            stat,
+            [get_stats(m).get(stat) for m in methods],
+            col_width,
+            label_width,
+            # The smallest error wins; a sample count is not a score, and neither is the
+            # best case a method happened to get.
+            better=None if stat in ("min", "n") else LOWER,
+        )
 
 
 def _print_value_accuracy(
     methods, get_n, get_correct, label, col_width, label_width=LABEL_WIDTH_DEFAULT
 ):
     """Print a single value accuracy row (e.g. '5/7 (71%)')."""
-    print(f"  {label:>{label_width}}", end="")
+    fractions, texts = [], []
     for m in methods:
-        n = get_n(m)
-        nc = get_correct(m)
-        text = f"{nc}/{n} ({nc / n:.0%})" if n > 0 else "-"
-        print(f"  {text:>{col_width}}", end="")
-    print()
+        n, nc = get_n(m), get_correct(m)
+        fractions.append(nc / n if n > 0 else None)
+        texts.append(f"{nc}/{n} ({nc / n:.0%})" if n > 0 else "-")
+    print_row(
+        label,
+        fractions,
+        col_width,
+        label_width,
+        better=HIGHER,
+        texts=texts,
+    )
 
 
 def _print_metric_rows(methods, rows, get_video, col_width, label_width=LABEL_WIDTH_DEFAULT):
-    """Print one row per (key, label, formatter), '-' where a column has no value."""
-    for key, label, formatter in rows:
-        print(f"  {label:>{label_width}}", end="")
-        for m in methods:
-            print(f"  {formatter(get_video(m).get(key), col_width)}", end="")
-        print()
+    """Print one row per (key, label, formatter, better), '-' where a column has no value."""
+    for key, label, formatter, better in rows:
+        print_row(
+            label,
+            [get_video(m).get(key) for m in methods],
+            col_width,
+            label_width,
+            formatter=formatter,
+            better=better,
+        )
 
 
 CLOCK_GROUP_LABELS = {"measured": "measured videos", "retimed": "retimed videos"}
 
+# The last column says which direction wins the row, or None for a row that reports what
+# a fit did rather than how well it did it.
 CLOCK_AGGREGATE_ROWS = [
-    ("residual_threshold_ms_max", "reference tolerance, loosest [ms]", format_value),
-    ("clock_rate_error_ppm_mean_abs", "clock rate error, mean |err| [ppm]", format_value),
-    ("clock_rate_error_ppm_max_abs", "clock rate error, worst |err| [ppm]", format_value),
-    ("clock_offset_error_ms_mean_abs", "clock offset error, mean |err| [ms]", format_value),
-    ("clock_offset_error_ms_max_abs", "clock offset error, worst |err| [ms]", format_value),
-    ("sync_error_mean_ms", "sync error, mean over videos [ms]", format_value),
-    ("sync_error_max_ms", "sync error, worst over videos [ms]", format_value),
-    ("rmse_after_mean", "fit RMSE, mean over videos [ms]", format_value),
-    ("rmse_after_max", "fit RMSE, worst over videos [ms]", format_value),
-    ("r2_after_min", "fit R2, worst over videos", format_value),
-    ("false_rejections", "outliers rejected in error", format_value),
-    ("false_acceptances", "misdecodes kept as inliers", format_value),
-    ("n_flagged", "frames with both a fit and an annotation", format_value),
-    ("n_considered_frames", "frames in the fit", format_value),
-    ("n_rejected_frames", "frames rejected by the fit", format_value),
-    ("n_dropped_frames", "frames missing from the container", format_value),
+    ("residual_threshold_ms_max", "reference tolerance, loosest [ms]", format_value, None),
+    ("clock_rate_error_ppm_mean_abs", "clock rate error, mean |err| [ppm]", format_value, LOWER),
+    ("clock_rate_error_ppm_max_abs", "clock rate error, worst |err| [ppm]", format_value, LOWER),
+    ("clock_offset_error_ms_mean_abs", "clock offset error, mean |err| [ms]", format_value, LOWER),
+    ("clock_offset_error_ms_max_abs", "clock offset error, worst |err| [ms]", format_value, LOWER),
+    ("sync_error_mean_ms", "sync error, mean over videos [ms]", format_value, LOWER),
+    ("sync_error_max_ms", "sync error, worst over videos [ms]", format_value, LOWER),
+    ("rmse_after_mean", "fit RMSE, mean over videos [ms]", format_value, LOWER),
+    ("rmse_after_max", "fit RMSE, worst over videos [ms]", format_value, LOWER),
+    ("r2_after_min", "fit R2, worst over videos", format_value, HIGHER),
+    ("false_rejections", "outliers rejected in error", format_value, LOWER),
+    ("false_acceptances", "misdecodes kept as inliers", format_value, LOWER),
+    ("n_flagged", "frames with both a fit and an annotation", format_value, None),
+    ("n_considered_frames", "frames in the fit", format_value, None),
+    ("n_rejected_frames", "frames rejected by the fit", format_value, None),
+    ("n_dropped_frames", "frames missing from the container", format_value, None),
 ]
 
 
@@ -788,7 +869,10 @@ def print_report(methods, all_metrics, col_width, label_width=LABEL_WIDTH_DEFAUL
     print()
     print_header(methods, col_width, label_width, "Corner error (px, image space)")
     _print_error_stats(
-        methods, lambda m: all_metrics[m]["aruco"]["corner_error_px"], col_width, label_width
+        methods,
+        lambda m: all_metrics[m]["aruco"]["corner_error_px"],
+        col_width,
+        label_width,
     )
 
     # ── Corner LED detection ─────────────────────────────────────────────
@@ -820,13 +904,19 @@ def print_report(methods, all_metrics, col_width, label_width=LABEL_WIDTH_DEFAUL
     print()
     print_header(methods, col_width, label_width, "Pixel error — image space")
     _print_error_stats(
-        methods, lambda m: all_metrics[m]["corners"]["error_image_px"], col_width, label_width
+        methods,
+        lambda m: all_metrics[m]["corners"]["error_image_px"],
+        col_width,
+        label_width,
     )
 
     print()
     print_header(methods, col_width, label_width, "Pixel error — board space")
     _print_error_stats(
-        methods, lambda m: all_metrics[m]["corners"]["error_board_px"], col_width, label_width
+        methods,
+        lambda m: all_metrics[m]["corners"]["error_board_px"],
+        col_width,
+        label_width,
     )
 
     # ── Counter reading ──────────────────────────────────────────────────
@@ -907,11 +997,17 @@ def print_report(methods, all_metrics, col_width, label_width=LABEL_WIDTH_DEFAUL
     ]:
         print(f"  {err_label.upper():>{label_width}}")
         for stat in ["mean", "std", "min", "median", "max"]:
-            print(f"  {'  ' + stat:>{label_width}}", end="")
-            for m in methods:
-                val = all_metrics[m]["overall"]["timestamp_error"].get(err_key, {}).get(stat)
-                print(f"  {format_value(val, col_width)}", end="")
-            print()
+            values = [
+                all_metrics[m]["overall"]["timestamp_error"].get(err_key, {}).get(stat)
+                for m in methods
+            ]
+            print_row(
+                "  " + stat,
+                values,
+                col_width,
+                label_width,
+                better=LOWER,
+            )
 
 
 def print_timing(methods, timing, col_width, label_width=LABEL_WIDTH_DEFAULT):
@@ -936,11 +1032,14 @@ def print_timing(methods, timing, col_width, label_width=LABEL_WIDTH_DEFAULT):
             if i > 0:
                 print(f"  {step.upper():-^{label_width}}")
             for stat in stat_keys:
-                print(f"  {'  ' + stat:>{label_width}}", end="")
-                for m in methods:
-                    val = timing[m][subset_name].get(step, {}).get(stat)
-                    print(f"  {format_value(val, col_width)}", end="")
-                print()
+                print_row(
+                    "  " + stat,
+                    [timing[m][subset_name].get(step, {}).get(stat) for m in methods],
+                    col_width,
+                    label_width,
+                    # The best case a method got says little; the rest is speed, so faster wins
+                    better=None if stat == "min" else LOWER,
+                )
 
 
 def _describe_run(config):
@@ -980,7 +1079,16 @@ def main():
     parser.add_argument(
         "-t", "--timing", action="store_true", help="Include per-step timing statistics"
     )
+    parser.add_argument(
+        "--color",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help="Highlight the leading method for each metric in green "
+        "(default: auto, i.e. only when writing to a terminal)",
+    )
     args = parser.parse_args()
+
+    set_color(args.color)
 
     gt = load_ground_truth(args.ground_truth)
     gt_images = gt["images"]

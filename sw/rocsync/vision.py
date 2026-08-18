@@ -25,6 +25,7 @@ _STATS_KEYS = (
     "rectified",
     "counter_leds",
     "ring_leds",
+    "ring_window",
     "timestamp",
 )
 
@@ -62,7 +63,7 @@ def _make_blob_detector():
 
     # Disabled: Exclude elongated blobs caused by motion blur
     params.filterByInertia = False
-    #params.minInertiaRatio = 0.5
+    # params.minInertiaRatio = 0.5
 
     return cv2.SimpleBlobDetector.create(params)
 
@@ -123,6 +124,10 @@ def read_ring(extracted_board, camera_type, board, draw_on=None, stats=None):
     ring = board.decode_ring(leds)
     if stats is not None:
         stats["ring_leds"] = leds
+        # The arc itself, so the benchmark can score reading it apart from the
+        # timestamp: an arc that wraps the period end is read correctly and still
+        # yields no time, because the counter changed while it was being exposed.
+        stats["ring_window"] = tuple(int(v) for v in ring) if ring is not None else None
     _record_step(stats, "ring_reading", t_start, success=ring is not None)
     return ring
 

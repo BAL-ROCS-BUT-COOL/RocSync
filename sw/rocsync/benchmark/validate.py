@@ -67,17 +67,17 @@ def extract_pipeline_result(stats):
     }
 
     # -- Ring --
-    ring_step = steps.get("ring_reading", {})
-    ring_visible = ring_step.get("success", False)
+    # Read off the arc rather than the timestamp, so an arc that wraps the period
+    # end is still scored: the pipeline reads it correctly and then refuses to time
+    # it, and those are two different things to be right or wrong about.
+    ring_window = stats.get("ring_window")
     timestamp = stats.get("timestamp")
 
-    if ring_visible and timestamp is not None:
-        # read_ring returns inclusive end (last ON LED); convert to half-open
-        # (first OFF LED) to match ground truth convention.
-        ring = {
-            "start": timestamp[0] % board.period if board is not None else timestamp[0],
-            "end": (timestamp[1] + 1) % board.period if board is not None else timestamp[1] + 1,
-        }
+    if ring_window is not None and board is not None:
+        # read_ring returns an inclusive end (last ON LED); convert to half-open
+        # (first OFF LED) to match the ground truth convention.
+        start, end = ring_window
+        ring = {"start": start % board.period, "end": (end + 1) % board.period}
     else:
         ring = {"start": 0, "end": 0}
 

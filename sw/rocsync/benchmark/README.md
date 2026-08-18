@@ -144,7 +144,10 @@ Fields:
 - `corners[i].visible` / `corners[i].position`: Per-corner-LED visibility and position in original image coordinates (position omitted when not visible). Benchmark results use the same space, so the two are directly comparable.
 - `homography`: 3×3 matrix mapping original image → rectified board coordinates.
 - `counter.visible` / `counter.value`: Whether the binary counter is readable and its decoded value (omitted when not visible).
-- `ring.start` / `ring.end`: First ON and first OFF LED indices (0–99), half-open interval `[start, end)`. `start == end` means the ring is undecodable.
+- `ring.start` / `ring.end`: First ON and first OFF LED indices (0–99), half-open interval
+  `[start, end)`. `start == end` means no arc was readable. Annotate the arc as it appears,
+  including one that wraps the end of the period (`start > end`) — reading the arc and timing
+  it are separate things to be right about, and the benchmark scores them separately.
 - `videos[path]`: `board_ms = clock_rate * pts_ms + clock_offset_ms`, with `pts_min_ms` and
   `pts_max_ms` spanning the *annotated* frames rather than the file, so scoring never
   extrapolates past the frames the reference was built from.
@@ -206,8 +209,9 @@ Metrics are computed per pipeline step:
 - **ArUco**: detection rates + corner pixel error in image space
 - **Corners**: detection rates in image space and board space + pixel errors in both spaces
 - **Counter**: detection rates + value accuracy
-- **Ring**: detection rates + start/end value accuracy
-- **Overall**: timestamp detection + exact match accuracy + start/end/exposure error statistics
+- **Ring**: detection rates + start/end value accuracy, wrapping arcs included
+- **Overall**: timestamp detection + exact match accuracy + start/end/exposure error statistics,
+  over the frames a timestamp actually follows from
 - **Clock fit** (per video, when the ground truth has a reference clock): clock rate error in
   ppm, clock offset error, sync error, residuals against the annotations, and whether the
   fit's own outlier rejection agrees with them
@@ -223,6 +227,14 @@ reads as zero for whichever checkout produced the annotations, and a non-zero er
 checkout measures divergence from it rather than distance from truth. Detection rates do not suffer
 this — the ground truth's positives include everything annotated by hand on frames where the
 pipeline failed.
+
+A ring arc that wraps the end of the period was exposed across a counter increment, so the
+counter no longer says which period the arc belongs to and no timestamp follows from it. The
+board decides this, in `board_time_from_ring`; the benchmark asks rather than reimplementing.
+Such a frame is still scored on whether the arc was read correctly, but it is not a positive
+for the overall timestamp step — the pipeline is right to refuse it — and it is kept out of
+every clock fit, the reference included. Annotations are unaffected: record what is on screen
+and the scoring sorts out what is decodable.
 
 The clock-fit block reads the reference out of the ground truth and never re-fits it. Its
 rows:
@@ -270,8 +282,8 @@ uv run rocsync-evaluate output/benchmark/other.json output/benchmark/current.jso
 
 Running a checkout under the benchmark needs `rocsync/benchmark/{__init__,common,validate}.py`,
 `rocsync/dataset.py` for the suffix sets `common.py` collects inputs by, `rocsync/timeline.py` and
-`rocsync/video_statistics.py` for the clock fit, the `stats` hooks in `vision.py`, and a
-`rocsync-validate` entry point. None of those three modules imports anything from `rocsync`
+`rocsync/video_statistics.py` for the clock fit, the `stats` hooks in `vision.py` — including
+`ring_window`, which carries the decoded arc — and a `rocsync-validate` entry point. None of those three modules imports anything from `rocsync`
 except each other, so an older checkout only needs the files copied in. `annotate.py` and `evaluate.py` need geometry that
 older checkouts lack, so they are not portable and are not needed there.
 

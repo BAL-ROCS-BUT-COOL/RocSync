@@ -42,8 +42,8 @@ STEP_GT_POSITIVE = {
     "corners": lambda gt: any(c.get("visible", False) for c in gt.get("corners", [])),
     "counter": lambda gt: gt.get("counter", {}).get("visible", False),
     "ring": ring_visible,
-    # Overall: a timestamp is extractable when both counter and ring are visible
-    "overall": lambda gt: gt.get("counter", {}).get("visible", False) and ring_visible(gt),
+    # Defined below, since deciding this needs the annotation's board geometry
+    "overall": lambda gt: _timestamp_extractable(gt),
 }
 
 # Map pipeline steps to prediction visibility checks.
@@ -108,6 +108,18 @@ def _gt_aruco_corners(gt):
     inv_H = np.linalg.inv(np.array(H, dtype=np.float64))
     pts = np.array([board.aruco_corners_coords], dtype=np.float64)
     return cv2.perspectiveTransform(pts, inv_H).reshape(4, 2)
+
+
+def _timestamp_extractable(gt):
+    """Whether a timestamp follows from an annotation at all.
+
+    Counter and ring both being visible is not enough: an arc that wraps the end of
+    the period was exposed across a counter increment, so it names no single time.
+    The pipeline refuses those, and scoring the refusal as a miss would penalise it
+    for the one correct answer available.
+    """
+    board = _board_for_gt(gt)
+    return board is not None and reconstruct_timestamp(gt, board) is not None
 
 
 def _corner_positions(entry):

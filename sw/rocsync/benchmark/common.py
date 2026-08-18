@@ -218,15 +218,22 @@ def ring_visible(image_data):
 def reconstruct_timestamp(image_data, board):
     """Reconstruct [start, end] timestamp from counter value and ring position.
 
-    Returns [start, end] list or None if counter or ring is not visible.
+    Returns None when the counter or ring is not visible, and equally when the board
+    calls the pair undecodable -- an arc wrapping the end of the period, or ending
+    within a LED of it, means the counter changed mid-exposure and no longer says
+    which period the arc belongs to. The decision is the board's rather than a rule
+    of our own: annotating what is on screen is not the same as it being decodable,
+    and a benchmark that reconstructed a time here would score the pipeline against
+    timestamps it is designed never to produce.
     """
     counter_value = image_data.get("counter", {}).get("value")
     ring = image_data.get("ring", {})
-    if counter_value is None or ring.get("start", 0) == ring.get("end", 0):
+    start, end = ring.get("start", 0), ring.get("end", 0)
+    if counter_value is None or start == end:
         return None
-    start = ring["start"] + counter_value * board.period
-    end = ring["end"] + counter_value * board.period
-    return [start, end]
+    # Annotations hold a half-open interval; the board decodes an inclusive one
+    timestamp = board.board_time_from_ring(counter_value, (start, (end - 1) % board.period))
+    return list(timestamp) if timestamp is not None else None
 
 
 def descriptive_stats(values):

@@ -25,7 +25,10 @@ from rocsync.benchmark.common import (
     descriptive_stats,
     parse_frame_key,
     reconstruct_timestamp,
+    residual_threshold_ms,
+    retimed_videos,
     ring_visible,
+    source_key,
 )
 from rocsync.board_profiles import BOARD_V1, PROFILES_BY_ARUCO
 
@@ -77,6 +80,20 @@ def load_ground_truth(path):
     """Load ground truth JSON file."""
     with open(path) as f:
         return json.load(f)
+
+
+def resolve_retimed_keys(benchmark, retimed):
+    """Move a run's per-frame predictions onto the keys the annotations use.
+
+    A retimed clip carries no annotations of its own, so a prediction about its frame
+    j is a prediction about frame j + offset of the recording it was cut from. Doing
+    this once at load leaves every per-frame metric comparing keys as it always has.
+    The `videos` section needs no such move: both sides key it by the retimed clip.
+    """
+    if not retimed:
+        return benchmark
+    images = {source_key(key, retimed): value for key, value in benchmark["images"].items()}
+    return {**benchmark, "images": images}
 
 
 # ── Geometry helpers ─────────────────────────────────────────────────────────
@@ -405,19 +422,40 @@ def compute_clock_metrics(benchmark, gt) -> dict[str, dict]:
     predictions = benchmark.get("videos")
     if not references:
         return {}
+
+    def described(reference, **fields):
+        """Metrics for one video, always carrying what the reference itself says."""
+        return {
+            "timeline": reference.get("timeline", "measured"),
+            "residual_threshold_ms": residual_threshold_ms(reference),
+            **fields,
+        }
+
     if predictions is None:
-        return {rel_path: {"status": "no video timeline recorded"} for rel_path in references}
+        return {
+            rel_path: described(reference, status="no video timeline recorded")
+            for rel_path, reference in references.items()
+        }
+
+    # A recording whose retimed clip this run scored is not separately unscored
+    shadowed = {
+        reference["source"]
+        for path, reference in references.items()
+        if reference.get("source") and path in predictions
+    }
 
     gt_images = gt["images"]
     bm_images = benchmark["images"]
     metrics: dict[str, dict] = {}
     for rel_path, reference in references.items():
+        if rel_path in shadowed:
+            continue
         pred = predictions.get(rel_path)
         if pred is None:
-            metrics[rel_path] = {"status": "not in this run"}
+            metrics[rel_path] = described(reference, status="not in this run")
             continue
         if pred.get("error") is not None:
-            metrics[rel_path] = {"status": pred["error"]}
+            metrics[rel_path] = described(reference, status=pred["error"])
             continue
 
         ref = ReferenceClock.from_dict(reference)
@@ -433,9 +471,10 @@ def compute_clock_metrics(benchmark, gt) -> dict[str, dict]:
         # own outlier rejection agrees with them
         residuals = []
         false_rejections = false_acceptances = n_flagged = 0
+        annotated_path = reference.get("source", rel_path)  # retimed clips borrow theirs
         for key, annotation in gt_images.items():
             path, index = parse_frame_key(key)
-            if index is None or path != rel_path:
+            if index is None or path != annotated_path:
                 continue
             prediction = bm_images.get(key)
             if prediction is None:
@@ -457,23 +496,24 @@ def compute_clock_metrics(benchmark, gt) -> dict[str, dict]:
             elif not decoded_correctly and fit["inlier"]:
                 false_acceptances += 1
 
-        metrics[rel_path] = {
-            "status": None,
-            "clock_rate_error_ppm": (rate - ref.clock_rate) * 1e6,
-            "clock_offset_error_ms": offset - ref.clock_offset_ms,
-            "sync_error_first_ms": first,
-            "sync_error_last_ms": last,
-            "sync_error_max_ms": max(abs(first), abs(last)),
-            "residual_vs_gt_ms": descriptive_stats(residuals),
-            "false_rejections": false_rejections,
-            "false_acceptances": false_acceptances,
-            "n_flagged": n_flagged,
-            "rmse_after": pred.get("rmse_after"),
-            "r2_after": pred.get("r2_after"),
-            "n_considered_frames": pred.get("n_considered_frames"),
-            "n_rejected_frames": pred.get("n_rejected_frames"),
-            "n_dropped_frames": pred.get("n_dropped_frames"),
-        }
+        metrics[rel_path] = described(
+            reference,
+            status=None,
+            clock_rate_error_ppm=(rate - ref.clock_rate) * 1e6,
+            clock_offset_error_ms=offset - ref.clock_offset_ms,
+            sync_error_first_ms=first,
+            sync_error_last_ms=last,
+            sync_error_max_ms=max(abs(first), abs(last)),
+            residual_vs_gt_ms=descriptive_stats(residuals),
+            false_rejections=false_rejections,
+            false_acceptances=false_acceptances,
+            n_flagged=n_flagged,
+            rmse_after=pred.get("rmse_after"),
+            r2_after=pred.get("r2_after"),
+            n_considered_frames=pred.get("n_considered_frames"),
+            n_rejected_frames=pred.get("n_rejected_frames"),
+            n_dropped_frames=pred.get("n_dropped_frames"),
+        )
     return metrics
 
 
@@ -595,9 +635,7 @@ def _print_metric_rows(methods, rows, get_video, col_width, label_width=LABEL_WI
     for key, label, formatter in rows:
         print(f"  {label:>{label_width}}", end="")
         for m in methods:
-            video = get_video(m)
-            value = video.get(key) if video.get("status") is None else None
-            print(f"  {formatter(value, col_width)}", end="")
+            print(f"  {formatter(get_video(m).get(key), col_width)}", end="")
         print()
 
 
@@ -618,15 +656,17 @@ def print_clock_report(methods, clock_metrics, col_width, label_width=LABEL_WIDT
 
         print_header(methods, col_width, label_width, rel_path)
 
-        print(f"  {'status':>{label_width}}", end="")
-        for m in methods:
-            status = get_video(m).get("status") or "scored"
-            print(f"  {status[:col_width]:>{col_width}}", end="")
-        print()
+        for label, key, default in (("status", "status", "scored"), ("timeline", "timeline", "?")):
+            print(f"  {label:>{label_width}}", end="")
+            for m in methods:
+                text = get_video(m).get(key) or default
+                print(f"  {text[:col_width]:>{col_width}}", end="")
+            print()
 
         _print_metric_rows(
             methods,
             [
+                ("residual_threshold_ms", "reference tolerance [ms]", format_value),
                 ("clock_rate_error_ppm", "clock rate error [ppm]", format_value),
                 ("clock_offset_error_ms", "clock offset error [ms]", format_value),
                 ("sync_error_first_ms", "sync error, first frame [ms]", format_value),
@@ -874,6 +914,9 @@ def main():
     if not benchmarks:
         print("No benchmark .json files found", file=sys.stderr)
         sys.exit(1)
+
+    retimed = retimed_videos(gt)
+    benchmarks = {m: resolve_retimed_keys(bm, retimed) for m, bm in benchmarks.items()}
 
     methods = list(benchmarks.keys())
     col_width = max(14, max(len(m) for m in methods) + 2)

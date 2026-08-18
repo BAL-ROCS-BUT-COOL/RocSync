@@ -23,16 +23,17 @@ import numpy as np
 
 from rocsync.benchmark.common import (
     MIN_REFERENCE_FRAMES,
-    REFERENCE_RESIDUAL_THRESHOLD_MS,
     FrameSource,
     collect_frames,
     corner_positions_in_image,
     fit_reference_clock,
     frame_key,
+    measured_residual_threshold_ms,
     parse_frame_key,
     reconstruct_timestamp,
     reference_outliers,
     reference_residual,
+    source_frame_period_ms,
 )
 from rocsync.board_profiles import BOARD_V1, PROFILES_BY_ARUCO, RectifiedBoard
 from rocsync.camera import CameraType
@@ -283,20 +284,38 @@ def video_rel_paths(frames):
     return sorted({parse_frame_key(ref.key)[0] for ref in frames if ref.index is not None})
 
 
-def derive_reference_clock(images, rel_path, pts):
-    """(clock, outliers) for one video, clock None below MIN_REFERENCE_FRAMES."""
-    starts = annotated_starts(images, rel_path)
+def derive_reference_clock(starts, pts, threshold_ms):
+    """(clock, outliers) for one video, clock None below MIN_REFERENCE_FRAMES.
+
+    Takes the annotated board times rather than finding them, so a caller scoring a
+    retimed clip can hand over the source annotations in that clip's own numbering.
+    """
     clock = fit_reference_clock(starts, pts)
     if clock is None:
         return None, []
-    return clock, reference_outliers(clock, starts, pts)
+    return clock, reference_outliers(clock, starts, pts, threshold_ms)
 
 
-def describe_outliers(rel_path, outliers):
+def describe_outliers(rel_path, outliers, threshold_ms):
     """One line per frame whose annotation the rest of the video contradicts."""
-    lines = [f"{rel_path}: {len(outliers)} frame(s) beyond {REFERENCE_RESIDUAL_THRESHOLD_MS} ms"]
+    lines = [f"{rel_path}: {len(outliers)} frame(s) beyond {threshold_ms:.2f} ms"]
     lines += [f"  {frame_key(rel_path, i)}  {residual:+.2f} ms" for i, residual in outliers]
     return "\n".join(lines)
+
+
+def measured_video_entry(clock, source_period_ms, threshold_ms):
+    """The `videos` entry for a clip whose timeline is the camera's own."""
+    return {
+        **clock.to_dict(threshold_ms),
+        "timeline": "measured",
+        "source_frame_period_ms": source_period_ms,
+        "derived_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
+
+def is_synthesized(videos, rel_path):
+    """Whether a stored entry describes a retimed clip, which is not ours to re-derive."""
+    return (videos.get(rel_path) or {}).get("timeline") == "synthesized"
 
 
 class Mode(Enum):
@@ -379,6 +398,7 @@ class AnnotationTool:
         # Reference clock state. pts are read once per video and kept; a video is
         # re-derived only once one of its annotations has actually changed.
         self._video_pts: dict[str, dict[int, float]] = {}
+        self._video_threshold: dict[str, tuple[float | None, float]] = {}
         self._dirty_videos: set[str] = set()
 
         # Board profile and derived geometry (set per-image)
@@ -432,7 +452,7 @@ class AnnotationTool:
     # ── Main loop ───────────────────────────────────────────────────────
 
     def run(self):
-        self.frames = collect_frames(self.data_dir)
+        self.frames = collect_frames(self.data_dir, sources_only=True)
         if not self.frames:
             print("No images or videos found.", file=sys.stderr)
             return
@@ -1316,6 +1336,17 @@ class AnnotationTool:
             self._video_pts[rel_path] = dict(enumerate(frame_pts(self.data_dir / rel_path)))
         return self._video_pts[rel_path]
 
+    def _load_threshold(self, rel_path):
+        """(source frame period, residual tolerance) of a video, both in ms.
+
+        The period comes from ffprobe, so like the timestamps it is read once per
+        video and kept off the render path.
+        """
+        if rel_path not in self._video_threshold:
+            period = source_frame_period_ms(self.data_dir / rel_path)
+            self._video_threshold[rel_path] = (period, measured_residual_threshold_ms(period))
+        return self._video_threshold[rel_path]
+
     def _update_references(self):
         """Re-derive the reference clock of every video that needs one.
 
@@ -1325,22 +1356,25 @@ class AnnotationTool:
         """
         videos = self.ground_truth.setdefault("videos", {})
         for rel_path in video_rel_paths(self.frames):
+            if is_synthesized(videos, rel_path):
+                continue
             if rel_path in videos and rel_path not in self._dirty_videos:
                 continue
+            period, threshold = self._load_threshold(rel_path)
             clock, outliers = derive_reference_clock(
-                self.ground_truth["images"], rel_path, self._load_pts(rel_path)
+                annotated_starts(self.ground_truth["images"], rel_path),
+                self._load_pts(rel_path),
+                threshold,
             )
             if clock is None:
                 continue
             if outliers:
                 # Refusing to store is the point; losing the annotation work is not
-                self.status_msg = describe_outliers(rel_path, outliers).splitlines()[0]
-                print(describe_outliers(rel_path, outliers), file=sys.stderr)
+                described = describe_outliers(rel_path, outliers, threshold)
+                self.status_msg = described.splitlines()[0]
+                print(described, file=sys.stderr)
                 continue
-            videos[rel_path] = {
-                **clock.to_dict(),
-                "derived_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            }
+            videos[rel_path] = measured_video_entry(clock, period, threshold)
         self._dirty_videos.clear()
 
     def _clock_overlay(self, frame_key_str):
@@ -1368,7 +1402,7 @@ class AnnotationTool:
             fit_reference_clock(starts, pts, exclude=index), index, starts, pts
         )
         if residual is not None:
-            within = abs(residual) <= REFERENCE_RESIDUAL_THRESHOLD_MS
+            within = abs(residual) <= self._load_threshold(rel_path)[1]
             lines.append((f"dt {residual:+.2f} ms", (0, 128, 0) if within else (0, 0, 200)))
         clock = fit_reference_clock(starts, pts)
         if clock is not None:
@@ -1438,24 +1472,26 @@ def fit_clocks(data_dir, output_path):
     ground_truth.setdefault("images", {})
     videos = ground_truth.setdefault("videos", {})
 
-    frames = collect_frames(data_dir)
+    frames = collect_frames(data_dir, sources_only=True)
     failed = False
     for rel_path in video_rel_paths(frames):
+        if is_synthesized(videos, rel_path):
+            continue
+        period = source_frame_period_ms(data_dir / rel_path)
+        threshold = measured_residual_threshold_ms(period)
         pts = dict(enumerate(frame_pts(data_dir / rel_path)))
-        clock, outliers = derive_reference_clock(ground_truth["images"], rel_path, pts)
+        starts = annotated_starts(ground_truth["images"], rel_path)
+        clock, outliers = derive_reference_clock(starts, pts, threshold)
         if clock is None:
             print(f"{rel_path}: fewer than {MIN_REFERENCE_FRAMES} annotated frames, skipped")
             continue
         if outliers:
-            print(describe_outliers(rel_path, outliers), file=sys.stderr)
+            print(describe_outliers(rel_path, outliers, threshold), file=sys.stderr)
             failed = True
             continue
 
         previous = videos.get(rel_path)
-        videos[rel_path] = {
-            **clock.to_dict(),
-            "derived_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        }
+        videos[rel_path] = measured_video_entry(clock, period, threshold)
         if previous is None:
             print(f"{rel_path}: derived {clock.clock_rate:.7f}x, {clock.clock_offset_ms:.2f} ms")
         elif any(previous.get(k) != videos[rel_path][k] for k in ("clock_rate", "clock_offset_ms")):

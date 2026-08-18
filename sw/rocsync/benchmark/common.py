@@ -1,5 +1,6 @@
 """Shared utilities for RocSync benchmark tools."""
 
+import subprocess
 import sys
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
@@ -8,7 +9,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from rocsync.board_profiles import PROFILES_BY_ARUCO
 from rocsync.dataset import VIDEO_SUFFIXES
+from rocsync.timeline import frame_pts, median_frame_period
 
 STEP_ORDER = [
     "aruco_detection",
@@ -25,8 +28,18 @@ FRAME_INDEX_DIGITS = 6  # zero-padded so keys sort in frame order
 FRAME_CACHE_SIZE = 4  # a decoded 4K frame is ~25 MB
 FORWARD_GRAB_LIMIT = 12  # a seek re-decodes from the preceding keyframe anyway
 
-REFERENCE_RESIDUAL_THRESHOLD_MS = 2.0  # one ring LED is 1 ms; more is a bad annotation
 MIN_REFERENCE_FRAMES = 5  # a two-point fit is exact by construction and proves nothing
+
+# A synthesized timeline is built from the annotations themselves, so the only slack it
+# needs covers reading the ring arc one LED out at either end. A measured one has to
+# absorb the camera: the container stores a nominal frame rate while the sensor exposes
+# when it pleases, which on the dataset's 30 fps clips scatters by up to 9 ms.
+SYNTHESIZED_RESIDUAL_THRESHOLD_MS = 2.0
+MEASURED_RESIDUAL_FRACTION = 1 / 3  # of a source frame
+MEASURED_RESIDUAL_MIN_MS = 2.0  # never tighter than the board itself resolves
+MEASURED_RESIDUAL_MAX_MS = 50.0  # below the ring period, so a counter step still shows
+
+RETIMED_MARKER = ".retimed"  # `clip.retimed.mp4` is `clip.mp4` on a synthesized timeline
 
 
 @dataclass(frozen=True)
@@ -95,12 +108,111 @@ def count_video_frames(path):
         cap.release()
 
 
-def collect_frames(root_dir):
+def _is_positive_float(text):
+    """Whether `text` parses as a number above zero; ffprobe prints 'N/A' for some."""
+    try:
+        return float(text) > 0
+    except ValueError:
+        return False
+
+
+def source_frame_period_ms(video_path):
+    """Frame period of the recording this file was cut from, in ms, or None.
+
+    Read from the packet duration, which survives decimation: a clip holding every 16th
+    frame of a 30 fps recording still says 33.3 ms per packet while its timestamps sit
+    533 ms apart. The timestamp spacing would describe the subsampling instead, and a
+    tolerance scaled from that would be far too loose to catch anything.
+    """
+    try:
+        output = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-read_intervals",
+                "%+#50",
+                "-show_entries",
+                "frame=duration_time",
+                "-of",
+                "csv=p=0",
+                str(video_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        output = ""
+
+    fields = (line.strip().rstrip(",") for line in output.splitlines())
+    durations = [float(f) for f in fields if _is_positive_float(f)]
+    if durations:
+        # The mode, so one odd packet at a cut cannot stand for the whole recording
+        return float(max(set(durations), key=durations.count)) * 1000
+
+    # Without a packet duration the spacing is all there is, subsampled or not
+    return median_frame_period(frame_pts(video_path))
+
+
+def measured_residual_threshold_ms(source_period_ms):
+    """How far an annotated frame may sit from a clock fitted to a recorded timeline."""
+    if not source_period_ms:
+        return MEASURED_RESIDUAL_MAX_MS
+    scaled = source_period_ms * MEASURED_RESIDUAL_FRACTION
+    return min(max(scaled, MEASURED_RESIDUAL_MIN_MS), MEASURED_RESIDUAL_MAX_MS)
+
+
+def residual_threshold_ms(video_entry):
+    """The tolerance that applies to one video, from how its timeline came about.
+
+    An entry records the tolerance its reference was checked against, and that stored
+    number wins: a frozen reference stays valid under the rule it was frozen by, not
+    whichever rule the code holds today. Deriving is the fallback for an entry written
+    before the tolerance was recorded.
+    """
+    entry = video_entry or {}
+    stored = entry.get("residual_threshold_ms")
+    if stored is not None:
+        return float(stored)
+    if entry.get("timeline") == "synthesized":
+        return SYNTHESIZED_RESIDUAL_THRESHOLD_MS
+    return measured_residual_threshold_ms(entry.get("source_frame_period_ms"))
+
+
+def is_retimed(path):
+    """Whether this file is a retimed clip rather than something recorded."""
+    return Path(path).stem.endswith(RETIMED_MARKER)
+
+
+def retimed_path(path):
+    """Where the retimed clip cut from `path` belongs."""
+    path = Path(path)
+    return path.with_name(f"{path.stem}{RETIMED_MARKER}{path.suffix}")
+
+
+def has_retimed_sibling(path):
+    """Whether a retimed clip cut from `path` sits beside it, in any video container."""
+    path = Path(path)
+    return any(
+        path.with_name(f"{path.stem}{RETIMED_MARKER}{suffix}").is_file()
+        for suffix in VIDEO_SUFFIXES
+    )
+
+
+def collect_frames(root_dir, sources_only=False):
     """Every benchmark frame under `root_dir`, sorted, images and videos alike.
 
     Every frame of a video is benchmark material, so all of them are enumerated. A video
     that will not open contributes no frames at all, which keeps the annotator and the
     validator from disagreeing about what the dataset contains.
+
+    A retimed clip stands in for the video it was cut from, so scoring a dataset holding
+    both counts each frame once. `sources_only` walks what was recorded instead, which is
+    what the annotator wants: a retimed clip is trimmed to the frames already annotated,
+    and annotating the ones outside that window is how the window grows.
     """
     root_dir = Path(root_dir)
     frames = []
@@ -112,6 +224,8 @@ def collect_frames(root_dir):
         if suffix in IMAGE_EXTENSIONS:
             frames.append(FrameRef(path, None, rel_path))
         elif suffix in VIDEO_SUFFIXES:
+            if is_retimed(path) if sources_only else has_retimed_sibling(path):
+                continue
             n_frames = count_video_frames(path)
             if not n_frames:
                 print(f"WARNING: could not read any frame of {path}", file=sys.stderr)
@@ -236,6 +350,18 @@ def reconstruct_timestamp(image_data, board):
     return list(timestamp) if timestamp is not None else None
 
 
+def annotated_board_time(entry):
+    """Board time in ms an annotation pins down, or None when it pins down none.
+
+    Resolves the board from the annotated marker, so a caller only needs the entry.
+    """
+    board = PROFILES_BY_ARUCO.get(entry.get("aruco", {}).get("id"))
+    if board is None:
+        return None
+    timestamp = reconstruct_timestamp(entry, board)
+    return None if timestamp is None else timestamp[0]
+
+
 def descriptive_stats(values):
     """Compute mean, median, std, min, max, n for a list of numbers."""
     if not values:
@@ -292,11 +418,9 @@ class ReferenceClock:
         """Board time in ms for one or many container timestamps in ms."""
         return self.clock_rate * np.asarray(pts_ms, dtype=float) + self.clock_offset_ms
 
-    def to_dict(self):
-        return {
-            **asdict(self),
-            "residual_threshold_ms": REFERENCE_RESIDUAL_THRESHOLD_MS,
-        }
+    def to_dict(self, threshold_ms):
+        """Serialized form, recording the tolerance the reference was checked against."""
+        return {**asdict(self), "residual_threshold_ms": threshold_ms}
 
     @classmethod
     def from_dict(cls, data):
@@ -349,13 +473,53 @@ def reference_residual(clock, index, starts_by_index, pts_by_index):
     return float(clock.predict(pts)) - float(starts_by_index[index])
 
 
-def reference_outliers(clock, starts_by_index, pts_by_index):
-    """[(index, signed residual ms)] for frames beyond the reference threshold."""
+def reference_outliers(clock, starts_by_index, pts_by_index, threshold_ms):
+    """[(index, signed residual ms)] for frames the clock disagrees with.
+
+    The tolerance is passed in rather than fixed, because what counts as too far
+    depends on where the timeline came from -- see `residual_threshold_ms`.
+    """
     if clock is None:
         return []
     outliers = []
     for index in sorted(starts_by_index):
         residual = reference_residual(clock, index, starts_by_index, pts_by_index)
-        if residual is not None and abs(residual) > REFERENCE_RESIDUAL_THRESHOLD_MS:
+        if residual is not None and abs(residual) > threshold_ms:
             outliers.append((index, residual))
     return outliers
+
+
+@dataclass(frozen=True)
+class RetimedVideo:
+    """A retimed clip and the recording it was cut from.
+
+    Annotations stay keyed to the source, so the clip can be regenerated or thrown away
+    without touching them; this is what turns a prediction about a retimed frame back
+    into the annotation it should be scored against.
+    """
+
+    path: str  # relative path of the retimed clip
+    source: str  # relative path of the clip it was cut from
+    frame_offset: int  # retimed frame j is source frame j + frame_offset
+
+
+def retimed_videos(ground_truth):
+    """{retimed path: RetimedVideo} for every retimed clip the ground truth describes."""
+    videos = {}
+    for path, entry in (ground_truth.get("videos") or {}).items():
+        if entry.get("source") is not None:
+            videos[path] = RetimedVideo(
+                path=path,
+                source=entry["source"],
+                frame_offset=int(entry.get("source_frame_offset", 0)),
+            )
+    return videos
+
+
+def source_key(key, retimed):
+    """The annotation key a frame key refers to, unchanged for anything not retimed."""
+    path, index = parse_frame_key(key)
+    video = retimed.get(path)
+    if video is None or index is None:
+        return key
+    return frame_key(video.source, index + video.frame_offset)

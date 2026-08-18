@@ -277,6 +277,11 @@ def frame_pts(video_path):
 
     Uses grab() so frames are demuxed without decoding pixels, which makes this
     cheap enough to run before picking frames out of a video.
+
+    OpenCV reports timestamps relative to the stream's start time, so a clip whose
+    container starts at 47 s still begins at 0.0 here. `clock_offset_ms` is defined
+    against this view, which is also the one `read_frames_async` feeds the pipeline; an
+    absolute container timestamp has to have the start time subtracted first.
     """
     cap = cv2.VideoCapture(str(video_path), cv2.CAP_FFMPEG)
     if not cap.isOpened():

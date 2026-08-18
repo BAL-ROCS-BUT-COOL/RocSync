@@ -25,9 +25,10 @@ import pytest
 from rocsync.benchmark.annotate import annotated_starts, derive_reference_clock, video_rel_paths
 from rocsync.benchmark.common import (
     MIN_REFERENCE_FRAMES,
-    REFERENCE_RESIDUAL_THRESHOLD_MS,
     ReferenceClock,
     collect_frames,
+    reference_outliers,
+    residual_threshold_ms,
 )
 from rocsync.board_profiles import PROFILES_BY_ARUCO
 from rocsync.camera import CameraType
@@ -119,13 +120,26 @@ def test_annotated_positions_are_image_space(annotations):
     )
 
 
+def clip_starts(images, rel_path, stored):
+    """Annotated board times in one clip's own frame numbering.
+
+    A retimed clip has no annotations of its own -- they stay with the recording it
+    was cut from -- so its stored mapping is what puts them back on its frames.
+    """
+    source = stored.get("source", rel_path)
+    offset = int(stored.get("source_frame_offset", 0))
+    return {index - offset: start for index, start in annotated_starts(images, source).items()}
+
+
 def test_every_reference_clock_still_fits_its_annotations(ground_truth):
-    """A stored reference clock reproduces, and no annotation contradicts it.
+    """No annotation contradicts the reference clock stored for its video.
 
     The evaluation measures fitted clocks against these numbers, so a residual beyond
-    the threshold means the reference is scoring against a frame that is itself wrong.
-    Deriving it here rather than trusting the file also catches annotations edited
-    without re-running `rocsync-annotate --fit-clocks`.
+    the video's tolerance means the reference is scoring against a frame that is itself
+    wrong. A measured reference is additionally re-derived here rather than trusted,
+    which catches annotations edited without re-running `rocsync-annotate --fit-clocks`;
+    a synthesized one is drawn rather than fitted, so the annotations are what it has to
+    answer to, not a least-squares line through them.
     """
     references = ground_truth.get("videos", {})
     if not references:
@@ -133,15 +147,20 @@ def test_every_reference_clock_still_fits_its_annotations(ground_truth):
 
     for rel_path, stored in references.items():
         pts = dict(enumerate(frame_pts(GROUND_TRUTH.parent / rel_path)))
-        clock, outliers = derive_reference_clock(ground_truth["images"], rel_path, pts)
+        threshold = residual_threshold_ms(stored)
+        starts = clip_starts(ground_truth["images"], rel_path, stored)
+        outliers = reference_outliers(ReferenceClock.from_dict(stored), starts, pts, threshold)
 
-        assert clock is not None, f"{rel_path}: too few annotations to re-derive"
+        assert len(starts) >= MIN_REFERENCE_FRAMES, f"{rel_path}: too few annotations to check"
         assert not outliers, (
-            f"{rel_path}: {len(outliers)} annotated frame(s) beyond "
-            f"{REFERENCE_RESIDUAL_THRESHOLD_MS} ms:\n  "
+            f"{rel_path}: {len(outliers)} annotated frame(s) beyond {threshold:.2f} ms:\n  "
             + "\n  ".join(f"#{i:06d} {residual:+.2f} ms" for i, residual in outliers[:20])
         )
-        assert clock == ReferenceClock.from_dict(stored), (
+        if stored.get("timeline") == "synthesized":
+            continue
+
+        derived, _ = derive_reference_clock(starts, pts, threshold)
+        assert derived == ReferenceClock.from_dict(stored), (
             f"{rel_path}: stored reference does not match the annotations it claims to "
             f"describe; re-run `rocsync-annotate --fit-clocks`"
         )
@@ -149,7 +168,7 @@ def test_every_reference_clock_still_fits_its_annotations(ground_truth):
 
 def test_every_sufficiently_annotated_video_has_a_reference_clock(ground_truth):
     """A video the evaluation could score must not be silently unscored."""
-    frames = collect_frames(GROUND_TRUTH.parent)
+    frames = collect_frames(GROUND_TRUTH.parent, sources_only=True)
     references = ground_truth.get("videos", {})
 
     missing = [

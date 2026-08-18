@@ -6,7 +6,9 @@ videos.
 Inputs are collected recursively: images (`.png`, `.jpg`, `.jpeg`) and videos (`.mp4`, `.mov`,
 `.avi`, `.mkv`). **Every frame of a video is a benchmark frame** — video frames are decoded on
 demand, so nothing is extracted to disk. A dataset should hold a video *or* its extracted frames,
-not both, or the same content is benchmarked twice under two sets of keys.
+not both, or the same content is benchmarked twice under two sets of keys. A
+[retimed clip](#retimed-videos) is the one exception: it sits beside its source and shadows it,
+so validation and scoring see one of the two and annotation the other.
 
 These are development tools: they run against a checkout, not an installed copy. Create the
 environment once with `uv sync` from `RocSync/sw`, then prefix each command with `uv run` to use
@@ -48,7 +50,7 @@ fit 54 frames  RMSE 0.21  max 0.63 ms
 ```
 
 `dt` is how far the annotated timestamp sits from where the rest of the video puts this
-frame, green within the 2 ms tolerance and red beyond it. The clock behind it is fitted
+frame, green within [the video's tolerance](#ground-truth-format) and red beyond it. The clock behind it is fitted
 over the video's *other* annotated frames and asked to predict this one, so a frame cannot
 drag the line towards itself and hide half its own error. It reads the annotation on screen
 rather than the saved one, so a correction shows in the number before it is accepted.
@@ -125,6 +127,7 @@ presentation time to board time that the video's annotations agree on:
   "images": {"...": "..."},
   "videos": {
     "subdir/clip.mp4": {
+      "timeline": "measured",
       "clock_rate": 1.0000743,
       "clock_offset_ms": -4333.21,
       "pts_min_ms": 0.0,
@@ -132,8 +135,18 @@ presentation time to board time that the video's annotations agree on:
       "n_frames_fitted": 54,
       "rmse_ms": 0.21,
       "max_residual_ms": 0.63,
-      "residual_threshold_ms": 2.0,
+      "residual_threshold_ms": 11.111,
+      "source_frame_period_ms": 33.333,
       "derived_at": "2026-08-18T09:12:00+00:00"
+    },
+    "subdir/clip.retimed.mp4": {
+      "timeline": "synthesized",
+      "source": "subdir/clip.mp4",
+      "source_frame_offset": 0,
+      "anchors_digest": "sha256:9f2c1a4b7d3e5068",
+      "n_frames": 72,
+      "residual_threshold_ms": 2.0,
+      "...": "same clock fields as above"
     }
   }
 }
@@ -150,19 +163,113 @@ Fields:
   it are separate things to be right about, and the benchmark scores them separately.
 - `videos[path]`: `board_ms = clock_rate * pts_ms + clock_offset_ms`, with `pts_min_ms` and
   `pts_max_ms` spanning the *annotated* frames rather than the file, so scoring never
-  extrapolates past the frames the reference was built from.
+  extrapolates past the frames the reference was built from. Timestamps are as a decoder
+  reports them, relative to the stream's start time, which is also what the pipeline reads.
+- `videos[path].timeline`: `measured` for a recording, whose clock is fitted over its
+  annotations, or `synthesized` for a [retimed clip](#retimed-videos), whose clock was drawn
+  and whose timestamps were built to match it.
+- `videos[path].residual_threshold_ms`: How far an annotated frame may sit from the clock. A
+  synthesized timeline gets 2 ms, one ring LED at each end of the arc, because it is built from
+  the annotations themselves. A measured one gets a third of a source frame, clamped to
+  [2, 50] ms — tighter than the board itself resolves is meaningless, and a tolerance
+  approaching the 100 ms ring period would stop flagging a whole counter step. The stored number is what the reference was checked
+  against and what scoring reports, so a frozen reference stays valid under the rule it was
+  frozen by.
+- `videos[path].source_frame_period_ms`: Frame period of the recording, read from the packet
+  duration rather than the timestamp spacing. A clip holding every 16th frame of a 30 fps
+  recording still says 33.3 ms per packet while its timestamps sit 533 ms apart, and it is the
+  camera's own rate that the tolerance has to scale from.
+- `videos[path].source` / `source_frame_offset` / `anchors_digest` / `n_frames`: Present on a
+  retimed clip only. Frame *j* of the clip is frame *j + source_frame_offset* of `source`, which
+  is where its annotations live. The digest covers the annotations it was built from and
+  `n_frames` what it ended up spanning, which together tell `rocsync-retime` when it has gone
+  stale.
 
 The reference clock is plain least squares over the annotated timestamps, not the RANSAC
 fit `rocsync` uses on decoded ones. `rocsync-evaluate` measures fitted clocks against these
 numbers, so they have to be a pure function of the annotations: derived with the production
 fitter, a change to that fitter would move the ground truth and every error measured against
 it at the same time. No outlier is tolerated either, which is all RANSAC would have bought —
-an annotated frame more than `residual_threshold_ms` (one board LED is 1 ms) off the line is
-a bad annotation, and refusing to store a reference is how it gets found.
+an annotated frame further than `residual_threshold_ms` off the line is a bad annotation, and
+refusing to store a reference is how it gets found. The annotator shows each frame's
+leave-one-out residual against that same tolerance while you work.
 
 The annotator derives a video's reference when it has at least 5 timestamp annotations and no
 reference yet, or when one of its annotations was added, edited or cleared. A video nobody
 touched keeps the exact number it had.
+
+## Retimed Videos
+
+A recording's container timestamps are not a record of when the camera exposed. The phone clips in
+the dataset write a near-nominal grid while the sensor wanders ±7 ms around it, which puts a floor
+under any clock fitted against them: fitting the undecimated original over 650 frames gives the
+same 3.2 ms as the decimated copy, so the information was never written rather than lost in
+processing.
+
+That floor is the honest answer to how well a phone can be synchronized, and far too coarse to
+catch a regression in decoding or fitting — a 3 ms error and a correct answer look alike.
+`rocsync-retime` produces the other kind of benchmark video: the annotated board times become the
+timeline, so the clock the pipeline should recover is known exactly instead of fitted. Both kinds
+coexist in a dataset, labelled `measured` and `synthesized`, because each answers a question the
+other cannot.
+
+```bash
+uv run rocsync-retime [data_dir] [-o ground_truth.json] [--jitter-ms 0] [--force]
+```
+
+- `data_dir`: Directory containing validation images and videos (default: `validation_data/`).
+- `-o`: Ground truth JSON to read and update (default: `<data_dir>/ground_truth.json`).
+- `--jitter-ms`: Gaussian noise on frames without an annotation. Anchors stay exact — perturbing
+  them would put back the noise the retiming exists to remove (default: 0).
+- `--force`: Rebuild clips already up to date.
+
+This needs PyAV, which is in the `dev` dependency group: the tool authors datasets rather than
+reading them, so a checkout has it after `uv sync` and an installed copy does not.
+
+### What it writes
+
+`clip.retimed.mp4` beside `clip.mp4`, a **stream copy** with rewritten packet timestamps. Pixels
+stay bit-identical, which is what lets every existing corner, homography and LED annotation carry
+over — they are what the clip is built from. Non-video streams are dropped and the output uses a
+1/90000 time base, fine enough that rounding is negligible against the 2 ms tolerance.
+
+Each clip's `clock_rate` is drawn from `U(1 ± 0.05)` — the widest deviation that stays inside
+`process_video`'s own sanity warning — seeded on the source's relative path, so the target is never
+trivially `1.0` and a regenerated clip reproduces. The offset follows from where the timeline
+lands, in the tens of seconds. Anchors satisfy `clock_rate · pts + clock_offset_ms == board_time`
+by construction, and the tool verifies that by reading the written file back before recording it.
+
+### What it spans
+
+The clip is trimmed to `[first annotated frame, last annotated frame]`, so no timestamp is ever
+extrapolated and the strict tolerance holds across the whole file. A stream copy cannot start
+mid-GOP, so the output actually starts at the last keyframe at or before the first anchor and may
+carry a few frames past the last one; those continue the adjacent segment's slope and are not
+anchors, so nothing checks them. The tool refuses a clip needing more than five such margin frames.
+
+Every frame inside the window is kept, annotated or not — partially visible boards, wrapping ring
+arcs, frames with no board at all. A clip of only cleanly decodable frames would stop exercising
+the rejection paths that matter. Only frames with a reconstructable annotated timestamp anchor the
+timeline; the rest are interpolated between anchors and still carry their real capture jitter,
+which is the point.
+
+### Where the annotations live
+
+With the source, always. A retimed clip is a derived artifact that can be regenerated or deleted
+without touching them, and its ground truth entry records `source` and `source_frame_offset` so a
+prediction about its frame *j* resolves back to frame *j + offset* of the recording.
+
+That is also why **the annotator walks the recordings and never a retimed clip**: the sources are
+untrimmed, so frames outside the current window stay annotatable, which is how a window grows.
+`rocsync-validate` and `rocsync-evaluate` do the opposite — a recording with a retimed clip beside
+it is skipped in favour of it, so the same footage is never benchmarked twice.
+
+### Re-running
+
+Safe after every annotation session. Each entry stores an `anchors_digest` over the annotations it
+was built from; a clip whose digest still matches and whose file is intact is reported as up to
+date and left alone. Only clips whose annotations actually moved get rewritten, and `--force`
+overrides that.
 
 ## Validation Benchmark
 
@@ -214,7 +321,8 @@ Metrics are computed per pipeline step:
   over the frames a timestamp actually follows from
 - **Clock fit** (per video, when the ground truth has a reference clock): clock rate error in
   ppm, clock offset error, sync error, residuals against the annotations, and whether the
-  fit's own outlier rejection agrees with them
+  fit's own outlier rejection agrees with them. A recording whose retimed clip the run scored
+  is not reported separately
 
 Corner positions are compared against the annotated coordinates. Board space is derived by mapping
 both sides through the annotated homography, which normalises the threshold to LED sample radii —
@@ -236,11 +344,15 @@ for the overall timestamp step — the pipeline is right to refuse it — and it
 every clock fit, the reference included. Annotations are unaffected: record what is on screen
 and the scoring sorts out what is decodable.
 
-The clock-fit block reads the reference out of the ground truth and never re-fits it. Its
-rows:
+The clock-fit block reads the reference out of the ground truth and never re-fits it. Read a
+sync error against the `reference tolerance` on the same block: a 0.5 ms error against a
+synthesized timeline is a real measurement, while against a measured one it is inside the
+camera's own noise. Its rows:
 
 | Row | Meaning |
 | --- | --- |
+| `timeline` | `measured` for a recording, `synthesized` for a [retimed clip](#retimed-videos) |
+| `reference tolerance [ms]` | how far an annotation may sit from the reference, which is what makes those two comparable |
 | `clock rate error [ppm]` | fitted rate minus reference rate; the raw difference is ~1e-5 and unreadable otherwise |
 | `clock offset error [ms]` | fitted board time at `pts == 0` minus the reference's |
 | `sync error, first/last/worst [ms]` | how far the two clocks disagree at either end of the annotated span |
@@ -283,9 +395,11 @@ uv run rocsync-evaluate output/benchmark/other.json output/benchmark/current.jso
 Running a checkout under the benchmark needs `rocsync/benchmark/{__init__,common,validate}.py`,
 `rocsync/dataset.py` for the suffix sets `common.py` collects inputs by, `rocsync/timeline.py` and
 `rocsync/video_statistics.py` for the clock fit, the `stats` hooks in `vision.py` — including
-`ring_window`, which carries the decoded arc — and a `rocsync-validate` entry point. None of those three modules imports anything from `rocsync`
-except each other, so an older checkout only needs the files copied in. `annotate.py` and `evaluate.py` need geometry that
-older checkouts lack, so they are not portable and are not needed there.
+`ring_window`, which carries the decoded arc — and a `rocsync-validate` entry point. Beyond those,
+the benchmark modules reach only for `board_profiles.py` and `camera.py`, which every checkout
+already has, so an older one needs nothing but the files above copied in. `annotate.py`,
+`retime.py` and `evaluate.py` need geometry that older checkouts lack, so they are not portable
+and are not needed there.
 
 `rocsync-evaluate` prints how many ground truth frames each column actually scores. A column that
 scores fewer was run over a different set of inputs, and its rates describe that subset — a

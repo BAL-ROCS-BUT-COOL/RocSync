@@ -154,6 +154,7 @@ every frame of a video counting as one benchmark frame:
 | Tool | Purpose |
 | --- | --- |
 | `annotate.py` | Interactive GUI for building a `ground_truth.json` from validation frames |
+| `retime.py` | Remux a clip onto a clock built from its annotations, so the timing a benchmark run has to recover is known exactly rather than fitted |
 | `validate.py` | Run the pipeline over every frame and record what it decoded, with per-step timings, then fit each video's clock |
 | `evaluate.py` | Score a validation run against the ground truth and report where it fails, per frame and per fitted clock |
 

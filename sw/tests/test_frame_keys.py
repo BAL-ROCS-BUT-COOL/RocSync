@@ -5,7 +5,16 @@ annotation lands under one string and the prediction under another, and evaluati
 scores the frame as a miss on both sides rather than reporting an error.
 """
 
-from rocsync.benchmark.common import frame_key, parse_frame_key
+from rocsync.benchmark.common import frame_key, parse_frame_key, retimed_videos, source_key
+
+RETIMED = retimed_videos(
+    {
+        "videos": {
+            "clip.retimed.mp4": {"source": "clip.mp4", "source_frame_offset": 12},
+            "clip.mp4": {"timeline": "measured"},
+        }
+    }
+)
 
 
 def test_still_image_key_is_its_relative_path():
@@ -44,3 +53,22 @@ def test_only_the_last_separator_splits_the_key():
 def test_a_trailing_separator_without_an_index_is_part_of_the_path():
     assert parse_frame_key("clip.mp4#") == ("clip.mp4#", None)
     assert parse_frame_key("clip.mp4#abc") == ("clip.mp4#abc", None)
+
+
+def test_a_retimed_frame_resolves_to_the_annotation_it_was_cut_from():
+    """Annotations stay with the recording, so a retimed prediction has to reach back."""
+    assert source_key("clip.retimed.mp4#000000", RETIMED) == "clip.mp4#000012"
+    assert source_key("clip.retimed.mp4#000005", RETIMED) == "clip.mp4#000017"
+
+
+def test_source_key_round_trips_against_frame_key():
+    video = RETIMED["clip.retimed.mp4"]
+    for index in range(5):
+        key = source_key(frame_key(video.path, index), RETIMED)
+        assert parse_frame_key(key) == (video.source, index + video.frame_offset)
+
+
+def test_source_key_leaves_a_recording_and_a_still_alone():
+    assert source_key("clip.mp4#000003", RETIMED) == "clip.mp4#000003"
+    assert source_key("still.png", RETIMED) == "still.png"
+    assert source_key("clip.mp4#000003", {}) == "clip.mp4#000003"

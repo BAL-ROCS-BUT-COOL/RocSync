@@ -156,6 +156,24 @@ def test_collect_frames_ignores_a_directory_named_like_a_video(dataset):
     assert len(collect_frames(dataset)) == N_FRAMES + 1
 
 
+def test_a_retimed_clip_shadows_the_recording_it_was_cut_from(dataset):
+    """Otherwise the validator would benchmark the same footage twice over."""
+    shutil.copy(dataset / "clip.mp4", dataset / "clip.retimed.mp4")
+
+    videos = {ref.key.split("#")[0] for ref in collect_frames(dataset)}
+    assert "clip.retimed.mp4" in videos
+    assert "clip.mp4" not in videos
+
+
+def test_the_annotator_is_shown_the_recording_and_not_the_retimed_clip(dataset):
+    """A retimed clip is trimmed, so annotating it would put frames out of reach."""
+    shutil.copy(dataset / "clip.mp4", dataset / "clip.retimed.mp4")
+
+    videos = {ref.key.split("#")[0] for ref in collect_frames(dataset, sources_only=True)}
+    assert "clip.mp4" in videos
+    assert "clip.retimed.mp4" not in videos
+
+
 def test_collect_frames_skips_an_unreadable_video(dataset):
     (dataset / "broken.mp4").write_bytes(b"not a video")
     frames = collect_frames(dataset)

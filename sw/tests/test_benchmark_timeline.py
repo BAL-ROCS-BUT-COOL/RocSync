@@ -8,15 +8,22 @@ frozen in the ground truth, never against a fit recomputed here.
 
 import pytest
 
-from rocsync.benchmark.common import fit_reference_clock, frame_key
-from rocsync.benchmark.evaluate import compute_clock_metrics
+from rocsync.benchmark.common import (
+    fit_reference_clock,
+    frame_key,
+    retimed_videos,
+)
+from rocsync.benchmark.evaluate import compute_clock_metrics, resolve_retimed_keys
 from rocsync.timeline import summarize_timeline
 
 VIDEO = "clips/take.mp4"
+RETIMED = "clips/take.retimed.mp4"
+TRIMMED = 4  # leading frames the retimed clip does not span
 PERIOD = 500.0  # ms between frames, i.e. 2 fps
 FPS = 2.0
 CLOCK_RATE = 1.000074
 CLOCK_OFFSET_MS = -4333.2
+THRESHOLD_MS = 2.0
 EXPOSURE_MS = 8
 ARUCO_ID = 21
 BOARD_PERIOD = 100  # ring LEDs, so board time is counter * 100 + ring start
@@ -60,7 +67,10 @@ def dataset(n=20, offset_error_ms=0.0, misdecoded=(), rejected=()):
             "fit": {"residual_ms": 0.0, "inlier": i not in rejected},
         }
 
-    ground_truth = {"images": images, "videos": {VIDEO: reference.to_dict()}}
+    ground_truth = {
+        "images": images,
+        "videos": {VIDEO: {**reference.to_dict(THRESHOLD_MS), "timeline": "measured"}},
+    }
     benchmark = {
         "images": predictions,
         "videos": {
@@ -77,6 +87,30 @@ def dataset(n=20, offset_error_ms=0.0, misdecoded=(), rejected=()):
         },
     }
     return ground_truth, benchmark
+
+
+def retimed_dataset(**kwargs):
+    """The same run, scored through a retimed clip that carries no annotations.
+
+    Its frames are the recording's from `TRIMMED` on, renumbered from zero, which is
+    what the stored mapping has to undo. The annotations stay exactly where they were.
+    """
+    ground_truth, benchmark = dataset(**kwargs)
+    ground_truth["videos"] = {
+        RETIMED: {
+            **ground_truth["videos"][VIDEO],
+            "timeline": "synthesized",
+            "source": VIDEO,
+            "source_frame_offset": TRIMMED,
+        }
+    }
+    benchmark["videos"] = {RETIMED: benchmark["videos"][VIDEO]}
+    source_images = benchmark["images"]
+    benchmark["images"] = {
+        frame_key(RETIMED, index - TRIMMED): source_images[frame_key(VIDEO, index)]
+        for index in range(TRIMMED, len(source_images))
+    }
+    return ground_truth, resolve_retimed_keys(benchmark, retimed_videos(ground_truth))
 
 
 def test_summarize_timeline_recovers_a_planted_clock():
@@ -138,5 +172,32 @@ def test_a_run_without_a_timeline_is_reported_rather_than_scored():
     del benchmark["videos"]
 
     assert compute_clock_metrics(benchmark, ground_truth) == {
-        VIDEO: {"status": "no video timeline recorded"}
+        VIDEO: {
+            "status": "no video timeline recorded",
+            "timeline": "measured",
+            "residual_threshold_ms": THRESHOLD_MS,
+        }
     }
+
+
+def test_a_retimed_clip_is_scored_through_the_annotations_it_was_cut_from():
+    ground_truth, benchmark = retimed_dataset()
+
+    metrics = compute_clock_metrics(benchmark, ground_truth)
+
+    assert VIDEO not in metrics  # scored once, through the clip that stands in for it
+    assert metrics[RETIMED]["timeline"] == "synthesized"
+    assert metrics[RETIMED]["sync_error_max_ms"] == pytest.approx(0.0, abs=1e-9)
+    # The frames the trim cut have no prediction, so they are skipped rather than missed
+    assert metrics[RETIMED]["residual_vs_gt_ms"]["n"] == 20 - TRIMMED
+
+
+def test_a_misdecode_is_attributed_through_the_retiming():
+    """A wrong read has to land on the annotation it contradicts, not on its neighbour."""
+    ground_truth, benchmark = retimed_dataset(misdecoded=(7,), rejected=(9,))
+
+    metrics = compute_clock_metrics(benchmark, ground_truth)[RETIMED]
+
+    assert metrics["false_acceptances"] == 1  # frame 7 was misdecoded but kept
+    assert metrics["false_rejections"] == 1  # frame 9 decoded correctly but was thrown out
+    assert metrics["n_flagged"] == 20 - TRIMMED

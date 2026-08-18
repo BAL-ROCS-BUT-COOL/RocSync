@@ -319,10 +319,13 @@ Metrics are computed per pipeline step:
 - **Ring**: detection rates + start/end value accuracy, wrapping arcs included
 - **Overall**: timestamp detection + exact match accuracy + start/end/exposure error statistics,
   over the frames a timestamp actually follows from
-- **Clock fit** (per video, when the ground truth has a reference clock): clock rate error in
-  ppm, clock offset error, sync error, residuals against the annotations, and whether the
-  fit's own outlier rejection agrees with them. A recording whose retimed clip the run scored
-  is not reported separately
+- **Clock fit** (when the ground truth has a reference clock): clock rate error in ppm, clock
+  offset error, sync error, residuals against the annotations, and whether the fit's own
+  outlier rejection agrees with them. Reported per group of videos rather than per video —
+  measured and retimed timelines are summarized separately, because a measured one also
+  carries the camera's own timestamp error. Fit errors are the mean and the worst over the
+  group's videos, frame counters their totals, residuals pooled over every frame the group
+  scored. A recording whose retimed clip the run scored is not reported separately
 
 Corner positions are compared against the annotated coordinates. Board space is derived by mapping
 both sides through the annotated homography, which normalises the threshold to LED sample radii —

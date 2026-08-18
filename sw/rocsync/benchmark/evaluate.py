@@ -13,6 +13,7 @@ visible flags, not from a global status field.
 import argparse
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 import cv2
@@ -426,6 +427,8 @@ def compute_clock_metrics(benchmark, gt) -> dict[str, dict]:
     def described(reference, **fields):
         """Metrics for one video, always carrying what the reference itself says."""
         return {
+            # A reference cut from another video's annotations describes a retimed clip
+            "group": "retimed" if reference.get("source") else "measured",
             "timeline": reference.get("timeline", "measured"),
             "residual_threshold_ms": residual_threshold_ms(reference),
             **fields,
@@ -504,7 +507,7 @@ def compute_clock_metrics(benchmark, gt) -> dict[str, dict]:
             sync_error_first_ms=first,
             sync_error_last_ms=last,
             sync_error_max_ms=max(abs(first), abs(last)),
-            residual_vs_gt_ms=descriptive_stats(residuals),
+            residuals_ms=residuals,
             false_rejections=false_rejections,
             false_acceptances=false_acceptances,
             n_flagged=n_flagged,
@@ -515,6 +518,69 @@ def compute_clock_metrics(benchmark, gt) -> dict[str, dict]:
             n_dropped_frames=pred.get("n_dropped_frames"),
         )
     return metrics
+
+
+# ── Clock fit aggregation ────────────────────────────────────────────────────
+
+CLOCK_GROUPS = ("measured", "retimed")
+
+# Frame counters describe how much work a fit did, so a group reports their totals.
+CLOCK_COUNT_KEYS = (
+    "false_rejections",
+    "false_acceptances",
+    "n_flagged",
+    "n_considered_frames",
+    "n_rejected_frames",
+    "n_dropped_frames",
+)
+
+
+def _mean(values):
+    return float(np.mean(values))
+
+
+def aggregate_clock_metrics(per_video) -> dict[str, dict]:
+    """Summarize the per-video clock scores once per group of videos.
+
+    Per-video rows say little a reader can act on once there are more than a handful of
+    videos, and the two groups answer different questions: a measured timeline scores the
+    whole chain including the camera's own timestamps, a retimed one only the parts under
+    test. Videos are the samples for the fit errors, frames for the residuals.
+    """
+    groups: dict[str, list] = {}
+    for metrics in per_video.values():
+        groups.setdefault(metrics["group"], []).append(metrics)
+    return {group: _aggregate_group(videos) for group, videos in groups.items()}
+
+
+def _aggregate_group(videos):
+    """Video-level spreads, frame-level totals, and residuals pooled over every frame."""
+    scored = [v for v in videos if v.get("status") is None]
+    unscored = Counter(v["status"] for v in videos if v.get("status") is not None)
+
+    def over_videos(key, reduce, transform=lambda value: value):
+        values = [transform(v[key]) for v in scored if v.get(key) is not None]
+        return reduce(values) if values else None
+
+    aggregate = {
+        "n_videos": len(videos),
+        "n_scored": len(scored),
+        "unscored": "; ".join(f"{status} ({n})" for status, n in unscored.most_common()),
+        "residual_threshold_ms_max": over_videos("residual_threshold_ms", max),
+        "clock_rate_error_ppm_mean_abs": over_videos("clock_rate_error_ppm", _mean, abs),
+        "clock_rate_error_ppm_max_abs": over_videos("clock_rate_error_ppm", max, abs),
+        "clock_offset_error_ms_mean_abs": over_videos("clock_offset_error_ms", _mean, abs),
+        "clock_offset_error_ms_max_abs": over_videos("clock_offset_error_ms", max, abs),
+        "sync_error_mean_ms": over_videos("sync_error_max_ms", _mean),
+        "sync_error_max_ms": over_videos("sync_error_max_ms", max),
+        "rmse_after_mean": over_videos("rmse_after", _mean),
+        "rmse_after_max": over_videos("rmse_after", max),
+        "r2_after_min": over_videos("r2_after", min),
+        "residual_vs_gt_ms": descriptive_stats([r for v in scored for r in v["residuals_ms"]]),
+    }
+    for key in CLOCK_COUNT_KEYS:
+        aggregate[key] = over_videos(key, sum)
+    return aggregate
 
 
 # ── Timing statistics ────────────────────────────────────────────────────────
@@ -639,58 +705,67 @@ def _print_metric_rows(methods, rows, get_video, col_width, label_width=LABEL_WI
         print()
 
 
+CLOCK_GROUP_LABELS = {"measured": "measured videos", "retimed": "retimed videos"}
+
+CLOCK_AGGREGATE_ROWS = [
+    ("residual_threshold_ms_max", "reference tolerance, loosest [ms]", format_value),
+    ("clock_rate_error_ppm_mean_abs", "clock rate error, mean |err| [ppm]", format_value),
+    ("clock_rate_error_ppm_max_abs", "clock rate error, worst |err| [ppm]", format_value),
+    ("clock_offset_error_ms_mean_abs", "clock offset error, mean |err| [ms]", format_value),
+    ("clock_offset_error_ms_max_abs", "clock offset error, worst |err| [ms]", format_value),
+    ("sync_error_mean_ms", "sync error, mean over videos [ms]", format_value),
+    ("sync_error_max_ms", "sync error, worst over videos [ms]", format_value),
+    ("rmse_after_mean", "fit RMSE, mean over videos [ms]", format_value),
+    ("rmse_after_max", "fit RMSE, worst over videos [ms]", format_value),
+    ("r2_after_min", "fit R2, worst over videos", format_value),
+    ("false_rejections", "outliers rejected in error", format_value),
+    ("false_acceptances", "misdecodes kept as inliers", format_value),
+    ("n_flagged", "frames with both a fit and an annotation", format_value),
+    ("n_considered_frames", "frames in the fit", format_value),
+    ("n_rejected_frames", "frames rejected by the fit", format_value),
+    ("n_dropped_frames", "frames missing from the container", format_value),
+]
+
+
 def print_clock_report(methods, clock_metrics, col_width, label_width=LABEL_WIDTH_DEFAULT):
-    """Print the clock-fit section, one block per video with a reference clock."""
-    rel_paths = sorted({rel for m in methods for rel in clock_metrics[m]})
-    if not rel_paths:
+    """Print the clock-fit section, one aggregated block per group of videos."""
+    aggregates = {m: aggregate_clock_metrics(clock_metrics[m]) for m in methods}
+    groups = [g for g in CLOCK_GROUPS if any(g in aggregates[m] for m in methods)]
+    if not groups:
         return
 
     print(f"{'=' * 100}")
-    print("  CLOCK FIT (per video)")
+    print("  CLOCK FIT (aggregated over videos)")
     print(f"{'=' * 100}")
 
-    for rel_path in rel_paths:
+    for group in groups:
 
-        def get_video(m, rel_path=rel_path):
-            return clock_metrics[m].get(rel_path, {"status": "not in this run"})
+        def get_group(m, group=group):
+            return aggregates[m].get(group, {})
 
-        print_header(methods, col_width, label_width, rel_path)
+        print_header(methods, col_width, label_width, CLOCK_GROUP_LABELS[group])
 
-        for label, key, default in (("status", "status", "scored"), ("timeline", "timeline", "?")):
-            print(f"  {label:>{label_width}}", end="")
-            for m in methods:
-                text = get_video(m).get(key) or default
-                print(f"  {text[:col_width]:>{col_width}}", end="")
-            print()
+        print(f"  {'videos scored':>{label_width}}", end="")
+        for m in methods:
+            aggregate = get_group(m)
+            n_videos = aggregate.get("n_videos", 0)
+            text = f"{aggregate['n_scored']}/{n_videos}" if n_videos else "-"
+            print(f"  {text:>{col_width}}", end="")
+        print()
 
-        _print_metric_rows(
-            methods,
-            [
-                ("residual_threshold_ms", "reference tolerance [ms]", format_value),
-                ("clock_rate_error_ppm", "clock rate error [ppm]", format_value),
-                ("clock_offset_error_ms", "clock offset error [ms]", format_value),
-                ("sync_error_first_ms", "sync error, first frame [ms]", format_value),
-                ("sync_error_last_ms", "sync error, last frame [ms]", format_value),
-                ("sync_error_max_ms", "sync error, worst [ms]", format_value),
-                ("false_rejections", "outliers rejected in error", format_value),
-                ("false_acceptances", "misdecodes kept as inliers", format_value),
-                ("n_flagged", "frames with both a fit and an annotation", format_value),
-                ("rmse_after", "fit RMSE after rejection [ms]", format_value),
-                ("r2_after", "fit R2 after rejection", format_value),
-                ("n_considered_frames", "frames in the fit", format_value),
-                ("n_rejected_frames", "frames rejected by the fit", format_value),
-                ("n_dropped_frames", "frames missing from the container", format_value),
-            ],
-            get_video,
-            col_width,
-            label_width,
-        )
+        # Reasons are sentences, so they get their own line rather than a clipped column
+        for m in methods:
+            unscored = get_group(m).get("unscored")
+            if unscored:
+                print(f"  {'unscored':>{label_width}}  {m}: {unscored}")
+
+        _print_metric_rows(methods, CLOCK_AGGREGATE_ROWS, get_group, col_width, label_width)
 
         print()
-        print_header(methods, col_width, label_width, "Residual vs annotations (ms)")
+        print_header(methods, col_width, label_width, "Residual vs annotations (ms), pooled")
         _print_error_stats(
             methods,
-            lambda m, rel_path=rel_path: get_video(m, rel_path).get("residual_vs_gt_ms") or {},
+            lambda m: get_group(m).get("residual_vs_gt_ms") or {},
             col_width,
             label_width,
         )

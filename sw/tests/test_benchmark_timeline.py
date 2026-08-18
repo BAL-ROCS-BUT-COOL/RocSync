@@ -9,11 +9,16 @@ frozen in the ground truth, never against a fit recomputed here.
 import pytest
 
 from rocsync.benchmark.common import (
+    descriptive_stats,
     fit_reference_clock,
     frame_key,
     retimed_videos,
 )
-from rocsync.benchmark.evaluate import compute_clock_metrics, resolve_retimed_keys
+from rocsync.benchmark.evaluate import (
+    aggregate_clock_metrics,
+    compute_clock_metrics,
+    resolve_retimed_keys,
+)
 from rocsync.timeline import summarize_timeline
 
 VIDEO = "clips/take.mp4"
@@ -142,7 +147,7 @@ def test_a_matching_clock_scores_no_error():
     assert metrics["clock_rate_error_ppm"] == pytest.approx(0.0, abs=1e-6)
     assert metrics["clock_offset_error_ms"] == pytest.approx(0.0, abs=1e-9)
     assert metrics["sync_error_max_ms"] == pytest.approx(0.0, abs=1e-9)
-    assert metrics["residual_vs_gt_ms"]["n"] == 20
+    assert len(metrics["residuals_ms"]) == 20
 
 
 def test_a_shifted_clock_is_off_by_that_shift_everywhere():
@@ -154,7 +159,7 @@ def test_a_shifted_clock_is_off_by_that_shift_everywhere():
     # A pure offset error does not decay along the recording
     assert metrics["sync_error_first_ms"] == pytest.approx(12.5)
     assert metrics["sync_error_last_ms"] == pytest.approx(12.5)
-    assert metrics["residual_vs_gt_ms"]["mean"] == pytest.approx(12.5, abs=0.5)
+    assert descriptive_stats(metrics["residuals_ms"])["mean"] == pytest.approx(12.5, abs=0.5)
 
 
 def test_outlier_rejection_is_scored_against_the_annotations():
@@ -173,6 +178,7 @@ def test_a_run_without_a_timeline_is_reported_rather_than_scored():
 
     assert compute_clock_metrics(benchmark, ground_truth) == {
         VIDEO: {
+            "group": "measured",
             "status": "no video timeline recorded",
             "timeline": "measured",
             "residual_threshold_ms": THRESHOLD_MS,
@@ -189,7 +195,7 @@ def test_a_retimed_clip_is_scored_through_the_annotations_it_was_cut_from():
     assert metrics[RETIMED]["timeline"] == "synthesized"
     assert metrics[RETIMED]["sync_error_max_ms"] == pytest.approx(0.0, abs=1e-9)
     # The frames the trim cut have no prediction, so they are skipped rather than missed
-    assert metrics[RETIMED]["residual_vs_gt_ms"]["n"] == 20 - TRIMMED
+    assert len(metrics[RETIMED]["residuals_ms"]) == 20 - TRIMMED
 
 
 def test_a_misdecode_is_attributed_through_the_retiming():
@@ -201,3 +207,46 @@ def test_a_misdecode_is_attributed_through_the_retiming():
     assert metrics["false_acceptances"] == 1  # frame 7 was misdecoded but kept
     assert metrics["false_rejections"] == 1  # frame 9 decoded correctly but was thrown out
     assert metrics["n_flagged"] == 20 - TRIMMED
+
+
+def test_aggregation_splits_measured_from_retimed_videos():
+    """The two timelines answer different questions, so they never share a row."""
+    measured_gt, measured_bm = dataset()
+    retimed_gt, retimed_bm = retimed_dataset()
+    per_video = {
+        **compute_clock_metrics(measured_bm, measured_gt),
+        **compute_clock_metrics(retimed_bm, retimed_gt),
+    }
+
+    groups = aggregate_clock_metrics(per_video)
+
+    assert set(groups) == {"measured", "retimed"}
+    assert groups["measured"]["residual_vs_gt_ms"]["n"] == 20
+    assert groups["retimed"]["residual_vs_gt_ms"]["n"] == 20 - TRIMMED
+
+
+def test_aggregation_keeps_the_worst_video_and_sums_the_frame_counts():
+    per_video = {}
+    for name, offset_error_ms in (("a", 4.0), ("b", -12.5)):
+        ground_truth, benchmark = dataset(offset_error_ms=offset_error_ms, rejected=(9,))
+        per_video[name] = compute_clock_metrics(benchmark, ground_truth)[VIDEO]
+
+    group = aggregate_clock_metrics(per_video)["measured"]
+
+    assert (group["n_scored"], group["n_videos"]) == (2, 2)
+    assert group["clock_offset_error_ms_max_abs"] == pytest.approx(12.5)
+    assert group["clock_offset_error_ms_mean_abs"] == pytest.approx(8.25)
+    assert group["n_rejected_frames"] == 2  # one frame per video
+    assert group["n_flagged"] == 40
+    assert group["residual_vs_gt_ms"]["n"] == 40
+
+
+def test_aggregation_names_the_videos_it_could_not_score():
+    ground_truth, benchmark = dataset()
+    del benchmark["videos"]
+
+    group = aggregate_clock_metrics(compute_clock_metrics(benchmark, ground_truth))["measured"]
+
+    assert (group["n_scored"], group["n_videos"]) == (0, 1)
+    assert group["unscored"] == "no video timeline recorded (1)"
+    assert group["sync_error_max_ms"] is None

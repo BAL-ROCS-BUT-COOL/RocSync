@@ -154,8 +154,8 @@ every frame of a video counting as one benchmark frame:
 | Tool | Purpose |
 | --- | --- |
 | `annotate.py` | Interactive GUI for building a `ground_truth.json` from validation frames |
-| `validate.py` | Run the pipeline over every frame and record what it decoded, with per-step timings |
-| `evaluate.py` | Score a validation run against the ground truth and report where it fails |
+| `validate.py` | Run the pipeline over every frame and record what it decoded, with per-step timings, then fit each video's clock |
+| `evaluate.py` | Score a validation run against the ground truth and report where it fails, per frame and per fitted clock |
 
 See [`rocsync/benchmark/README.md`](rocsync/benchmark/README.md) for the annotation shortcuts and
 the full argument list.

@@ -20,6 +20,8 @@ import numpy as np
 from sklearn.linear_model import LinearRegression, RANSACRegressor
 from sklearn.metrics import root_mean_squared_error
 
+from rocsync.video_statistics import VideoStatistics
+
 
 @dataclass
 class TimelineFit:
@@ -170,6 +172,104 @@ def fit_timeline(
         source_time_min=source_time_min,
         source_time_max=source_time_max,
     )
+
+
+def summarize_timeline(
+    timestamps,
+    frame_times,
+    n_frames,
+    fps,
+    window_frame_times=None,
+    timeline_windowed=False,
+):
+    """Fit board time against the container clock and describe the result.
+
+    Everything between a set of decoded timestamps and a finished `VideoStatistics`:
+    the frame period, the fit, the dropouts, each frame's residual and the split into
+    inliers and outliers. Shared with the benchmark, so what it measures is the
+    summary a real run produces rather than a copy of it.
+
+    `window_frame_times` lists the frames of each search window separately, because a
+    gap between two disjoint windows is not a dropout. Callers that scanned the whole
+    file can leave it out.
+
+    Returns (statistics, fit, considered, rejected, gaps). Raises ValueError when the
+    timeline cannot be fitted.
+    """
+    if len(timestamps) < 2:
+        raise ValueError("Insufficient number of timestamped frames.")
+    if not frame_times:
+        raise ValueError("No frames could be read.")
+
+    # Last-resort frame period only; the span is measured off the frames themselves
+    nominal_period = 1000 / fps if fps > 0 else None
+    period = median_frame_period(frame_times.values(), fallback=nominal_period)
+    if not period:
+        raise ValueError("Unable to determine the frame period.")
+
+    try:
+        fit = fit_timeline(frame_times, timestamps, fallback_period=nominal_period)
+    except ValueError as e:
+        raise ValueError(f"Unable to fit the frame timeline: {e}") from e
+
+    # Counted per window, so the span between disjoint windows is not a dropout
+    n_gaps = n_dropped_frames = 0
+    largest_gap_ms = 0.0
+    gaps = []
+    for window_times in window_frame_times or [frame_times]:
+        window_gaps, window_dropped, window_largest, found = detect_dropouts(
+            window_times.values(), period
+        )
+        n_gaps += window_gaps
+        n_dropped_frames += window_dropped
+        largest_gap_ms = max(largest_gap_ms, window_largest)
+        gaps.extend(found)
+
+    # Add error to timestamps, following the order the fit used
+    x = np.array([frame_times[k] for k in fit.order])
+    y = np.array([timestamps[k][0] for k in fit.order])
+    errors = fit.predict(x) - y
+    annotated_timestamps = {
+        frame_number: (*timestamps[frame_number], error)
+        for frame_number, error in zip(fit.order, errors, strict=True)
+    }
+
+    # Remove outliers
+    considered = {
+        k: annotated_timestamps[k]
+        for k, is_inlier in zip(fit.order, fit.inlier_mask, strict=True)
+        if is_inlier
+    }
+    rejected = {
+        k: annotated_timestamps[k]
+        for k, is_inlier in zip(fit.order, fit.inlier_mask, strict=True)
+        if not is_inlier
+    }
+
+    # Span anchored on frames actually present, so nothing is extrapolated
+    fit_stats = fit.to_dict()
+    pts_min, pts_max = min(frame_times.values()), max(frame_times.values())
+    exposure_times = [end - start for start, end, _ in considered.values()]
+    statistics = VideoStatistics(
+        n_frames=n_frames,
+        container_duration=pts_max - pts_min,
+        board_duration=fit_stats["last_frame"] - fit_stats["first_frame"],
+        nominal_fps=fps,
+        measured_fps=1000 / period,
+        median_frame_period=period,
+        n_gaps=n_gaps,
+        n_dropped_frames=n_dropped_frames,
+        largest_gap_ms=largest_gap_ms,
+        timeline_windowed=timeline_windowed,
+        mean_exposure_time=float(np.mean(exposure_times)),
+        min_exposure_time=float(np.min(exposure_times)),
+        max_exposure_time=float(np.max(exposure_times)),
+        std_exposure_time=float(np.std(exposure_times)),
+        considered_timestamps=considered,
+        rejected_timestamps=rejected,
+        **fit_stats,
+    )
+    return statistics, fit, considered, rejected, gaps
 
 
 def frame_pts(video_path):

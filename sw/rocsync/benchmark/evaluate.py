@@ -20,8 +20,10 @@ import numpy as np
 
 from rocsync.benchmark.common import (
     STEP_ORDER,
+    ReferenceClock,
     confusion_metrics,
     descriptive_stats,
+    parse_frame_key,
     reconstruct_timestamp,
     ring_visible,
 )
@@ -377,6 +379,92 @@ def compute_overall_metrics(benchmark_images, gt_images):
     }
 
 
+# ── Clock fit ────────────────────────────────────────────────────────────────
+
+
+def compute_clock_metrics(benchmark, gt) -> dict[str, dict]:
+    """Score each video's fitted clock against the reference frozen in the ground truth.
+
+    The reference is read, never re-fitted: deriving it here with the code under test
+    would let a change to that code move the ground truth along with the errors
+    measured against it.
+    """
+    references = gt.get("videos", {})
+    predictions = benchmark.get("videos")
+    if not references:
+        return {}
+    if predictions is None:
+        return {rel_path: {"status": "no video timeline recorded"} for rel_path in references}
+
+    gt_images = gt["images"]
+    bm_images = benchmark["images"]
+    metrics: dict[str, dict] = {}
+    for rel_path, reference in references.items():
+        pred = predictions.get(rel_path)
+        if pred is None:
+            metrics[rel_path] = {"status": "not in this run"}
+            continue
+        if pred.get("error") is not None:
+            metrics[rel_path] = {"status": pred["error"]}
+            continue
+
+        ref = ReferenceClock.from_dict(reference)
+        rate, offset = pred["clock_rate"], pred["clock_offset_ms"]
+
+        def predict(pts, rate=rate, offset=offset):
+            return rate * pts + offset
+
+        first = predict(ref.pts_min_ms) - float(ref.predict(ref.pts_min_ms))
+        last = predict(ref.pts_max_ms) - float(ref.predict(ref.pts_max_ms))
+
+        # Per-frame accuracy against the annotations themselves, and whether the fit's
+        # own outlier rejection agrees with them
+        residuals = []
+        false_rejections = false_acceptances = n_flagged = 0
+        for key, annotation in gt_images.items():
+            path, index = parse_frame_key(key)
+            if index is None or path != rel_path:
+                continue
+            prediction = bm_images.get(key)
+            if prediction is None:
+                continue
+
+            board = _board_for_gt(annotation)
+            gt_ts = reconstruct_timestamp(annotation, board) if board is not None else None
+            pts = prediction.get("pts_ms")
+            if gt_ts is not None and pts is not None:
+                residuals.append(predict(pts) - gt_ts[0])
+
+            fit = prediction.get("fit")
+            if fit is None or gt_ts is None:
+                continue
+            n_flagged += 1
+            decoded_correctly = reconstruct_timestamp(prediction, board) == gt_ts
+            if decoded_correctly and not fit["inlier"]:
+                false_rejections += 1
+            elif not decoded_correctly and fit["inlier"]:
+                false_acceptances += 1
+
+        metrics[rel_path] = {
+            "status": None,
+            "clock_rate_error_ppm": (rate - ref.clock_rate) * 1e6,
+            "clock_offset_error_ms": offset - ref.clock_offset_ms,
+            "sync_error_first_ms": first,
+            "sync_error_last_ms": last,
+            "sync_error_max_ms": max(abs(first), abs(last)),
+            "residual_vs_gt_ms": descriptive_stats(residuals),
+            "false_rejections": false_rejections,
+            "false_acceptances": false_acceptances,
+            "n_flagged": n_flagged,
+            "rmse_after": pred.get("rmse_after"),
+            "r2_after": pred.get("r2_after"),
+            "n_considered_frames": pred.get("n_considered_frames"),
+            "n_rejected_frames": pred.get("n_rejected_frames"),
+            "n_dropped_frames": pred.get("n_dropped_frames"),
+        }
+    return metrics
+
+
 # ── Timing statistics ────────────────────────────────────────────────────────
 
 
@@ -488,6 +576,73 @@ def _print_value_accuracy(
         text = f"{nc}/{n} ({nc / n:.0%})" if n > 0 else "-"
         print(f"  {text:>{col_width}}", end="")
     print()
+
+
+def _print_metric_rows(methods, rows, get_video, col_width, label_width=LABEL_WIDTH_DEFAULT):
+    """Print one row per (key, label, formatter), '-' where a column has no value."""
+    for key, label, formatter in rows:
+        print(f"  {label:>{label_width}}", end="")
+        for m in methods:
+            video = get_video(m)
+            value = video.get(key) if video.get("status") is None else None
+            print(f"  {formatter(value, col_width)}", end="")
+        print()
+
+
+def print_clock_report(methods, clock_metrics, col_width, label_width=LABEL_WIDTH_DEFAULT):
+    """Print the clock-fit section, one block per video with a reference clock."""
+    rel_paths = sorted({rel for m in methods for rel in clock_metrics[m]})
+    if not rel_paths:
+        return
+
+    print(f"{'=' * 100}")
+    print("  CLOCK FIT (per video)")
+    print(f"{'=' * 100}")
+
+    for rel_path in rel_paths:
+
+        def get_video(m, rel_path=rel_path):
+            return clock_metrics[m].get(rel_path, {"status": "not in this run"})
+
+        print_header(methods, col_width, label_width, rel_path)
+
+        print(f"  {'status':>{label_width}}", end="")
+        for m in methods:
+            status = get_video(m).get("status") or "scored"
+            print(f"  {status[:col_width]:>{col_width}}", end="")
+        print()
+
+        _print_metric_rows(
+            methods,
+            [
+                ("clock_rate_error_ppm", "clock rate error [ppm]", format_value),
+                ("clock_offset_error_ms", "clock offset error [ms]", format_value),
+                ("sync_error_first_ms", "sync error, first frame [ms]", format_value),
+                ("sync_error_last_ms", "sync error, last frame [ms]", format_value),
+                ("sync_error_max_ms", "sync error, worst [ms]", format_value),
+                ("false_rejections", "outliers rejected in error", format_value),
+                ("false_acceptances", "misdecodes kept as inliers", format_value),
+                ("n_flagged", "frames with both a fit and an annotation", format_value),
+                ("rmse_after", "fit RMSE after rejection [ms]", format_value),
+                ("r2_after", "fit R2 after rejection", format_value),
+                ("n_considered_frames", "frames in the fit", format_value),
+                ("n_rejected_frames", "frames rejected by the fit", format_value),
+                ("n_dropped_frames", "frames missing from the container", format_value),
+            ],
+            get_video,
+            col_width,
+            label_width,
+        )
+
+        print()
+        print_header(methods, col_width, label_width, "Residual vs annotations (ms)")
+        _print_error_stats(
+            methods,
+            lambda m, rel_path=rel_path: get_video(m, rel_path).get("residual_vs_gt_ms") or {},
+            col_width,
+            label_width,
+        )
+        print()
 
 
 def print_report(methods, all_metrics, col_width, label_width=LABEL_WIDTH_DEFAULT):
@@ -733,6 +888,9 @@ def main():
         }
 
     print_report(methods, all_metrics, col_width)
+
+    clock_metrics = {m: compute_clock_metrics(benchmarks[m], gt) for m in methods}
+    print_clock_report(methods, clock_metrics, col_width)
 
     if args.timing:
         timing = {}

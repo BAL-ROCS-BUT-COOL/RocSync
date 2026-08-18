@@ -20,11 +20,14 @@ Interactive GUI for creating ground truth annotations. Runs the pipeline on each
 ### Usage
 
 ```bash
-uv run rocsync-annotate [data_dir] [-o ground_truth.json]
+uv run rocsync-annotate [data_dir] [-o ground_truth.json] [--fit-clocks]
 ```
 
 - `data_dir`: Directory containing validation images and videos (default: `validation_data/`).
 - `-o`: Output file (default: `<data_dir>/ground_truth.json`).
+- `--fit-clocks`: Re-derive every video's reference clock and exit, without opening the GUI.
+  Run it after editing a ground truth file by hand. It exits non-zero, naming the offending
+  frames, when a video's annotations do not agree on a single clock.
 
 The tool resumes from the first unannotated frame on restart.
 
@@ -36,6 +39,19 @@ The window shows two panels side-by-side:
 - **Right**: Rectified 640×640 board with color-coded LED overlays
   - Red circle = ON, Blue circle = OFF, Gray circle = not visible
   - If the pipeline failed (e.g., no ArUco detected), a black image is shown with LED positions at their expected locations.
+
+On a video frame the top right also carries the frame's timing residual:
+
+```
+dt +0.31 ms
+fit 54 frames  RMSE 0.21  max 0.63 ms
+```
+
+`dt` is how far the annotated timestamp sits from where the rest of the video puts this
+frame, green within the 2 ms tolerance and red beyond it. The clock behind it is fitted
+over the video's *other* annotated frames and asked to predict this one, so a frame cannot
+drag the line towards itself and hide half its own error. It reads the annotation on screen
+rather than the saved one, so a correction shows in the number before it is accepted.
 
 ### Keyboard Shortcuts
 
@@ -101,12 +117,49 @@ the file rather than a presentation timestamp, which would shift with the decode
 }
 ```
 
+A `videos` section holds one reference clock per video, the affine map from container
+presentation time to board time that the video's annotations agree on:
+
+```json
+{
+  "images": {"...": "..."},
+  "videos": {
+    "subdir/clip.mp4": {
+      "clock_rate": 1.0000743,
+      "clock_offset_ms": -4333.21,
+      "pts_min_ms": 0.0,
+      "pts_max_ms": 38500.0,
+      "n_frames_fitted": 54,
+      "rmse_ms": 0.21,
+      "max_residual_ms": 0.63,
+      "residual_threshold_ms": 2.0,
+      "derived_at": "2026-08-18T09:12:00+00:00"
+    }
+  }
+}
+```
+
 Fields:
 - `aruco.visible` / `aruco.id`: Whether the ArUco marker is visible and its detected ID (omitted when not visible).
 - `corners[i].visible` / `corners[i].position`: Per-corner-LED visibility and position in original image coordinates (position omitted when not visible). Benchmark results use the same space, so the two are directly comparable.
 - `homography`: 3×3 matrix mapping original image → rectified board coordinates.
 - `counter.visible` / `counter.value`: Whether the binary counter is readable and its decoded value (omitted when not visible).
 - `ring.start` / `ring.end`: First ON and first OFF LED indices (0–99), half-open interval `[start, end)`. `start == end` means the ring is undecodable.
+- `videos[path]`: `board_ms = clock_rate * pts_ms + clock_offset_ms`, with `pts_min_ms` and
+  `pts_max_ms` spanning the *annotated* frames rather than the file, so scoring never
+  extrapolates past the frames the reference was built from.
+
+The reference clock is plain least squares over the annotated timestamps, not the RANSAC
+fit `rocsync` uses on decoded ones. `rocsync-evaluate` measures fitted clocks against these
+numbers, so they have to be a pure function of the annotations: derived with the production
+fitter, a change to that fitter would move the ground truth and every error measured against
+it at the same time. No outlier is tolerated either, which is all RANSAC would have bought —
+an annotated frame more than `residual_threshold_ms` (one board LED is 1 ms) off the line is
+a bad annotation, and refusing to store a reference is how it gets found.
+
+The annotator derives a video's reference when it has at least 5 timestamp annotations and no
+reference yet, or when one of its annotations was added, edited or cleared. A video nobody
+touched keeps the exact number it had.
 
 ## Validation Benchmark
 
@@ -121,6 +174,17 @@ uv run rocsync-validate [data_dir] [-o results.json] [--debug DIR]
 - `--debug`: Directory for debug images.
 
 Results JSON contains a `config` section and an `images` section with per-frame aruco, corners, counter, ring, timestamp, success flag, and timing breakdown. Keys match the ground truth's, so `n_images` in `config` counts benchmark frames rather than files. Corner positions are in original image coordinates, matching the ground truth: the pipeline detects them in the rough-rectified grid, whose scale is a property of the checkout being measured, so they are un-warped through that grid's own homography before being stored.
+
+Every video additionally gets its clock fitted, by the same code a `rocsync` run uses, and a
+`videos` section records the resulting `VideoStatistics` — clock rate and offset, R²/RMSE
+before and after outlier rejection, frame period, dropouts and exposure. A video whose
+timeline could not be fitted carries an `error` instead of the fit. Each frame of a video
+gains its presentation timestamp as `pts_ms` and, once fitted, a `fit` of
+`{"residual_ms", "inlier"}`, so the per-frame outcome stays next to the frame it belongs to.
+
+Unlike a real run, which analyzes roughly one frame per second, every frame that decoded
+feeds the fit: the benchmark has already paid to decode them all, and using all of them keeps
+fit quality separate from the sampling policy.
 
 `config` records which checkout produced the file — branch, commit, whether the tree was dirty, run time, and the OpenCV and NumPy versions — because `rocsync-evaluate` labels its columns by filename alone.
 
@@ -144,6 +208,9 @@ Metrics are computed per pipeline step:
 - **Counter**: detection rates + value accuracy
 - **Ring**: detection rates + start/end value accuracy
 - **Overall**: timestamp detection + exact match accuracy + start/end/exposure error statistics
+- **Clock fit** (per video, when the ground truth has a reference clock): clock rate error in
+  ppm, clock offset error, sync error, residuals against the annotations, and whether the
+  fit's own outlier rejection agrees with them
 
 Corner positions are compared against the annotated coordinates. Board space is derived by mapping
 both sides through the annotated homography, which normalises the threshold to LED sample radii —
@@ -156,6 +223,26 @@ reads as zero for whichever checkout produced the annotations, and a non-zero er
 checkout measures divergence from it rather than distance from truth. Detection rates do not suffer
 this — the ground truth's positives include everything annotated by hand on frames where the
 pipeline failed.
+
+The clock-fit block reads the reference out of the ground truth and never re-fits it. Its
+rows:
+
+| Row | Meaning |
+| --- | --- |
+| `clock rate error [ppm]` | fitted rate minus reference rate; the raw difference is ~1e-5 and unreadable otherwise |
+| `clock offset error [ms]` | fitted board time at `pts == 0` minus the reference's |
+| `sync error, first/last/worst [ms]` | how far the two clocks disagree at either end of the annotated span |
+| `outliers rejected in error` | frames the fit threw out whose decode the annotation confirms |
+| `misdecodes kept as inliers` | frames the fit kept whose decode the annotation contradicts |
+| `residual vs annotations` | fitted board time minus annotated board time, per frame |
+
+Read `sync error` first. Rate and offset trade off against each other — they cancel at
+`pts == 0` and diverge everywhere else — so either one alone can look bad while the clock is
+fine, or look fine while the clock is not. The sync error is what actually lands on a frame.
+
+Unlike the position errors above, this block does not favour whichever checkout pre-filled
+the annotations: the reference is fitted over annotated *values*, not copied from a pipeline's
+output. A decoding bias present in both annotations and predictions still cancels.
 
 ## Comparing branches
 
@@ -182,9 +269,10 @@ uv run rocsync-evaluate output/benchmark/other.json output/benchmark/current.jso
 ```
 
 Running a checkout under the benchmark needs `rocsync/benchmark/{__init__,common,validate}.py`,
-`rocsync/dataset.py` for the suffix sets `common.py` collects inputs by, the `stats` hooks in
-`vision.py`, and a `rocsync-validate` entry point. `dataset.py` imports nothing from `rocsync`, so
-an older checkout only needs the file copied in. `annotate.py` and `evaluate.py` need geometry that
+`rocsync/dataset.py` for the suffix sets `common.py` collects inputs by, `rocsync/timeline.py` and
+`rocsync/video_statistics.py` for the clock fit, the `stats` hooks in `vision.py`, and a
+`rocsync-validate` entry point. None of those three modules imports anything from `rocsync`
+except each other, so an older checkout only needs the files copied in. `annotate.py` and `evaluate.py` need geometry that
 older checkouts lack, so they are not portable and are not needed there.
 
 `rocsync-evaluate` prints how many ground truth frames each column actually scores. A column that

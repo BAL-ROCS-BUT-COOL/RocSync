@@ -2,7 +2,7 @@
 
 import sys
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import cv2
@@ -24,6 +24,9 @@ FRAME_KEY_SEPARATOR = "#"
 FRAME_INDEX_DIGITS = 6  # zero-padded so keys sort in frame order
 FRAME_CACHE_SIZE = 4  # a decoded 4K frame is ~25 MB
 FORWARD_GRAB_LIMIT = 12  # a seek re-decodes from the preceding keyframe anyway
+
+REFERENCE_RESIDUAL_THRESHOLD_MS = 2.0  # one ring LED is 1 ms; more is a bad annotation
+MIN_REFERENCE_FRAMES = 5  # a two-point fit is exact by construction and proves nothing
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,17 @@ def frame_key(rel_path, index=None):
     if index is None:
         return rel_path
     return f"{rel_path}{FRAME_KEY_SEPARATOR}{index:0{FRAME_INDEX_DIGITS}d}"
+
+
+def parse_frame_key(key):
+    """Split a frame key back into (relative path, index), with None for a still image.
+
+    Only the last separator counts, so a path that contains one itself round-trips.
+    """
+    head, sep, tail = str(key).rpartition(FRAME_KEY_SEPARATOR)
+    if not sep or not tail.isdigit():
+        return str(key), None
+    return head, int(tail)
 
 
 def count_video_frames(path):
@@ -246,3 +260,95 @@ def confusion_metrics(tp, fp, fn, tn):
         "fpr": fpr,
         "f1": f1,
     }
+
+
+@dataclass(frozen=True)
+class ReferenceClock:
+    """Affine map from container presentation time to annotated board time.
+
+    The benchmark's own least-squares fit rather than `rocsync.timeline.fit_timeline`.
+    A reference the evaluation scores against has to be a pure function of the
+    annotations: fitting it with the production estimator would let a change to that
+    estimator move the ground truth, and with it every error measured against it. No
+    outlier is tolerated here anyway, which is all RANSAC would have bought.
+    """
+
+    clock_rate: float  # board ms per container ms
+    clock_offset_ms: float  # board ms at pts == 0
+    pts_min_ms: float  # span of the annotated frames, not of the file
+    pts_max_ms: float
+    n_frames_fitted: int
+    rmse_ms: float
+    max_residual_ms: float
+
+    def predict(self, pts_ms):
+        """Board time in ms for one or many container timestamps in ms."""
+        return self.clock_rate * np.asarray(pts_ms, dtype=float) + self.clock_offset_ms
+
+    def to_dict(self):
+        return {
+            **asdict(self),
+            "residual_threshold_ms": REFERENCE_RESIDUAL_THRESHOLD_MS,
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        fields = (
+            "clock_rate",
+            "clock_offset_ms",
+            "pts_min_ms",
+            "pts_max_ms",
+            "n_frames_fitted",
+            "rmse_ms",
+            "max_residual_ms",
+        )
+        return cls(**{k: data[k] for k in fields})
+
+
+def fit_reference_clock(starts_by_index, pts_by_index, exclude=None):
+    """Least-squares clock over annotated frames, or None with too few of them.
+
+    `starts_by_index` maps a video's frame index to its annotated board time in ms,
+    `pts_by_index` to the frame's presentation timestamp. Passing `exclude` drops one
+    index, which measures a frame against a fit that does not contain it.
+    """
+    order = sorted(k for k in starts_by_index if k != exclude and pts_by_index.get(k) is not None)
+    if len(order) < MIN_REFERENCE_FRAMES:
+        return None
+
+    x = np.array([pts_by_index[k] for k in order], dtype=float)
+    y = np.array([starts_by_index[k] for k in order], dtype=float)
+    if x.min() == x.max():  # a vertical line has no slope to fit
+        return None
+
+    clock_rate, clock_offset_ms = (float(v) for v in np.polyfit(x, y, 1))
+    residuals = clock_rate * x + clock_offset_ms - y
+    return ReferenceClock(
+        clock_rate=clock_rate,
+        clock_offset_ms=clock_offset_ms,
+        pts_min_ms=float(x.min()),
+        pts_max_ms=float(x.max()),
+        n_frames_fitted=len(order),
+        rmse_ms=float(np.sqrt(np.mean(residuals**2))),
+        max_residual_ms=float(np.max(np.abs(residuals))),
+    )
+
+
+def reference_residual(clock, index, starts_by_index, pts_by_index):
+    """Signed residual of one frame in ms, predicted minus annotated, or None."""
+    pts = pts_by_index.get(index)
+    if clock is None or pts is None or index not in starts_by_index:
+        return None
+    return float(clock.predict(pts)) - float(starts_by_index[index])
+
+
+def reference_outliers(clock, starts_by_index, pts_by_index):
+    """[(index, signed residual ms)] for frames beyond the reference threshold."""
+    if clock is None:
+        return []
+    outliers = []
+    for index in sorted(starts_by_index):
+        residual = reference_residual(clock, index, starts_by_index, pts_by_index)
+        if residual is not None and abs(residual) > REFERENCE_RESIDUAL_THRESHOLD_MS:
+            outliers.append((index, residual))
+    return outliers

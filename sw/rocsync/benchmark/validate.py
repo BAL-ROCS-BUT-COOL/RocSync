@@ -12,6 +12,7 @@ import argparse
 import json
 import subprocess
 import sys
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,9 +25,12 @@ from rocsync.benchmark.common import (
     FrameSource,
     collect_frames,
     corner_positions_in_image,
+    frame_key,
+    parse_frame_key,
 )
 from rocsync.board_profiles import PROFILES_BY_ARUCO
 from rocsync.camera import CameraType
+from rocsync.timeline import frame_pts, summarize_timeline
 from rocsync.vision import process_frame
 
 
@@ -155,6 +159,68 @@ def run_benchmark(frames, debug_dir=None):
     return results
 
 
+def fit_videos(frames, results):
+    """Fit a clock per video and fold the per-frame outcome back into `results`.
+
+    Runs the production summarization over every frame that decoded, rather than the
+    one-per-second sample a real run takes: the benchmark has already paid to decode
+    them all, and using all of them keeps fit quality separate from sampling policy.
+    """
+    by_path = defaultdict(list)
+    for ref in frames:
+        if ref.index is not None:
+            by_path[ref.path].append(ref)
+
+    videos = {}
+    for path in sorted(by_path):
+        refs = by_path[path]
+        rel_path, _ = parse_frame_key(refs[0].key)
+        frame_times = dict(enumerate(frame_pts(path)))
+
+        cap = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        cap.release()
+
+        # A frame's presentation timestamp is its own, whether or not the fit succeeds
+        for ref in refs:
+            if ref.key in results and ref.index in frame_times:
+                results[ref.key]["pts_ms"] = frame_times[ref.index]
+
+        timestamps = {
+            ref.index: tuple(results[ref.key]["timestamp"])
+            for ref in refs
+            if results.get(ref.key, {}).get("timestamp") is not None
+        }
+
+        try:
+            statistics, _, considered, rejected, _ = summarize_timeline(
+                timestamps, frame_times, len(frame_times), fps
+            )
+        except ValueError as e:
+            videos[rel_path] = {
+                "n_frames": len(frame_times),
+                "n_timestamped_frames": len(timestamps),
+                "error": str(e),
+            }
+            print(f"  WARNING: no clock for {rel_path}: {e}", file=sys.stderr)
+            continue
+
+        for index, (*_, residual) in {**considered, **rejected}.items():
+            key = frame_key(rel_path, index)
+            if key in results:
+                results[key]["fit"] = {
+                    "residual_ms": float(residual),
+                    "inlier": index in considered,
+                }
+
+        record = statistics.to_dict()
+        # The per-frame residuals now live next to the frames they belong to
+        del record["considered_timestamps"], record["rejected_timestamps"]
+        videos[rel_path] = {**record, "n_timestamped_frames": len(timestamps), "error": None}
+
+    return videos
+
+
 def main():
     parser = argparse.ArgumentParser(description="Benchmark rocsync on validation data")
     parser.add_argument(
@@ -192,8 +258,21 @@ def main():
     n_success = sum(1 for r in results.values() if r["success"])
     print(f"Detection rate: {n_success}/{len(results)} ({n_success / len(results):.1%})")
 
+    videos = fit_videos(frames, results)
+    for rel_path, video in videos.items():
+        if video["error"] is not None:
+            print(f"{rel_path}: no clock ({video['error']})")
+            continue
+        print(
+            f"{rel_path}: {video['clock_rate']:.6f}x, "
+            f"offset {video['clock_offset_ms']:.1f} ms, "
+            f"RMSE {video['rmse_after']:.2f} ms, "
+            f"{video['n_considered_frames']}/{video['n_timestamped_frames']} inliers"
+        )
+
     output = {
         "config": run_provenance(data_dir, len(results)),
+        "videos": videos,
         "images": results,
     }
     with open(args.output, "w") as f:

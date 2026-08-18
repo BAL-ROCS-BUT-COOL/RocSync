@@ -14,15 +14,29 @@ import copy
 import json
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from rocsync.benchmark.common import FrameSource, collect_frames, corner_positions_in_image
+from rocsync.benchmark.common import (
+    MIN_REFERENCE_FRAMES,
+    REFERENCE_RESIDUAL_THRESHOLD_MS,
+    FrameSource,
+    collect_frames,
+    corner_positions_in_image,
+    fit_reference_clock,
+    frame_key,
+    parse_frame_key,
+    reconstruct_timestamp,
+    reference_outliers,
+    reference_residual,
+)
 from rocsync.board_profiles import BOARD_V1, PROFILES_BY_ARUCO, RectifiedBoard
 from rocsync.camera import CameraType
+from rocsync.timeline import frame_pts
 from rocsync.vision import ARUCO_DICTIONARY, process_frame
 
 # Every board rectifies to the same pixel grid, so one radius serves the whole GUI.
@@ -245,6 +259,46 @@ class ImageAnnotation:
 # ── Interaction state ───────────────────────────────────────────────────────
 
 
+# ── Reference clock ─────────────────────────────────────────────────────────
+
+
+def annotated_starts(images, rel_path):
+    """Annotated board start time in ms per frame index, for one video."""
+    starts = {}
+    for key, entry in images.items():
+        path, index = parse_frame_key(key)
+        if index is None or path != rel_path:
+            continue
+        board = PROFILES_BY_ARUCO.get(entry.get("aruco", {}).get("id"))
+        if board is None:
+            continue
+        timestamp = reconstruct_timestamp(entry, board)
+        if timestamp is not None:
+            starts[index] = timestamp[0]
+    return starts
+
+
+def video_rel_paths(frames):
+    """Relative paths of the videos in a frame list, sorted."""
+    return sorted({parse_frame_key(ref.key)[0] for ref in frames if ref.index is not None})
+
+
+def derive_reference_clock(images, rel_path, pts):
+    """(clock, outliers) for one video, clock None below MIN_REFERENCE_FRAMES."""
+    starts = annotated_starts(images, rel_path)
+    clock = fit_reference_clock(starts, pts)
+    if clock is None:
+        return None, []
+    return clock, reference_outliers(clock, starts, pts)
+
+
+def describe_outliers(rel_path, outliers):
+    """One line per frame whose annotation the rest of the video contradicts."""
+    lines = [f"{rel_path}: {len(outliers)} frame(s) beyond {REFERENCE_RESIDUAL_THRESHOLD_MS} ms"]
+    lines += [f"  {frame_key(rel_path, i)}  {residual:+.2f} ms" for i, residual in outliers]
+    return "\n".join(lines)
+
+
 class Mode(Enum):
     IDLE = "idle"
     DRAGGING_CORNER = "dragging"
@@ -299,10 +353,15 @@ class AnnotationTool:
     def __init__(self, data_dir, output_path=None):
         self.data_dir = Path(data_dir)
         self.output_path = Path(output_path) if output_path else self.data_dir / "ground_truth.json"
-        self.ground_truth = {"images": {}}
+        self.ground_truth = {"images": {}, "videos": {}}
         self.frames = []
         self.source = FrameSource()
         self.current_idx = 0
+
+        # Reference clock state. pts are read once per video and kept; a video is
+        # re-derived only once one of its annotations has actually changed.
+        self._video_pts: dict[str, dict[int, float]] = {}
+        self._dirty_videos: set[str] = set()
 
         # Board profile and derived geometry (set per-image)
         self.board = BOARD_V1.rectify()
@@ -460,6 +519,11 @@ class AnnotationTool:
                 )
             self._pump()
 
+            # Demuxing for presentation timestamps blocks, so do it before the loop
+            if ref.index is not None:
+                self._load_pts(parse_frame_key(frame_key)[0])
+            self._pump()
+
             self.mode = Mode.IDLE
             self._ring_start_candidate = None
             self.placing_idx = 0
@@ -472,6 +536,7 @@ class AnnotationTool:
 
             if action == "accept":
                 self.ground_truth["images"][frame_key] = self.annotation.to_dict()
+                self._mark_video_dirty(frame_key)
                 self._save_ground_truth()
                 self.current_idx = (self.current_idx + 1) % n_frames
             elif action == "skip":
@@ -488,6 +553,7 @@ class AnnotationTool:
                 self.current_idx = self._find_source_boundary(self.current_idx, forward=False)
             elif action == "clear":
                 self.ground_truth["images"].pop(frame_key, None)
+                self._mark_video_dirty(frame_key)
                 self._save_ground_truth()
                 # stay on current frame — re-runs pipeline on next iteration
             elif action == "quit":
@@ -1046,6 +1112,13 @@ class AnnotationTool:
             board_img, annotation_label, (tx, ty), font, font_scale, annotation_color, thickness
         )
 
+        # How this frame's timestamp sits against the clock the rest of its video implies
+        for i, (text, color) in enumerate(self._clock_overlay(frame_key), start=1):
+            (lw, lh), _ = cv2.getTextSize(text, font, 0.45, 1)
+            cv2.putText(
+                board_img, text, (bs - lw - margin, ty + i * (lh + 10)), font, 0.45, color, 1
+            )
+
         # The left panel is already at the common height; scale the board to match.
         left_scaled = left
         board_scaled = cv2.resize(board_img, (h, h))
@@ -1211,12 +1284,99 @@ class AnnotationTool:
                 self.ground_truth = json.load(f)
             if "images" not in self.ground_truth:
                 self.ground_truth = {"images": {}}
+            self.ground_truth.setdefault("videos", {})
             n = len(self.ground_truth["images"])
             print(f"Loaded {n} existing annotations from {self.output_path}")
 
     def _save_ground_truth(self):
+        self._update_references()
         with open(self.output_path, "w") as f:
             json.dump(self.ground_truth, f, indent=2)
+
+    # ── Reference clock ─────────────────────────────────────────────────
+
+    def _mark_video_dirty(self, frame_key_str):
+        """Note that a video's annotations changed, so its reference is re-derived."""
+        rel_path, index = parse_frame_key(frame_key_str)
+        if index is not None:
+            self._dirty_videos.add(rel_path)
+
+    def _load_pts(self, rel_path):
+        """Presentation timestamps of a video, keyed by frame index.
+
+        Reading them demuxes the whole file, so it happens once per video and off
+        the render path.
+        """
+        if rel_path not in self._video_pts:
+            self._video_pts[rel_path] = dict(enumerate(frame_pts(self.data_dir / rel_path)))
+        return self._video_pts[rel_path]
+
+    def _update_references(self):
+        """Re-derive the reference clock of every video that needs one.
+
+        Gated so a frozen reference is never silently replaced: a video is derived
+        only when it has none yet or one of its annotations just changed. A video
+        the rest of the session never touched keeps the exact number it had.
+        """
+        videos = self.ground_truth.setdefault("videos", {})
+        for rel_path in video_rel_paths(self.frames):
+            if rel_path in videos and rel_path not in self._dirty_videos:
+                continue
+            clock, outliers = derive_reference_clock(
+                self.ground_truth["images"], rel_path, self._load_pts(rel_path)
+            )
+            if clock is None:
+                continue
+            if outliers:
+                # Refusing to store is the point; losing the annotation work is not
+                self.status_msg = describe_outliers(rel_path, outliers).splitlines()[0]
+                print(describe_outliers(rel_path, outliers), file=sys.stderr)
+                continue
+            videos[rel_path] = {
+                **clock.to_dict(),
+                "derived_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+        self._dirty_videos.clear()
+
+    def _clock_overlay(self, frame_key_str):
+        """Lines describing how this frame's timestamp sits against its video's clock.
+
+        The residual is leave-one-out: the clock is fitted over the video's *other*
+        annotated frames and asked to predict this one, so a frame cannot drag the
+        line towards itself and hide its own mistake. It reads the live annotation,
+        so a correction shows up before it is saved.
+        """
+        rel_path, index = parse_frame_key(frame_key_str)
+        pts = self._video_pts.get(rel_path)
+        if index is None or not pts:
+            return []
+
+        starts = annotated_starts(self.ground_truth["images"], rel_path)
+        live = reconstruct_timestamp(self.annotation.to_dict(), self.board)
+        if live is None:
+            starts.pop(index, None)
+        else:
+            starts[index] = live[0]
+
+        lines = []
+        residual = reference_residual(
+            fit_reference_clock(starts, pts, exclude=index), index, starts, pts
+        )
+        if residual is not None:
+            within = abs(residual) <= REFERENCE_RESIDUAL_THRESHOLD_MS
+            lines.append((f"dt {residual:+.2f} ms", (0, 255, 0) if within else (0, 0, 255)))
+        clock = fit_reference_clock(starts, pts)
+        if clock is not None:
+            lines.append(
+                (
+                    f"fit {clock.n_frames_fitted} frames  RMSE {clock.rmse_ms:.2f}"
+                    f"  max {clock.max_residual_ms:.2f} ms",
+                    COLOR_BOARD_TEXT,
+                )
+            )
+        elif len(starts) < MIN_REFERENCE_FRAMES:
+            lines.append((f"fit needs {MIN_REFERENCE_FRAMES} annotated frames", COLOR_NOT_VIS))
+        return lines
 
     def _find_unannotated(self, from_idx, forward=True):
         """Find the next/previous unannotated frame index, wrapping around the list.
@@ -1255,6 +1415,57 @@ class AnnotationTool:
         return from_idx
 
 
+def fit_clocks(data_dir, output_path):
+    """Re-derive every video's reference clock without opening the GUI.
+
+    Unlike the annotator this recomputes unconditionally -- it is an explicit request
+    to re-derive, which is what to run after editing a ground truth file by hand.
+    Returns a process exit code.
+    """
+    data_dir = Path(data_dir)
+    output_path = Path(output_path) if output_path else data_dir / "ground_truth.json"
+    if not output_path.exists():
+        print(f"No ground truth at {output_path}", file=sys.stderr)
+        return 1
+
+    with open(output_path) as f:
+        ground_truth = json.load(f)
+    ground_truth.setdefault("images", {})
+    videos = ground_truth.setdefault("videos", {})
+
+    frames = collect_frames(data_dir)
+    failed = False
+    for rel_path in video_rel_paths(frames):
+        pts = dict(enumerate(frame_pts(data_dir / rel_path)))
+        clock, outliers = derive_reference_clock(ground_truth["images"], rel_path, pts)
+        if clock is None:
+            print(f"{rel_path}: fewer than {MIN_REFERENCE_FRAMES} annotated frames, skipped")
+            continue
+        if outliers:
+            print(describe_outliers(rel_path, outliers), file=sys.stderr)
+            failed = True
+            continue
+
+        previous = videos.get(rel_path)
+        videos[rel_path] = {
+            **clock.to_dict(),
+            "derived_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        if previous is None:
+            print(f"{rel_path}: derived {clock.clock_rate:.7f}x, {clock.clock_offset_ms:.2f} ms")
+        elif any(previous.get(k) != videos[rel_path][k] for k in ("clock_rate", "clock_offset_ms")):
+            print(
+                f"{rel_path}: {previous['clock_rate']:.7f}x -> {clock.clock_rate:.7f}x, "
+                f"{previous['clock_offset_ms']:.2f} -> {clock.clock_offset_ms:.2f} ms"
+            )
+        else:
+            print(f"{rel_path}: unchanged")
+
+    with open(output_path, "w") as f:
+        json.dump(ground_truth, f, indent=2)
+    return 1 if failed else 0
+
+
 # ── CLI entry point ─────────────────────────────────────────────────────────
 
 
@@ -1272,7 +1483,15 @@ def main():
         default=None,
         help="Output ground truth JSON (default: <data_dir>/ground_truth.json)",
     )
+    parser.add_argument(
+        "--fit-clocks",
+        action="store_true",
+        help="Re-derive every video's reference clock and exit, without opening the GUI",
+    )
     args = parser.parse_args()
+
+    if args.fit_clocks:
+        sys.exit(fit_clocks(args.data_dir, args.output))
 
     tool = AnnotationTool(args.data_dir, output_path=args.output)
     tool.run()

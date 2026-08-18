@@ -22,8 +22,16 @@ import cv2
 import numpy as np
 import pytest
 
+from rocsync.benchmark.annotate import annotated_starts, derive_reference_clock, video_rel_paths
+from rocsync.benchmark.common import (
+    MIN_REFERENCE_FRAMES,
+    REFERENCE_RESIDUAL_THRESHOLD_MS,
+    ReferenceClock,
+    collect_frames,
+)
 from rocsync.board_profiles import PROFILES_BY_ARUCO
 from rocsync.camera import CameraType
+from rocsync.timeline import frame_pts
 
 GROUND_TRUTH = Path(
     os.environ.get(
@@ -40,9 +48,14 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(scope="module")
-def annotations():
+def ground_truth():
     with open(GROUND_TRUTH) as f:
-        return json.load(f)["images"]
+        return json.load(f)
+
+
+@pytest.fixture(scope="module")
+def annotations(ground_truth):
+    return ground_truth["images"]
 
 
 def _nominal_in_image(gt):
@@ -103,4 +116,51 @@ def test_annotated_positions_are_image_space(annotations):
     assert max(xs) > 640, (
         f"all annotated x coordinates fall within {max(xs):.0f} px; "
         "the file may hold rectified board coordinates instead of image coordinates"
+    )
+
+
+def test_every_reference_clock_still_fits_its_annotations(ground_truth):
+    """A stored reference clock reproduces, and no annotation contradicts it.
+
+    The evaluation measures fitted clocks against these numbers, so a residual beyond
+    the threshold means the reference is scoring against a frame that is itself wrong.
+    Deriving it here rather than trusting the file also catches annotations edited
+    without re-running `rocsync-annotate --fit-clocks`.
+    """
+    references = ground_truth.get("videos", {})
+    if not references:
+        pytest.skip("no reference clocks in this ground truth")
+
+    for rel_path, stored in references.items():
+        pts = dict(enumerate(frame_pts(GROUND_TRUTH.parent / rel_path)))
+        clock, outliers = derive_reference_clock(ground_truth["images"], rel_path, pts)
+
+        assert clock is not None, f"{rel_path}: too few annotations to re-derive"
+        assert not outliers, (
+            f"{rel_path}: {len(outliers)} annotated frame(s) beyond "
+            f"{REFERENCE_RESIDUAL_THRESHOLD_MS} ms:\n  "
+            + "\n  ".join(f"#{i:06d} {residual:+.2f} ms" for i, residual in outliers[:20])
+        )
+        assert clock == ReferenceClock.from_dict(stored), (
+            f"{rel_path}: stored reference does not match the annotations it claims to "
+            f"describe; re-run `rocsync-annotate --fit-clocks`"
+        )
+
+
+def test_every_sufficiently_annotated_video_has_a_reference_clock(ground_truth):
+    """A video the evaluation could score must not be silently unscored."""
+    frames = collect_frames(GROUND_TRUTH.parent)
+    references = ground_truth.get("videos", {})
+
+    missing = [
+        rel_path
+        for rel_path in video_rel_paths(frames)
+        if rel_path not in references
+        and len(annotated_starts(ground_truth["images"], rel_path)) >= MIN_REFERENCE_FRAMES
+    ]
+
+    assert not missing, (
+        "videos with enough annotations but no reference clock: "
+        + ", ".join(missing)
+        + "; run `rocsync-annotate --fit-clocks`"
     )

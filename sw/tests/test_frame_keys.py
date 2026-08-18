@@ -5,7 +5,7 @@ annotation lands under one string and the prediction under another, and evaluati
 scores the frame as a miss on both sides rather than reporting an error.
 """
 
-from rocsync.benchmark.common import frame_key
+from rocsync.benchmark.common import frame_key, parse_frame_key
 
 
 def test_still_image_key_is_its_relative_path():
@@ -28,3 +28,19 @@ def test_a_video_frame_sorts_next_to_its_own_file():
     """`#` sorts below `.` and `/`, so frames never interleave with sibling names."""
     keys = sorted(["clip.mp4#000001", "clip.mp4#000000", "clip.txt", "clip-other.mp4"])
     assert keys == ["clip-other.mp4", "clip.mp4#000000", "clip.mp4#000001", "clip.txt"]
+
+
+def test_a_key_round_trips_back_to_its_parts():
+    for rel_path, index in [("sub/img.png", None), ("sub/clip.mp4", 0), ("sub/clip.mp4", 42)]:
+        assert parse_frame_key(frame_key(rel_path, index)) == (rel_path, index)
+
+
+def test_only_the_last_separator_splits_the_key():
+    """A path may contain a `#` of its own; the index is always what follows the last."""
+    assert parse_frame_key("take #2/clip.mp4#000007") == ("take #2/clip.mp4", 7)
+    assert parse_frame_key("take #2/still.png") == ("take #2/still.png", None)
+
+
+def test_a_trailing_separator_without_an_index_is_part_of_the_path():
+    assert parse_frame_key("clip.mp4#") == ("clip.mp4#", None)
+    assert parse_frame_key("clip.mp4#abc") == ("clip.mp4#abc", None)

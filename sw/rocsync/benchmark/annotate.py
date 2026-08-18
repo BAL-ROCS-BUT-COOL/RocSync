@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import copy
+import itertools
 import json
 import sys
 from dataclasses import dataclass, field
@@ -73,6 +74,60 @@ def counter_bbox(counter_pos):
         max(cx) + LED_RADIUS_PX + 10,
         max(cy) + LED_RADIUS_PX + 10,
     )
+
+
+# A homography follows from four point pairs whose board coordinates are in general
+# position. v2's LEDs 0, 1 and 4 are collinear, so a fifth-LED set needs a corner off
+# that line. The area threshold separates the collinear zero from the smallest triangle
+# the layout actually forms (~10000 px² on v2) with room to spare.
+MIN_HOMOGRAPHY_CORNERS = 4
+MIN_CORNER_TRIANGLE_FRACTION = 0.02  # of board_size, squared, as an area
+FIT_WARNING = "Rectified view needs"  # prefix of the message a failed fit leaves
+
+
+def _min_triangle_area(points):
+    """Smallest triangle area over all triples of points — zero if three are collinear."""
+    return min(
+        abs(np.linalg.det(np.array([points[j] - points[i], points[k] - points[i]]))) / 2
+        for i, j, k in itertools.combinations(range(len(points)), 3)
+    )
+
+
+def _determines_homography(points, min_area):
+    """Whether four of the points sit in general position, i.e. no three of them collinear."""
+    return any(
+        _min_triangle_area([points[i] for i in quad]) >= min_area
+        for quad in itertools.combinations(range(len(points)), MIN_HOMOGRAPHY_CORNERS)
+    )
+
+
+def fit_corner_homography(corners, board):
+    """Fit original image → rectified board from the visible corner LEDs, or None.
+
+    None means the visible corners do not determine a map: too few of them, board
+    coordinates that are degenerate, or a fit that came out singular.
+    """
+    board_pos = board.always_on_leds[CameraType.RGB]
+    visible = [i for i, c in enumerate(corners) if c["visible"]]
+    if len(visible) < MIN_HOMOGRAPHY_CORNERS:
+        return None
+
+    dst = np.array([board_pos[i] for i in visible], dtype=np.float32)
+    min_area = (MIN_CORNER_TRIANGLE_FRACTION * board.board_size) ** 2
+    if not _determines_homography(dst, min_area):
+        return None
+
+    src = np.array([corners[i]["position"] for i in visible], dtype=np.float32)
+    try:
+        if len(visible) == MIN_HOMOGRAPHY_CORNERS:
+            H = cv2.getPerspectiveTransform(src, dst)
+        else:
+            H, _ = cv2.findHomography(src, dst)
+    except cv2.error:
+        return None
+    if H is None or not np.isfinite(H).all():
+        return None
+    return H
 
 
 # Known ArUco marker IDs to cycle through
@@ -367,6 +422,9 @@ HELP_TEXT = [
     "=== Keys ===",
     "0-N               : Place that corner next",
     ". / ,             : Next / previous input file",
+    "=== Rectified view ===",
+    "Any corner edit re-fits the board view,",
+    "from 4 or more visible corner LEDs",
 ]
 
 
@@ -541,15 +599,10 @@ class AnnotationTool:
                         bx, by = self.corner_pos[i]
                         c["position"] = [ox + bx * scale, oy + by * scale]
 
-            # Re-warp the rectified image using the annotation's homography
-            # so the displayed image is consistent with to_original/to_board.
-            # This matters when loading a saved annotation whose homography
-            # differs from the pipeline's (e.g. user corrected corners earlier).
-            if all(c["visible"] for c in self.annotation.corners):
-                self._recompute_homography(image)
-            elif self.annotation.homography is not None:
-                # Not all corners visible but we have a saved homography.
-                # Warp using it so the displayed image matches to_original/to_board.
+            # Warp with the annotation's own homography, saved or from the pipeline, so
+            # the displayed image is consistent with to_original/to_board. Loading never
+            # refits: a stored annotation keeps the homography it was accepted with.
+            if self.annotation.homography is not None:
                 H = np.array(self.annotation.homography, dtype=np.float64)
                 mask = image[:, :, 2]
                 self.stats["rectified"] = cv2.warpPerspective(
@@ -787,8 +840,7 @@ class AnnotationTool:
             elif event == cv2.EVENT_LBUTTONUP and self._drag_on_left:
                 if self._drag_idx is not None:
                     if self._drag_started:
-                        if all(c["visible"] for c in self.annotation.corners):
-                            self._recompute_homography(self._current_image)
+                        self._recompute_homography(self._current_image)
                     else:
                         self._place_corner(ox, oy)
                     self._drag_idx = None
@@ -870,8 +922,7 @@ class AnnotationTool:
         if self._drag_idx is not None:
             if not self._drag_started:
                 self._cycle_corner_state(self._drag_idx)
-            if all(c["visible"] for c in self.annotation.corners):
-                self._recompute_homography(self._current_image)
+            self._recompute_homography(self._current_image)
             self._drag_idx = None
             self._drag_started = False
             self.mode = Mode.IDLE
@@ -891,8 +942,7 @@ class AnnotationTool:
         corner = self.annotation.corners[self.placing_idx]
         corner["position"] = [ox, oy]
         corner["visible"] = True
-        if all(c["visible"] for c in self.annotation.corners):
-            self._recompute_homography(self._current_image)
+        self._recompute_homography(self._current_image)
         self.placing_idx = (self.placing_idx + 1) % len(self.annotation.corners)
         self._needs_redraw = True
 
@@ -1003,29 +1053,31 @@ class AnnotationTool:
         self._needs_redraw = True
 
     def _recompute_homography(self, original):
-        """Recompute homography and re-warp rectified image from all visible corners."""
+        """Refit the homography and re-warp the board from the visible corners.
+
+        Returns whether the fit succeeded; a failed one leaves the previous homography
+        and rectified view in place, so the board stays usable while corners are edited.
+        """
         ann = self.annotation
         board = self.board
-        visible = [c for c in ann.corners if c["visible"]]
-        if len(visible) < 4:
-            return
-        src = np.array([c["position"] for c in ann.corners if c["visible"]], dtype=np.float32)
-        dst = np.array(
-            [
-                board.always_on_leds[CameraType.RGB][i]
-                for i, c in enumerate(ann.corners)
-                if c["visible"]
-            ],
-            dtype=np.float32,
-        )
-        if len(src) == 4:
-            H = cv2.getPerspectiveTransform(src, dst)
-        else:
-            H, _ = cv2.findHomography(src, dst)
+        H = fit_corner_homography(ann.corners, board)
+        if H is None:
+            n = sum(1 for c in ann.corners if c["visible"])
+            self.status_msg = (
+                f"{FIT_WARNING} {MIN_HOMOGRAPHY_CORNERS} non-collinear corner LEDs ({n} visible)"
+            )
+            return False
+        if self.status_msg.startswith(FIT_WARNING):
+            self.status_msg = ""
         ann.homography = H.tolist()
+        # Hidden corners have no annotated position, so park them where the fit predicts.
+        for i, c in enumerate(ann.corners):
+            if not c["visible"]:
+                c["position"] = ann.to_original(*self.corner_pos[i])
         mask = original[:, :, 2]  # red channel
         bs = board.board_size
         self.stats["rectified"] = cv2.warpPerspective(mask, H, (bs, bs))
+        return True
 
     def _handle_ring_first_click(self, idx):
         """First ring click (CW first ON LED), then wait for CW first OFF LED."""

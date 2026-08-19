@@ -69,7 +69,7 @@ rather than the saved one, so a correction shows in the number before it is acce
 
 | Key | Action |
 |-----|--------|
-| Enter / Space | Accept annotation, save, advance to next frame |
+| Enter / Space | Accept annotation, save, advance to the next unannotated frame |
 | D / Right arrow | Skip to next frame without saving |
 | A / Left arrow | Go back to previous frame |
 | N | Jump to next unannotated frame |

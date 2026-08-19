@@ -798,7 +798,9 @@ class AnnotationTool:
                 self.ground_truth["images"][frame_key] = self.annotation.to_dict()
                 self._mark_video_dirty(frame_key)
                 self._save_ground_truth()
-                self.current_idx = (self.current_idx + 1) % n_frames
+                # Show next unannotated frame, or next frame if no unannoted exists
+                nxt = self._find_unannotated(self.current_idx, forward=True)
+                self.current_idx = nxt if nxt != self.current_idx else (self.current_idx + 1) % n_frames
             elif action == "skip":
                 self.current_idx = (self.current_idx + 1) % n_frames
             elif action == "back":
@@ -1441,7 +1443,7 @@ class AnnotationTool:
 
         # Row 2: keyboard shortcuts, shrunk if they would reach past the panel split
         shortcuts = (
-            "Enter=Accept  Left/Right=Prev/Next  N/B=Skip to unannotated  "
+            "Enter/Space=Accept  Left/Right=Prev/Next  N/B=Skip to unannotated  "
             ",/.=Prev/Next file  0-N=Pick corner  C=Clear  Q=Quit  H=Help"
         )
         draw_text(

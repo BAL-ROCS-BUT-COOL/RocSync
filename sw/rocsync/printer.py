@@ -17,10 +17,6 @@ def succprint(string):
     print(f"\033[92m{string}\033[0m")
 
 
-def boldprint(string):
-    print(f"\033[1m{string}\033[0m")
-
-
 def printresult(name, value, is_valid):
     string = f"{name + ':':<40} {value:>30}"
     if is_valid:

@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import pathlib
 from pathlib import Path
@@ -9,31 +10,34 @@ import numpy as np
 from tqdm import tqdm
 
 from rocsync.board_profiles import PROFILES_BY_NAME
+from rocsync.dataset import VIDEO_SUFFIXES
 from rocsync.ftk import process_ftk_recording
 from rocsync.printer import errprint, succprint, warnprint
+from rocsync.timecode import parse_hms
 from rocsync.video import process_video
 from rocsync.vision import CameraType, process_frame
 
 
 class NpEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, (np.bool_, bool)):
-            return bool(obj)
-        return super().default(obj)
+    def default(self, o):
+        if isinstance(o, np.integer):
+            return int(o)
+        elif isinstance(o, np.floating):
+            return float(o)
+        elif isinstance(o, np.ndarray):
+            return o.tolist()
+        elif isinstance(o, (np.bool_, bool)):
+            return bool(o)
+        return super().default(o)
 
 
 def process_image(path, camera_type, debug_dir=None, board=None):
     image = cv2.imread(path)
     _, timestamp = process_frame(image, camera_type, 0, board, debug_dir)
     if timestamp is not None:
-        succprint(f"start: {timestamp[0]} ms, end {timestamp[1]} ms")
-        return {"start": timestamp[0], "end": timestamp[1]}
+        succprint(f"first frame: {timestamp[0]} ms, last frame: {timestamp[1]} ms")
+        # Interpret an image as a single-frame recording: its exposure window is its board-time span
+        return {"first_frame": timestamp[0], "last_frame": timestamp[1]}
     else:
         errprint("Error: Unable to decode timestamp.")
 
@@ -53,24 +57,25 @@ def mkdir_unique(name, parent_dir):
     return str(debug_dir)
 
 
+WINDOW_TIME_FORMATS = "hh:mm:ss, 'end' or 'end-hh:mm:ss'"
+
+
 def parse_time(time_str: str) -> float:
-    """Expects a delta time string with format hh:mm:ss.ms"""
-    if time_str is None:
-        return None
+    """Parses a time in hh:mm:ss format, "end" for the end of the file, or
+    "end-hh:mm:ss" for an offset back from it.
 
-    time = time_str.split(":")
-    if len(time) != 3:
-        errprint(f"Invalid time format: {time_str}, expected hh:mm:ss.ms")
-        raise ValueError
-    try:
-        h = int(time[0])
-        m = int(time[1])
-        s = float(time[2])
-    except ValueError:
-        errprint(f"Invalid time format: {time_str}, expected hh:mm:ss.ms")
-        raise ValueError
+    The seconds may be fractional, so a window can be given to the millisecond.
+    An offset from the end is returned as a negative time.
+    """
+    text = time_str.strip().lower()
+    if text == "end":
+        return math.inf
+    # A bare leading "-" means the same, but needs quoting on a command line
+    for prefix in ("end-", "-"):
+        if text.startswith(prefix):
+            return -parse_hms(text[len(prefix) :], time_str, WINDOW_TIME_FORMATS)
 
-    return h * 3600 + m * 60 + s
+    return parse_hms(text, time_str, WINDOW_TIME_FORMATS)
 
 
 def main():
@@ -111,7 +116,7 @@ def main():
         default="output.json",
         type=str,
         metavar="FILE",
-        help="JSON file to store results",
+        help="JSON file to store results (default: output.json)",
     )
     parser.add_argument(
         "-y",
@@ -127,35 +132,21 @@ def main():
     )
     parser.add_argument(
         "--board-version",
-        choices=["auto"] + list(PROFILES_BY_NAME.keys()),
+        choices=["auto", *PROFILES_BY_NAME],
         default="auto",
         help="board hardware revision (default: auto-detect from ArUco marker ID)",
     )
 
     # Specify time windows to search for ROCsync
     parser.add_argument(
-        "--start1",
-        type=str,
-        default=None,
-        help="start time of first window to search, in hh:mm:ss.ms format",
-    )
-    parser.add_argument(
-        "--end1",
-        type=str,
-        default=None,
-        help="end time window of first window to search, in hh:mm:ss.ms format",
-    )
-    parser.add_argument(
-        "--start2",
-        type=str,
-        default=None,
-        help="start time window of second window to search, in hh:mm:ss.ms format",
-    )
-    parser.add_argument(
-        "--end2",
-        type=str,
-        default=None,
-        help="end time window of second window to search, in hh:mm:ss.ms format",
+        "--window",
+        nargs=2,
+        action="append",
+        metavar=("START", "END"),
+        help="time span to search, in hh:mm:ss format with optionally fractional "
+        "seconds; 'end' is the end of the file and 'end-hh:mm:ss' counts back from it, "
+        "e.g. --window end-0:00:30 end. Repeat for several spans; overlapping ones are "
+        "merged (default: whole file)",
     )
     parser.add_argument(
         "--recurse_in_dir",
@@ -165,24 +156,33 @@ def main():
 
     args = parser.parse_args()
 
-    board = (
-        PROFILES_BY_NAME.get(args.board_version)
-        if args.board_version != "auto"
-        else None
-    )
+    # Auto-detection identifies the board from its ArUco marker, which is invisible in IR
+    if args.camera_type == CameraType.INFRARED.value and args.board_version == "auto":
+        parser.error(
+            f"-c {CameraType.INFRARED.value} requires an explicit --board-version "
+            f"(choices: {', '.join(PROFILES_BY_NAME)}); auto-detection needs the "
+            "ArUco marker, which is not visible in IR"
+        )
 
-    # Parse time arguments
-    start_time1, end_time1 = parse_time(args.start1), parse_time(args.end1)
-    start_time2, end_time2 = parse_time(args.start2), parse_time(args.end2)
+    board = PROFILES_BY_NAME.get(args.board_version) if args.board_version != "auto" else None
+
+    # Parse the search windows; they are resolved against the video and merged later
+    windows = []
+    for start_str, end_str in args.window or []:
+        try:
+            start, end = parse_time(start_str), parse_time(end_str)
+        except ValueError as e:
+            parser.error(f"argument --window: {e}")
+        if start >= 0 and start >= end:
+            parser.error(f"argument --window: start {start_str} is not before end {end_str}")
+        windows.append((start, end))
 
     files = set()
     for path in args.path:
         path_obj = Path(path)
         if path_obj.is_dir():
             # walk dir recursively
-            for file in (
-                path_obj.rglob("*") if args.recurse_in_dir else path_obj.glob("*")
-            ):
+            for file in path_obj.rglob("*") if args.recurse_in_dir else path_obj.glob("*"):
                 if file.is_file():
                     files.add(file.resolve())
         elif path_obj.is_file():
@@ -191,7 +191,7 @@ def main():
             errprint(f"Invalid path: {path}")
             return
 
-    videos = sorted([f for f in files if f.suffix.lower() in [".mp4", ".avi", ".mov"]])
+    videos = sorted([f for f in files if f.suffix.lower() in VIDEO_SUFFIXES])
     images = sorted([f for f in files if f.suffix.lower() in [".png", ".jpg", ".jpeg"]])
     ftk_recordings = sorted([f for f in files if f.suffix.lower() == ".csv"])
 
@@ -201,14 +201,15 @@ def main():
         )
         for file in videos + images + ftk_recordings:
             print(f"    {file}")
-        while True and not args.yes:
-            response = input("Do you want to continue (Y/n): ").strip().lower()
-            if response in ["y", "yes", ""]:
-                break
-            elif response in ["n", "no"]:
-                return
-            else:
-                print("Please enter 'y' or 'n'.")
+        if not args.yes:
+            while True:
+                response = input("Do you want to continue (Y/n): ").strip().lower()
+                if response in ["y", "yes", ""]:
+                    break
+                elif response in ["n", "no"]:
+                    return
+                else:
+                    print("Please enter 'y' or 'n'.")
 
     if args.debug:
         os.makedirs(args.debug, exist_ok=True)
@@ -227,9 +228,7 @@ def main():
             result = json.load(file)
         print(f"Loaded previous results from {args.output}")
 
-    for file in tqdm(
-        videos + images + ftk_recordings, desc="Processing files", position=0
-    ):
+    for file in tqdm(videos + images + ftk_recordings, desc="Processing files", position=0):
         if str(file) in result:
             print(f"Skipping {file}, already processed.")
             continue
@@ -246,29 +245,30 @@ def main():
             export_dir = mkdir_unique(name, args.export_frames)
 
         ret = None
+        entry_type = None
         if file in videos:
+            entry_type = "video"
             statistics = process_video(
                 file,
                 CameraType(args.camera_type),
-                export_dir,
-                args.stride,
-                debug_dir,
-                start_time1,
-                end_time1,
-                start_time2,
-                end_time2,
+                export_dir=export_dir,
+                stride=args.stride,
+                debug_dir=debug_dir,
+                windows=windows,
                 board=board,
             )
             if statistics is not None:
                 ret = statistics.to_dict()
 
         elif file in images:
+            entry_type = "image"
             ret = process_image(file, CameraType(args.camera_type), debug_dir, board)
         elif file in ftk_recordings:
+            entry_type = "ftk"
             ret = process_ftk_recording(file, debug_dir)
 
         if ret is not None:
-            result[str(file)] = ret
+            result[str(file)] = {"type": entry_type, **ret}
         else:
             errprint(f"Error: Unable to time-sync {file}.")
 

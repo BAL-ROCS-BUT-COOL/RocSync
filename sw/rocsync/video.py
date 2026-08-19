@@ -2,70 +2,168 @@ import math
 import os
 import queue
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.ticker import MaxNLocator
-from sklearn.linear_model import RANSACRegressor
-from sklearn.metrics import root_mean_squared_error
 from tqdm import tqdm
 
-from rocsync.printer import *
+from rocsync.clips import MAX_FRAMES_IN_FLIGHT
+from rocsync.printer import errprint, print, printresult, warnprint
+from rocsync.timeline import detect_dropouts, fit_timeline, median_frame_period
 from rocsync.video_statistics import VideoStatistics
 from rocsync.vision import CameraType, process_frame
 
 
-def read_frames_async(cap, frame_queue, start_frame=0, end_frame=None):
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            frame_queue.put((None, None))
+def read_frames_async(
+    cap, frame_queue, skip_before_pts_ms=None, stop_after_pts_ms=None, stop_event=None
+):
+    """Push (frame, frame number, pts) onto the queue until EOF or the window ends.
+
+    Seeking is deliberately not used to reach the window: OpenCV maps a requested
+    time onto a frame index through the container's average frame rate, which is
+    exactly the quantity a dropped span invalidates -- on a file with a 1.5 s hole,
+    seeking to 2 s lands 8 frames past it. The file is scanned from the start
+    instead, and each frame's own presentation timestamp decides where it belongs.
+    """
+
+    def put(item):
+        # Wake up regularly so a consumer that went away cannot wedge this thread
+        while stop_event is None or not stop_event.is_set():
+            try:
+                frame_queue.put(item, timeout=0.1)
+                return True
+            except queue.Full:  # noqa: PERF203 - retrying is the point of the loop
+                continue
+        return False
+
+    # Frames outside the window are grabbed but never retrieved into an image
+    while stop_event is None or not stop_event.is_set():
+        if not cap.grab():
+            put((None, None, None))
             break
 
+        # Straight after grabbing, this is the grabbed frame's own timestamp
+        pts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
         frame_number = int(cap.get(cv2.CAP_PROP_POS_FRAMES) - 1)
-        if end_frame is not None and frame_number >= end_frame:
-            frame_queue.put((None, None))
+
+        if stop_after_pts_ms is not None and pts_ms > stop_after_pts_ms:
+            put((None, None, None))
+            break
+        if skip_before_pts_ms is not None and pts_ms < skip_before_pts_ms:
+            continue
+
+        ret, frame = cap.retrieve()
+        if not ret:
+            put((None, None, None))
             break
 
-        frame_queue.put((frame, frame_number))
+        if not put((frame, frame_number, pts_ms)):
+            break
 
 
-def export_frame_async(frame_queue, y_pred, path):
-    frame, frame_number = frame_queue.get()  # blocking wait
-    if frame is None:
-        errprint("Error: Input stream ended unexpectedly.")
-        return
-    cv2.imwrite(f"{path}/f{frame_number}_s{y_pred[frame_number]:.0f}.png", frame)
+def probe_last_pts_ms(video_path):
+    """Presentation timestamp of the last frame, or None if no frame could be read.
+
+    Seeking near the end is only a starting point: whatever frame the seek lands on,
+    grabbing forward to EOF finds the true last frame, so a frame count the container
+    reports wrongly cannot skew the result.
+    """
+    cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        return None
+    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    try:
+        # An over-reported frame count seeks past the end, so retry further back
+        for first_frame in (max(0, n_frames - 1), max(0, n_frames // 2), 0):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, first_frame)
+            last_pts_ms = None
+            while cap.grab():
+                last_pts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+            if last_pts_ms is not None:
+                return last_pts_ms
+    finally:
+        cap.release()
+    return None
 
 
-def export_frames(video_path, output_path, y_pred):
+def resolve_windows(windows, video_path):
+    """Turns requested search windows into absolute [start, end] spans in seconds.
+
+    A negative bound is an offset from the last frame's presentation timestamp. The
+    result is sorted, and overlapping spans are merged so that no frame is scanned --
+    and no gap between frames counted -- twice.
+    """
+    if not windows:
+        return [(0.0, math.inf)]
+
+    last_pts_s = None
+    if any(bound < 0 for window in windows for bound in window):
+        last_pts_ms = probe_last_pts_ms(video_path)
+        if last_pts_ms is None:
+            raise ValueError("no frame could be read to resolve a window bound given from the end")
+        last_pts_s = last_pts_ms / 1000.0
+
+    resolved = []
+    for start, end in windows:
+        if start < 0:
+            start = max(0.0, last_pts_s + start)
+        if end < 0:
+            end = max(0.0, last_pts_s + end)
+        if start >= end:
+            raise ValueError(f"window [{start:.3f}s, {end:.3f}s] starts at or after it ends")
+        resolved.append((start, end))
+
+    resolved.sort()
+    merged = [resolved[0]]
+    for start, end in resolved[1:]:
+        merged_start, merged_end = merged[-1]
+        if start <= merged_end:  # overlapping or touching
+            merged[-1] = (merged_start, max(merged_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def export_frames(video_path, output_path, fit, n_frames=None):
     cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
     # cap.set(cv2.CAP_PROP_FFMPEG_HWACCEL, cv2.CAP_FFMPEG_HWACCEL_NVDEC)  # try to use
     if not cap.isOpened():
         errprint(f"Error: Could not open video: {video_path}")
         return
-    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if n_frames is None:
+        n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     os.makedirs(output_path, exist_ok=True)
 
     # Read frames in separate thread
-    frame_queue = queue.Queue(maxsize=100)
+    frame_queue = queue.Queue(maxsize=MAX_FRAMES_IN_FLIGHT)
     thread = threading.Thread(target=read_frames_async, args=(cap, frame_queue))
     thread.daemon = True
     thread.start()
 
-    # Export frames concurrently using multiple threads
-    with ThreadPoolExecutor(max_workers=100) as executor:
+    # Export frames concurrently, but only as fast as they can be encoded
+    in_flight = threading.Semaphore(MAX_FRAMES_IN_FLIGHT)
+    with ThreadPoolExecutor() as executor:
         futures = []
-        for _ in range(n_frames):
-            futures.append(
-                executor.submit(export_frame_async, frame_queue, y_pred, output_path)
+        pbar = tqdm(total=n_frames, desc="Exporting frames", position=1)
+        while True:
+            frame, frame_number, pts_ms = frame_queue.get()  # blocking wait
+            if frame is None:
+                break
+            timestamp = fit.clock_rate * pts_ms + fit.clock_offset_ms
+            in_flight.acquire()
+            future = executor.submit(
+                cv2.imwrite,
+                f"{output_path}/f{frame_number}_s{timestamp:.0f}.png",
+                frame,
             )
-        for future in tqdm(
-            as_completed(futures), total=n_frames, desc="Exporting frames", position=1
-        ):
+            future.add_done_callback(lambda _: in_flight.release())
+            futures.append(future)
+            pbar.update(1)
+        pbar.close()
+        for future in futures:
             future.result()
     cap.release()
 
@@ -73,64 +171,82 @@ def export_frames(video_path, output_path, y_pred):
 def process_video_window(
     video_path: str,
     camera_type: CameraType,
-    window_start: int,
-    window_end: int,
+    window_start: float,
+    window_end: float,
     stride=None,
-    debug_dir: str = None,
-    brightness_boost: int = None,
+    debug_dir: str | None = None,
     board=None,
 ):
     cap = cv2.VideoCapture(video_path)
 
     # Extract video metadata
     fps = cap.get(cv2.CAP_PROP_FPS)
-    start_frame = int(max(0, math.floor(window_start * fps)))
-    end_frame = int(
-        min(math.ceil(window_end * fps) + 1, cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    )  # end_frame is exclusive
+    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # The window is a time span; presentation timestamps are in milliseconds
+    window_start_ms = window_start * 1000.0
+    window_end_ms = window_end * 1000.0
 
     # Read frames in separate thread
-    frame_queue = queue.Queue(maxsize=100)
+    frame_queue = queue.Queue(maxsize=MAX_FRAMES_IN_FLIGHT)
+    stop_event = threading.Event()
     thread = threading.Thread(
-        target=read_frames_async, args=(cap, frame_queue, start_frame, end_frame)
+        target=read_frames_async,
+        args=(cap, frame_queue, window_start_ms, window_end_ms, stop_event),
     )
-    thread.daemon = False
+    thread.daemon = True
     thread.start()
 
     timestamps = {}
+    frame_times = {}
     scan_window = 0
     if stride is None:
-        stride = int(fps)
+        # One analyzed frame per second, or every frame without a usable frame rate
+        stride = int(fps) if fps >= 1 else 1
 
+    expected_frames = n_frames
+    if fps > 0 and math.isfinite(window_end - window_start):
+        expected_frames = min(n_frames, math.ceil((window_end - window_start) * fps) + 1)
+    window_label = f"[{window_start:.3f}s, " + (
+        "end]" if math.isinf(window_end) else f"{window_end:.3f}s]"
+    )
     pbar = tqdm(
-        range(start_frame, end_frame),
-        desc=f"Analyzing frames in time window [{window_start:.3f}s, {window_end:.3f}s] --> Found {len(timestamps)} timestamps",
+        total=expected_frames,
+        desc=f"Analyzing frames in time window {window_label} --> Found {len(timestamps)} timestamps",
         position=1,
     )
-    for _ in pbar:
-        frame, frame_number = frame_queue.get()  # blocking wait
-        if frame is None:
-            errprint(
-                "Error: Input stream ended unexpectedly. Could be a sign of skipped frames."
-            )
-            break
-        if scan_window > 0 or frame_number % stride == 0:
-            rocsync_detected, timestamp = process_frame(
-                frame, camera_type, frame_number, board, debug_dir, brightness_boost
-            )
-            scan_window -= 1
-            if timestamp is not None:
-                timestamps[frame_number] = timestamp
-            if rocsync_detected:
-                scan_window = 5
-                pbar.set_description(
-                    f"Analyzing frames in time window [{window_start:.3f}s, {window_end:.3f}s] --> Found {len(timestamps)} timestamps"
+    try:
+        while True:
+            frame, frame_number, pts_ms = frame_queue.get()  # blocking wait
+            if frame is None:
+                break
+            pbar.update(1)
+
+            # Every frame read, analyzed or not: period and dropouts come from this
+            frame_times[frame_number] = pts_ms
+
+            if not window_start_ms <= pts_ms <= window_end_ms:
+                continue
+
+            if scan_window > 0 or frame_number % stride == 0:
+                rocsync_detected, timestamp = process_frame(
+                    frame, camera_type, frame_number, board, debug_dir
                 )
+                scan_window -= 1
+                if timestamp is not None:
+                    timestamps[frame_number] = timestamp
+                if rocsync_detected:
+                    scan_window = 5
+                    pbar.set_description(
+                        f"Analyzing frames in time window {window_label} --> Found {len(timestamps)} timestamps"
+                    )
+    finally:
+        pbar.close()
+        stop_event.set()
+        thread.join(timeout=5)
+        cap.release()
 
-    thread.join()
-    cap.release()
-
-    return timestamps
+    return timestamps, frame_times
 
 
 def process_video(
@@ -139,11 +255,7 @@ def process_video(
     export_dir=None,
     stride=None,
     debug_dir=None,
-    window1_start=None,
-    window1_end=None,
-    window2_start=None,
-    window2_end=None,
-    brightness_boost=None,
+    windows=None,
     board=None,
 ):
     # Get video metadata
@@ -156,141 +268,152 @@ def process_video(
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    expected_duration = (n_frames - 1) / fps * 1000
     cap.release()
 
-    if window1_start is None:
-        window1_start = 0
-    elif window1_start < 0:
-        window1_start = max(0, (expected_duration / 1000) + window1_start)
+    # Last-resort frame period only; the span is measured off the frames themselves
+    nominal_period = 1000 / fps if fps > 0 else None
 
-    if window1_end is None:
-        window1_end = expected_duration / 1000
-    elif window1_end < 0:
-        window1_end = max(0, (expected_duration / 1000) + window1_end)
+    # Whether the reported span and dropouts describe the file or just the windows
+    timeline_windowed = bool(windows)
 
-    if window2_start is None:
-        window2_start = 0
-    elif window2_start < 0:
-        window2_start = max(0, (expected_duration / 1000) + window2_start)
-
-    if window2_end is None:
-        window2_end = expected_duration / 1000
-    elif window2_end < 0:
-        window2_end = max(0, (expected_duration / 1000) + window2_end)
+    try:
+        windows = resolve_windows(windows, video_path)
+    except ValueError as e:
+        errprint(f"Error: Unable to resolve the search windows: {e}")
+        return
 
     # Analyze frames
-    timestamps = process_video_window(
-        video_path,
-        camera_type,
-        window1_start,
-        window1_end,
-        stride,
-        debug_dir,
-        brightness_boost,
-        board,
-    )
-
-    if (
-        window2_start > window1_end or window2_end < window1_start
-    ):  # check if window2 is not overlapping with window1
-        # TODO: better window checking
-        timestamps2 = process_video_window(
+    timestamps = {}
+    frame_times = {}
+    window_frame_times = []
+    for window_start, window_end in windows:
+        window_timestamps, window_times = process_video_window(
             video_path,
             camera_type,
-            window2_start,
-            window2_end,
+            window_start,
+            window_end,
             stride,
             debug_dir,
-            brightness_boost,
             board,
         )
-        timestamps = {**timestamps, **timestamps2}
+        timestamps.update(window_timestamps)
+        frame_times.update(window_times)
+        window_frame_times.append(window_times)
 
     if len(timestamps) < 2:
         errprint("Error: Insufficient number of timestamped frames.")
         return
+    if not frame_times:
+        errprint("Error: No frames could be read.")
+        return
 
-    # Assuming constant frame rate, fit robust linear model
-    x = np.array(list(timestamps.keys())).reshape(-1, 1)
-    y = np.array([start for start, _ in timestamps.values()])
-    model = RANSACRegressor(
-        residual_threshold=1000 / fps,  # max one frame deviation
-        max_trials=1000,  # more trials for more consistent results
-        random_state=0,  # deterministic results
-    )
-    model.fit(x, y)
+    # Fit board time against the frames' own presentation timestamps, both in ms
+    period = median_frame_period(frame_times.values(), fallback=nominal_period)
+    if not period:
+        errprint("Error: Unable to determine the frame period.")
+        return
+    try:
+        fit = fit_timeline(frame_times, timestamps, fallback_period=nominal_period)
+    except ValueError as e:
+        errprint(f"Error: Unable to fit the frame timeline: {e}")
+        return
 
-    # Assert that we have at least 80% inliers
-    if np.sum(model.inlier_mask_) < 0.8 * len(timestamps):
+    if len(fit.order) < len(timestamps):
         warnprint(
-            f"WARNING: Estimated model has fewer than 80% inliers ({np.sum(model.inlier_mask_) / len(timestamps):.2%})."
+            f"WARNING: {len(timestamps) - len(fit.order)} timestamped frames have no "
+            f"presentation timestamp and were excluded from the fit."
         )
 
-    # Predict timestamps for all frames
-    x_range = np.arange(0, n_frames).reshape(-1, 1)
-    y_pred = model.predict(x_range)
+    # Warn below 80% inliers
+    if np.sum(fit.inlier_mask) < 0.8 * len(fit.order):
+        warnprint(
+            f"WARNING: Estimated model has fewer than 80% inliers ({np.sum(fit.inlier_mask) / len(fit.order):.2%})."
+        )
+    if abs(fit.clock_rate - 1) > 0.05:
+        warnprint(
+            f"WARNING: Container clock runs at {fit.clock_rate:.4f}x board time; "
+            f"expected approximately 1x."
+        )
 
-    # Add error to timestamps
-    errors = model.predict(x) - y
-    timestamps = {
-        frame_number: (start, end, error)
-        for (frame_number, (start, end)), error in zip(timestamps.items(), errors)
+    # Counted per window, so the span between disjoint windows is not a dropout
+    n_gaps = n_dropped_frames = 0
+    largest_gap_ms = 0.0
+    gaps = []
+    for window_times in window_frame_times:
+        window_gaps, window_dropped, window_largest, found = detect_dropouts(
+            window_times.values(), period
+        )
+        n_gaps += window_gaps
+        n_dropped_frames += window_dropped
+        largest_gap_ms = max(largest_gap_ms, window_largest)
+        gaps.extend(found)
+    if n_dropped_frames:
+        warnprint(
+            f"WARNING: {n_dropped_frames} frames missing from the container in "
+            f"{n_gaps} gap(s), largest {largest_gap_ms / 1000:.3f} s."
+        )
+
+    # Add error to timestamps, following the order the fit used
+    x = np.array([frame_times[k] for k in fit.order])
+    y = np.array([timestamps[k][0] for k in fit.order])
+    errors = fit.predict(x) - y
+    annotated_timestamps = {
+        frame_number: (*timestamps[frame_number], error)
+        for frame_number, error in zip(fit.order, errors, strict=True)
     }
 
     # Remove outliers
     filtered_timestamps = {
-        k: v for i, (k, v) in enumerate(timestamps.items()) if model.inlier_mask_[i]
+        k: annotated_timestamps[k]
+        for k, is_inlier in zip(fit.order, fit.inlier_mask, strict=True)
+        if is_inlier
     }
     rejected_timestamps = {
-        k: v for i, (k, v) in enumerate(timestamps.items()) if not model.inlier_mask_[i]
+        k: annotated_timestamps[k]
+        for k, is_inlier in zip(fit.order, fit.inlier_mask, strict=True)
+        if not is_inlier
     }
-    filtered_x = np.array(list(filtered_timestamps.keys())).reshape(-1, 1)
-    filtered_y = np.array([start for start, _, _ in filtered_timestamps.values()])
 
-    # Calculate statistics
+    # Span anchored on frames actually present, so nothing is extrapolated
+    fit_stats = fit.to_dict()
+    pts_min, pts_max = min(frame_times.values()), max(frame_times.values())
     exposure_times = [end - start for start, end, _ in filtered_timestamps.values()]
-    measured_duration = y_pred[-1] - y_pred[0]
     statistics = VideoStatistics(
         n_frames=n_frames,
-        n_considered_frames=len(filtered_timestamps),
-        n_rejected_frames=len(timestamps) - len(filtered_timestamps),
-        r2_before=model.score(x, y),
-        rmse_before=root_mean_squared_error(y, model.predict(x)),
-        r2_after=model.score(filtered_x, filtered_y),
-        rmse_after=root_mean_squared_error(filtered_y, model.predict(filtered_x)),
-        expected_duration=expected_duration,
-        measured_duration=measured_duration,
-        expected_fps=fps,
-        measured_fps=(n_frames - 1) / measured_duration * 1000,
-        speed_factor=measured_duration / expected_duration,
-        first_frame=y_pred[0],
-        last_frame=y_pred[-1],
+        container_duration=pts_max - pts_min,
+        board_duration=fit_stats["last_frame"] - fit_stats["first_frame"],
+        nominal_fps=fps,
+        measured_fps=1000 / period,
+        median_frame_period=period,
+        n_gaps=n_gaps,
+        n_dropped_frames=n_dropped_frames,
+        largest_gap_ms=largest_gap_ms,
+        timeline_windowed=timeline_windowed,
         mean_exposure_time=np.mean(exposure_times),
         min_exposure_time=np.min(exposure_times),
         max_exposure_time=np.max(exposure_times),
         std_exposure_time=np.std(exposure_times),
         considered_timestamps=filtered_timestamps,
         rejected_timestamps=rejected_timestamps,
-        # interpolated_timestamps=y_pred.tolist(),
+        **fit_stats,
     )
 
     print_statistics(statistics)
 
     if debug_dir:
         plot_timechart(
-            filtered_x,
-            filtered_y,
-            x_range,
-            y_pred,
+            fit,
+            filtered_timestamps,
+            rejected_timestamps,
+            frame_times,
             exposure_times,
-            expected_duration,
+            gaps,
             debug_dir,
         )
         plot_exposure_histogram(exposure_times, debug_dir)
 
     if export_dir:
-        export_frames(video_path, export_dir, y_pred)
+        export_frames(video_path, export_dir, fit, n_frames)
 
     return statistics
 
@@ -319,18 +442,30 @@ def print_statistics(statistics: VideoStatistics):
         f"{statistics.rmse_before:.2f}/{statistics.rmse_after:.2f} ms",
         statistics.rmse_after < 2,
     )
-    print(format_str.format("First frame:", f"{statistics.first_frame/1000:.3f} s"))
-    print(format_str.format("Last frame:", f"{statistics.last_frame/1000:.3f} s"))
+    printresult(
+        "Dropped frames",
+        f"{statistics.n_dropped_frames} in {statistics.n_gaps} gap(s), max {statistics.largest_gap_ms / 1000:.3f} s",
+        statistics.n_dropped_frames == 0,
+    )
+    print(format_str.format("First frame:", f"{statistics.first_frame / 1000:.3f} s"))
+    print(format_str.format("Last frame:", f"{statistics.last_frame / 1000:.3f} s"))
     print(
         format_str.format(
-            "Framerate (expected/measured):",
-            f"{statistics.expected_fps:.3f}/{statistics.measured_fps:.3f} fps ({statistics.speed_factor:.6f}x)",
+            "Framerate (nominal/measured):",
+            f"{statistics.nominal_fps:.3f}/{statistics.measured_fps:.3f} fps",
         )
     )
     print(
         format_str.format(
-            "Duration (expected/measured):",
-            f"{statistics.expected_duration/1000:.3f}/{statistics.measured_duration/1000:.3f} s (Δ={statistics.measured_duration-statistics.expected_duration:.2f} ms)",
+            "Clock rate (board/container):",
+            f"{statistics.clock_rate:.6f}x",
+        )
+    )
+    scope = "analyzed window" if statistics.timeline_windowed else "container"
+    print(
+        format_str.format(
+            f"Duration ({scope}/board):",
+            f"{statistics.container_duration / 1000:.3f}/{statistics.board_duration / 1000:.3f} s (Δ={statistics.board_duration - statistics.container_duration:.2f} ms)",
         )
     )
     print(
@@ -342,38 +477,69 @@ def print_statistics(statistics: VideoStatistics):
     print(71 * "-")
 
 
-def plot_timechart(x, y, x_range, y_pred, exposure_times, expected_duration, debug_dir):
-    plt.figure()
-    plt.scatter(x, y, color="blue", label="Measurements")
-    plt.plot(x_range, y_pred, color="blue", label="Measured frametime")
-    plt.plot(
-        x_range,
-        np.linspace(y_pred[0], y_pred[0] + expected_duration, len(x_range)),
+def plot_timechart(
+    fit,
+    filtered_timestamps,
+    rejected_timestamps,
+    frame_times,
+    exposure_times,
+    gaps,
+    debug_dir,
+):
+    pts_min, pts_max = min(frame_times.values()), max(frame_times.values())
+    span = np.array([pts_min, pts_max])
+    x = np.array([frame_times[k] for k in filtered_timestamps]) / 1000
+    y = np.array([start for start, _, _ in filtered_timestamps.values()])
+
+    fig, ax = plt.subplots()
+    ax.scatter(x, y, color="blue", label="Measurements")
+    ax.plot(span / 1000, fit.predict(span), color="blue", label="Fitted frametime")
+
+    # A matched clock runs parallel to this, so drift shows as divergence from it
+    ax.plot(
+        span / 1000,
+        fit.predict(pts_min) + (span - pts_min),
         color="red",
-        label="Calculated frametime",
+        label="Unscaled container clock",
     )
-    plt.xlabel("Frame number")
-    plt.ylabel("Time relative to RocSync [ms]")
-    plt.title("Frame timing")
-    plt.gca().ticklabel_format(style="plain", useOffset=False)
-    plt.legend()
-    plt.grid(True)
-    ax2 = plt.gca().twinx()
+
+    if rejected_timestamps:
+        ax.scatter(
+            np.array([frame_times[k] for k in rejected_timestamps]) / 1000,
+            [start for start, _, _ in rejected_timestamps.values()],
+            color="red",
+            marker="x",
+            label="Rejected outliers",
+        )
+    for before, after, _ in gaps:
+        ax.axvspan(before / 1000, after / 1000, color="grey", alpha=0.3)
+    if gaps:
+        ax.axvspan(np.nan, np.nan, color="grey", alpha=0.3, label="Dropped frames")
+
+    ax.set_xlabel("Presentation timestamp [s]")
+    ax.set_ylabel("Time relative to RocSync [ms]")
+    ax.set_title("Frame timing")
+    ax.ticklabel_format(style="plain", useOffset=False)
+    ax.legend()
+    ax.grid(True)
+    ax2 = ax.twinx()
     ax2.scatter(x, exposure_times, color="green", label="Exposure time [ms]")
     ax2.set_ylabel("Exposure time [ms]")
     ax2.ticklabel_format(style="plain", useOffset=False)
     ax2.yaxis.set_major_locator(MaxNLocator(integer=True))
     ax2.legend(loc="upper right")
-    plt.savefig(f"{debug_dir}/timestamps.png")
+    fig.savefig(f"{debug_dir}/timestamps.png")
+    plt.close(fig)
 
 
 def plot_exposure_histogram(exposure_times, debug_dir):
-    plt.figure()
+    fig, ax = plt.subplots()
     unique_values, counts = np.unique(exposure_times, return_counts=True)
-    bar = plt.bar(unique_values, counts)
-    plt.bar_label(bar, counts)
-    plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
-    plt.xlabel("Exposure time [ms]")
-    plt.ylabel("Number of measured frames")
-    plt.title("Exposure time histogram")
-    plt.savefig(f"{debug_dir}/exposure.png")
+    bar = ax.bar(unique_values, counts)
+    ax.bar_label(bar, counts)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.set_xlabel("Exposure time [ms]")
+    ax.set_ylabel("Number of measured frames")
+    ax.set_title("Exposure time histogram")
+    fig.savefig(f"{debug_dir}/exposure.png")
+    plt.close(fig)

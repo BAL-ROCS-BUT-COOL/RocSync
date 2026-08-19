@@ -1,4 +1,25 @@
 # Multi-Camera Sync Toolkit
+
+## ⚙️ Requirements
+
+These scripts live in `sw/evaluation/` and import the shared timing code from the `rocsync`
+package, so set that environment up once:
+
+```bash
+cd path/to/RocSync/sw
+uv sync
+```
+
+Run them with `uv run` so they find the package:
+
+```bash
+uv run python evaluation/check_time_sync_all.py --dataset-folder /path/to/dataset ...
+```
+
+They read each frame's presentation timestamp out of the video itself and map it to
+board time through the fit in `time_synchronization_*.json`, so a recording that
+dropped frames keeps the missing span where it happened.
+
 ## 📂 Folder Setup
 
 Your dataset folder should look like this:
@@ -13,11 +34,7 @@ dataset_folder/
 │
 └── time sync/
     ├── clips_config.json
-    ├── time_synchronization.json
-    ├── extract_synced_videos.py
-    ├── extract_clips_as_png.py
-    ├── check_time_sync_all.py
-    └── ...
+    └── time_synchronization.json
 ```
 
 ### Description:
@@ -28,6 +45,11 @@ dataset_folder/
   * `clips_config.json`: defines which clips to extract.
   * `time_synchronization_*.json`: contains timing information for each camera.
 
+The scripts are not part of the dataset. Point them at it with `--dataset-folder`, which every
+script accepts. Its default is the parent of the script's own location, so it is only useful if
+you copy a script into the dataset folder; when running from `sw/evaluation/`, pass it
+explicitly.
+
 ---
 
 ## ✅ Check synchronization of all clips
@@ -36,7 +58,8 @@ Once you have a finished `time_synchronization_*.json` file, check if all videos
 
 Run the script:
 ```bash
-python path/to/check_time_sync_all.py \
+uv run python evaluation/check_time_sync_all.py \
+    --dataset-folder /path/to/dataset_folder \
     --time HH:MM:SS.mmm \
     --from-camera "cameraX"
 ```
@@ -61,13 +84,13 @@ This guide explains how to organize your dataset and run the `extract_synced_vid
 Run the extraction script from your terminal:
 
 ```bash
-python extract_synced_videos.py 
+uv run python evaluation/extract_synced_videos.py --dataset-folder /path/to/dataset_folder
 ```
 
 ### Optional Arguments:
 
 * `--dataset-folder`
-  Path to your dataset folder (the one containing `raw_videos/` and `time sync/`). Not necessary if you follow the **folder setup** above.
+  Path to your dataset folder (the one containing `raw_videos/` and `time sync/`).
 
 * `--target-fps`
   Desired output frame rate (e.g., 30).
@@ -101,13 +124,13 @@ This guide explains how to organize your dataset and run the `extract_clips_as_p
 Run the script from your terminal:
 
 ```bash
-python extract_clips_as_png.py 
+uv run python evaluation/extract_clips_as_png.py --dataset-folder /path/to/dataset_folder
 ```
 
 ### Optional Arguments:
 
 * `--dataset-folder`
-  Path to your dataset folder (the one containing `raw_videos/` and `time sync/`). Not necessary if you follow the **folder setup** above.
+  Path to your dataset folder (the one containing `raw_videos/` and `time sync/`).
 
 * `--target-fps`
   Desired output frame rate (e.g., 30).
@@ -121,8 +144,8 @@ python extract_clips_as_png.py
 * `--clips-json`
   Path to the `clips_config.json` file
 
-* `--only-specified`
-  If set, only produce PNGs for the camera given by `--from-camera`.
+* `--only-for-camera`
+  Add this to only produce PNGs for one specific camera (basename without extension, e.g. `Cam1` or `Cam1_raw`)
   
 
 ### Output:

@@ -606,7 +606,11 @@ class AnnotationTool:
             # Run pipeline
             self.stats = {}
             try:
-                process_frame(image, CameraType.RGB, 0, stats=self.stats)
+                # No area gate: the annotator should see every marker the detector found,
+                # however small — rejecting it is the benchmark's call, not the ground truth's.
+                process_frame(
+                    image, CameraType.RGB, 0, stats=self.stats, min_aruco_area_fraction=0.0
+                )
             except Exception as e:  # noqa: BLE001 — a bad frame must not kill the session
                 print(f"Pipeline error on {frame_key}: {e}", file=sys.stderr)
                 self.stats["rectified"] = None

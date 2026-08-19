@@ -44,6 +44,8 @@ The window shows two panels side-by-side:
   - When the pipeline found the ArUco marker but failed to detect the corner LEDs, the board is
     rectified from the marker alone and the counter and ring are read off that coarse view. It is
     an estimate to correct, not an annotation: refine the corner LEDs and the fit tightens.
+  - The pipeline's minimum marker-area gate is off here, so a board held far from the camera is
+    still offered for annotation; whether the benchmark run rejects it is measured separately.
   - If no ArUco marker was detected, a black image is shown with LED positions at their expected locations.
 
 On a video frame the top right also carries the frame's timing residual:

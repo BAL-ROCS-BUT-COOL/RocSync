@@ -263,12 +263,16 @@ def rectify_board(
     debug_dir=None,
     board_size=DEFAULT_BOARD_SIZE,
     stats=None,
+    min_aruco_area_fraction=MIN_ARUCO_AREA_FRACTION,
 ):
     """Locate the board in a frame and warp it onto a square pixel grid.
 
     Returns (detected, pcb, board): whether the board was seen at all, the
     rectified single-channel image or None if it could not be squared up, and the
     RectifiedBoard the reading should be decoded against.
+
+    `min_aruco_area_fraction` rejects frames where the board was held too far away; pass 0
+    to read whatever the marker detector found, however small.
     """
     _init_stats(stats)
     match camera_type:
@@ -311,7 +315,7 @@ def rectify_board(
             area_percentage = area / image_area
             if stats is not None:
                 stats["aruco_area_fraction"] = area_percentage
-            if area_percentage < MIN_ARUCO_AREA_FRACTION:
+            if area_percentage < min_aruco_area_fraction:
                 print(
                     f"Rejected {frame_number}: aruco marker only fills {area_percentage:.2%} of the image"
                 )
@@ -395,12 +399,20 @@ def process_frame(
     debug_dir=None,
     board_size=DEFAULT_BOARD_SIZE,
     stats=None,
+    min_aruco_area_fraction=MIN_ARUCO_AREA_FRACTION,
 ):
     """Board time (start_ms, end_ms) read off one frame, and whether a board was seen."""
     t_start = time.perf_counter()
     _init_stats(stats)
     detected, pcb, board = rectify_board(
-        image, camera_type, frame_number, board, debug_dir, board_size, stats
+        image,
+        camera_type,
+        frame_number,
+        board,
+        debug_dir,
+        board_size,
+        stats,
+        min_aruco_area_fraction,
     )
     if pcb is None or board is None:
         _finalize_stats(stats, t_start, detected, None)

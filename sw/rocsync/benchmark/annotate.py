@@ -44,6 +44,12 @@ from rocsync.vision import ARUCO_DICTIONARY, process_frame, read_counter, read_r
 # Every board rectifies to the same pixel grid, so one radius serves the whole GUI.
 LED_RADIUS_PX = BOARD_V1.rectify().led_sample_radius
 
+# Slack warped in around the board, so LEDs that a coarse fit pushes off the edge stay visible.
+BOARD_MARGIN_PX = 10
+
+# Length of the tick marks drawn along the board edge at each board corner
+BOARD_TICK_PX = 10
+
 
 # ── Board geometry helpers ──────────────────────────────────────────────────
 
@@ -147,6 +153,19 @@ def coarse_homography_from_aruco(stats, board):
     if H is None or not np.isfinite(H).all():
         return None
     return H
+
+
+def warp_board_view(image, H, board, margin=BOARD_MARGIN_PX):
+    """Rectify `image` into a board grid padded by `margin` px on every side."""
+    T = np.array([[1, 0, margin], [0, 1, margin], [0, 0, 1]], dtype=np.float64)
+    side = board.board_size + 2 * margin
+    return cv2.warpPerspective(image[:, :, 2], T @ np.asarray(H, dtype=np.float64), (side, side))
+
+
+def board_from_view(view, board, margin=BOARD_MARGIN_PX):
+    """The board itself, cropped back out of a padded view."""
+    bs = board.board_size
+    return view[margin : margin + bs, margin : margin + bs].copy()
 
 
 def decode_clock(rectified, board):
@@ -418,6 +437,7 @@ COLOR_RING_SEL = (0, 255, 0)  # green — ring selection highlight
 COLOR_TEXT = (0, 0, 0)  # black text on bright bg
 COLOR_STATUS_BG = (220, 220, 220)  # light gray
 COLOR_BOARD_TEXT = (255, 255, 255)  # white text on dark board
+COLOR_MARGIN = (180, 180, 180)  # light gray — board corner ticks inside the margin
 
 WINDOW_NAME = "RocSync Annotation"
 TARGET_HEIGHT = 800
@@ -506,6 +526,7 @@ class AnnotationTool:
         self.left_panel_w = 0
         self.left_scale = 1.0
         self.board_scale = 1.0
+        self._board_view = None  # rectified board plus margin, as drawn on the right
         self.status_msg = ""
         self._last_composite = None  # last frame, re-presented while work blocks the loop
         self._pending_key: int | None = None  # key caught by _pump, consumed by _image_loop
@@ -644,12 +665,11 @@ class AnnotationTool:
             # Warp with the annotation's own homography, saved or from the pipeline, so
             # the displayed image is consistent with to_original/to_board. Loading never
             # refits: a stored annotation keeps the homography it was accepted with.
+            self._board_view = None
             if self.annotation.homography is not None:
                 H = np.array(self.annotation.homography, dtype=np.float64)
-                mask = image[:, :, 2]
-                self.stats["rectified"] = cv2.warpPerspective(
-                    mask, H, (board.board_size, board.board_size)
-                )
+                self._board_view = warp_board_view(image, H, board)
+                self.stats["rectified"] = board_from_view(self._board_view, board)
             self._pump()
 
             # Demuxing for presentation timestamps blocks, so do it before the loop
@@ -796,10 +816,11 @@ class AnnotationTool:
         if x < self.left_panel_w:
             return None, None
         panel_x = x - self.left_panel_w
-        bx = int(panel_x / self.board_scale)
-        by = int(y / self.board_scale)
+        m = BOARD_MARGIN_PX
+        bx = int(panel_x / self.board_scale) - m
+        by = int(y / self.board_scale) - m
         bs = self.board.board_size
-        if bx < 0 or bx >= bs or by < 0 or by >= bs:
+        if bx < -m or bx >= bs + m or by < -m or by >= bs + m:
             return None, None
         return bx, by
 
@@ -964,8 +985,9 @@ class AnnotationTool:
                 self.mode = Mode.DRAGGING_CORNER
             if self._drag_started:
                 bs = self.board.board_size
-                cbx = max(0, min(bs - 1, bx))
-                cby = max(0, min(bs - 1, by))
+                m = BOARD_MARGIN_PX
+                cbx = max(-m, min(bs - 1 + m, bx))
+                cby = max(-m, min(bs - 1 + m, by))
                 self.annotation.corners[self._drag_idx]["position"] = self.annotation.to_original(
                     cbx, cby
                 )
@@ -1129,9 +1151,8 @@ class AnnotationTool:
         for i, c in enumerate(ann.corners):
             if not c["visible"]:
                 c["position"] = ann.to_original(*self.corner_pos[i])
-        mask = original[:, :, 2]  # red channel
-        bs = board.board_size
-        self.stats["rectified"] = cv2.warpPerspective(mask, H, (bs, bs))
+        self._board_view = warp_board_view(original, H, board)
+        self.stats["rectified"] = board_from_view(self._board_view, board)
         self._redecode_clock()
         return True
 
@@ -1197,18 +1218,22 @@ class AnnotationTool:
 
         # Right panel: rectified board with overlays
         bs = self.board.board_size
-        rectified = self.stats.get("rectified")
-        if rectified is not None:
-            if len(rectified.shape) == 2:
-                board_img = cv2.cvtColor(rectified, cv2.COLOR_GRAY2BGR)
-            else:
-                board_img = rectified.copy()
+        m = BOARD_MARGIN_PX
+        cs = bs + 2 * m
+        view = self._board_view
+        if view is not None:
+            board_img = cv2.cvtColor(view, cv2.COLOR_GRAY2BGR)
         else:
-            board_img = np.zeros((bs, bs, 3), dtype=np.uint8)
+            board_img = np.zeros((cs, cs, 3), dtype=np.uint8)
+        # Corner ticks marking where the board proper ends and the margin begins
+        for cx, sx in ((m, 1), (m + bs - 1, -1)):
+            for cy, sy in ((m, 1), (m + bs - 1, -1)):
+                cv2.line(board_img, (cx, cy), (cx + sx * BOARD_TICK_PX, cy), COLOR_MARGIN, 1)
+                cv2.line(board_img, (cx, cy), (cx, cy + sy * BOARD_TICK_PX), COLOR_MARGIN, 1)
 
         # ArUco overlay (always shown)
-        ax1, ay1 = self.aruco_x1, self.aruco_y1
-        ax2, ay2 = self.aruco_x2, self.aruco_y2
+        ax1, ay1 = self.aruco_x1 + m, self.aruco_y1 + m
+        ax2, ay2 = self.aruco_x2 + m, self.aruco_y2 + m
         if ann.aruco_visible:
             marker_size = ax2 - ax1
             marker = cv2.aruco.generateImageMarker(ARUCO_DICTIONARY, ann.aruco_id, marker_size)
@@ -1226,17 +1251,19 @@ class AnnotationTool:
         corner_labels = []
         for i, c in enumerate(ann.corners):
             cx, cy = ann.to_board(*c["position"])
+            cx, cy = cx + m, cy + m
             color = COLOR_ON if c["visible"] else COLOR_NOT_VIS
             cv2.circle(board_img, (cx, cy), LED_RADIUS_PX + 4, color, 2)
             corner_labels.append((str(i), cx + LED_RADIUS_PX + 8, cy + 6, color))
 
         # Counter bounding box
-        bx1, by1, bx2, by2 = self.counter_box
+        bx1, by1, bx2, by2 = (v + m for v in self.counter_box)
         bbox_color = COLOR_BOARD_TEXT if ann.counter_visible else COLOR_NOT_VIS
         cv2.rectangle(board_img, (bx1, by1), (bx2, by2), bbox_color, 1)
 
         # Counter LEDs
         for i, (cx, cy) in enumerate(self.counter_pos):
+            cx, cy = cx + m, cy + m
             if not ann.counter_visible:
                 color = COLOR_NOT_VIS
             elif ann.counter_leds[i]:
@@ -1247,6 +1274,7 @@ class AnnotationTool:
 
         # Ring LEDs
         for i, (rx, ry) in enumerate(self.ring_pos):
+            rx, ry = rx + m, ry + m
             if ann.ring_start == ann.ring_end:
                 color = COLOR_NOT_VIS
             else:
@@ -1261,7 +1289,7 @@ class AnnotationTool:
         board_scaled = cv2.resize(board_img, (h, h))
 
         self.left_panel_w = left_scaled.shape[1]
-        self.board_scale = h / bs
+        self.board_scale = h / cs
 
         # Board labels go on after the resize, so they are drawn at display
         # resolution rather than magnified along with the board.

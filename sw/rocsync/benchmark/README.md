@@ -38,7 +38,8 @@ The tool resumes from the first unannotated frame on restart.
 The window shows two panels side-by-side:
 
 - **Left**: Original image
-- **Right**: Rectified 640×640 board with color-coded LED overlays
+- **Right**: Rectified 640×640 board with color-coded LED overlays, drawn inside a 10 px margin
+  so LEDs that a loose fit pushes past the board edge stay visible and draggable
   - Red circle = ON, Blue circle = OFF, Gray circle = not visible
   - When the pipeline found the ArUco marker but failed to detect the corner LEDs, the board is
     rectified from the marker alone and the counter and ring are read off that coarse view. It is

@@ -52,6 +52,7 @@ OUTPUT_TIME_BASE = Fraction(1, 90000)
 CLOCK_RATE_SPREAD = 0.05  # stays inside process_video's own 5% sanity warning
 MUX_PAD_MS = 1000.0  # headroom so reordered decode timestamps stay above zero
 MAX_MARGIN_FRAMES = 5  # frames the codec may force outside the annotated window
+MAX_REPORTED_CONFLICTS = 5  # enough to see the pattern without burying the message
 
 
 class RetimeError(Exception):
@@ -94,8 +95,23 @@ def build_timeline(anchors, pts_by_index, clock_rate):
     """
     old = np.array([pts_by_index[index] for index, _ in anchors], dtype=float)
     board = np.array([board_ms for _, board_ms in anchors], dtype=float)
-    if np.any(np.diff(old) <= 0) or np.any(np.diff(board) <= 0):
-        raise RetimeError("annotated board times do not increase with the recording")
+    # Naming the frames, because the fix is to re-annotate them and a bare refusal
+    # leaves that search to the reader
+    conflicts = [
+        f"{anchors[i][0]}->{anchors[i + 1][0]} ({board[i]:.0f} -> {board[i + 1]:.0f} ms)"
+        for i in range(len(anchors) - 1)
+        if board[i + 1] <= board[i] or old[i + 1] <= old[i]
+    ]
+    if conflicts:
+        raise RetimeError(
+            "annotated board times do not increase with the recording at frames "
+            + ", ".join(conflicts[:MAX_REPORTED_CONFLICTS])
+            + (
+                f" and {len(conflicts) - MAX_REPORTED_CONFLICTS} more"
+                if len(conflicts) > MAX_REPORTED_CONFLICTS
+                else ""
+            )
+        )
     new = (board - board[0]) / clock_rate
     slope = (new[-1] - new[0]) / (old[-1] - old[0])
 

@@ -26,6 +26,7 @@ FRAME_KEY_SEPARATOR = "#"
 FRAME_INDEX_DIGITS = 6  # zero-padded so keys sort in frame order
 FRAME_CACHE_SIZE = 4  # a decoded 4K frame is ~25 MB
 FORWARD_GRAB_LIMIT = 12  # a seek re-decodes from the preceding keyframe anyway
+SEEK_BACKOFF_FRAMES = 32  # retry margin for a seek that landed past the frame wanted
 
 MIN_REFERENCE_FRAMES = 5  # a two-point fit is exact by construction and proves nothing
 
@@ -34,7 +35,7 @@ MIN_REFERENCE_FRAMES = 5  # a two-point fit is exact by construction and proves 
 # absorb the camera: the container stores a nominal frame rate while the sensor exposes
 # when it pleases, which on the dataset's 30 fps clips scatters by up to 9 ms.
 SYNTHESIZED_RESIDUAL_THRESHOLD_MS = 2.0
-MEASURED_RESIDUAL_FRACTION = 1 / 3  # of a source frame
+MEASURED_RESIDUAL_FRACTION = 1 / 2  # of a source frame
 MEASURED_RESIDUAL_MIN_MS = 2.0  # never tighter than the board itself resolves
 MEASURED_RESIDUAL_MAX_MS = 50.0  # below the ring period, so a counter step still shows
 
@@ -302,6 +303,7 @@ class FrameSource:
         self._cap = None
         self._cap_path = None
         self._next_index = -1  # index the open capture would read next; -1 forces a seek
+        self._pts: dict[Path, list[float] | None] = {}  # every frame's presentation timestamp
 
     def read(self, ref):
         """Decoded BGR image for `ref`, or None if it could not be read."""
@@ -325,19 +327,79 @@ class FrameSource:
                 return None
             self._cap, self._cap_path, self._next_index = cap, ref.path, 0
         cap = self._cap
+        pts = self._frame_pts(ref.path)
 
         ahead = ref.index - self._next_index
-        if 0 <= ahead <= FORWARD_GRAB_LIMIT:
-            for _ in range(ahead):
-                if not cap.grab():
-                    self._next_index = -1
-                    return None
-        else:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, ref.index)
+        frame = (
+            self._grab_forward(cap, ahead, pts, ref.index)
+            if 0 <= ahead <= FORWARD_GRAB_LIMIT
+            else None
+        )
+        if frame is None:
+            frame = self._seek_and_read(cap, pts, ref.index)
+        self._next_index = ref.index + 1 if frame is not None else -1
+        return frame
 
+    def _frame_pts(self, path):
+        """Presentation timestamps for `path`, or None when they cannot be read."""
+        if path not in self._pts:
+            self._pts[path] = frame_pts(path) or None
+        return self._pts[path]
+
+    def _window(self, pts, index):
+        """The timestamp span that belongs to frame `index` and to no other."""
+        low = (pts[index - 1] + pts[index]) / 2 if index > 0 else pts[index] - 1.0
+        high = (pts[index] + pts[index + 1]) / 2 if index + 1 < len(pts) else pts[index] + 1.0
+        return low, high
+
+    def _is_frame(self, cap, pts, index):
+        """Whether the frame just read off `cap` is the one `index` names."""
+        if pts is None or index >= len(pts):
+            return True
+        low, high = self._window(pts, index)
+        return low < cap.get(cv2.CAP_PROP_POS_MSEC) < high
+
+    def _grab_forward(self, cap, ahead, pts, index):
+        """Frame `index`, reached by reading on from where the capture stands.
+
+        None when it is not what came back, which leaves the caller to seek: an earlier
+        read may have been served a neighbouring frame, and counting on from there lands
+        every later frame one out.
+        """
+        for _ in range(ahead):
+            if not cap.grab():
+                return None
         success, frame = cap.read()
-        self._next_index = ref.index + 1 if success else -1
-        return frame if success else None
+        return frame if success and self._is_frame(cap, pts, index) else None
+
+    def _seek_and_read(self, cap, pts, index):
+        """Frame `index`, reached by seeking, or None if it could not be read.
+
+        `CAP_PROP_POS_FRAMES` converts the index into a timestamp through the stream's
+        average frame rate, so a recording whose frames are not spaced at that rate --
+        anything variable-rate, or cut from a faster source -- lands on a neighbour,
+        while the capture still reports the index that was asked for. The frame is
+        identified by its own timestamp instead: read on when the seek falls short, and
+        seek further back when it overshoots.
+        """
+        if pts is None or index >= len(pts):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+            success, frame = cap.read()
+            return frame if success else None
+
+        low, high = self._window(pts, index)
+        for start in (index, max(index - SEEK_BACKOFF_FRAMES, 0), 0):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+            while True:
+                if not cap.grab():
+                    return None
+                now = cap.get(cv2.CAP_PROP_POS_MSEC)
+                if now > low:
+                    break
+            if now < high:
+                success, frame = cap.retrieve()
+                return frame if success else None
+        return None
 
     def close(self):
         if self._cap is not None:

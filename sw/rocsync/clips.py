@@ -12,6 +12,7 @@ import numpy as np
 from tqdm import tqdm
 
 from rocsync.timecode import ms_to_timecode, timecode_to_ms, timecode_to_path_part
+from rocsync.timeline import frame_pts
 
 
 class Clip:
@@ -106,6 +107,20 @@ def select_frame_indices(
 # with the clip.
 MAX_FRAMES_IN_FLIGHT = 8
 
+SEEK_BACKOFF_FRAMES = 32  # retry margin for a seek that landed past the frame wanted
+
+
+def _grabbed_index(cap, timestamps, default):
+    """Index of the frame just grabbed, read off its own timestamp.
+
+    `default` stands in when there are no timestamps to compare against, which leaves
+    the seek trusted the way it always was.
+    """
+    if not timestamps:
+        return default
+    now = cap.get(cv2.CAP_PROP_POS_MSEC)
+    return min(range(len(timestamps)), key=lambda i: abs(timestamps[i] - now))
+
 
 def read_frames_at_indices(
     video_path: str,
@@ -126,6 +141,13 @@ def read_frames_at_indices(
     rather than re-reading them. Frames are not copied -- consumers that keep a
     frame beyond its iteration must copy it themselves.
 
+    Where the one seek lands is confirmed against the frame timestamps rather than
+    assumed: `CAP_PROP_POS_FRAMES` converts the index through the stream's average
+    frame rate, so a recording whose frames are not spaced at that rate -- anything
+    variable-rate, or cut from a faster source -- lands on a neighbour while still
+    reporting the index that was asked for, and every frame after it would then be
+    handed out under the wrong index.
+
     Stops early and warns if the source runs out of frames.
     """
     if not frame_indices:
@@ -138,13 +160,17 @@ def read_frames_at_indices(
     try:
         # Skipping to the first requested frame is the one seek worth doing.
         first = max(0, frame_indices[0])
+        starts = iter((first, max(first - SEEK_BACKOFF_FRAMES, 0), 0))
+        source_index = first
+        timestamps = []
         if first > 0:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, first)
+            timestamps = frame_pts(video_path)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, next(starts))
+            source_index = None  # where the seek landed, resolved off the first grab
 
         pbar = tqdm(total=len(frame_indices), desc=desc)
         try:
             out_index = 0
-            source_index = first
             while out_index < len(frame_indices):
                 if not cap.grab():
                     print(
@@ -152,6 +178,14 @@ def read_frames_at_indices(
                         f"{out_index}/{len(frame_indices)} requested frames"
                     )
                     return
+
+                if source_index is None:
+                    source_index = _grabbed_index(cap, timestamps, first)
+                    if source_index > first:
+                        # Overshot: seek again from further back, or give up and scan
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, next(starts, 0))
+                        source_index = None
+                        continue
 
                 # Frames between two wanted ones are grabbed but never retrieved,
                 # which skips converting and copying them into an image. Sampling

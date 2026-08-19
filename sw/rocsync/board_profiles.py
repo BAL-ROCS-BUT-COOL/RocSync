@@ -114,6 +114,7 @@ class BoardProfile:
     always_on_leds: dict  # {CameraType: np.ndarray Nx2}, N >= 4
     counter_led_coords: dict  # {CameraType: np.ndarray Nx2}, most significant bit first
     counter_bg_y: dict  # {CameraType: float} background sample row
+    # TODO the ~10 mm offset is inherited from the pixel-based layout; verify against the PCB
 
     def __hash__(self):
         return hash(self.name)

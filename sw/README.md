@@ -146,6 +146,18 @@ been time-synced:
 They expect a dataset folder containing `raw_videos/` and a `time sync/` subfolder. See
 [`evaluation/README.md`](evaluation/README.md) for the dataset layout and the full argument list.
 
+## Benchmarking
+`rocsync/benchmark/` measures the vision pipeline against a folder of validation images:
+
+| Tool | Purpose |
+| --- | --- |
+| `annotate.py` | Interactive GUI for building a `ground_truth.json` from validation images |
+| `validate.py` | Run the pipeline over every image and record what it decoded, with per-step timings |
+| `evaluate.py` | Score a validation run against the ground truth and report where it fails |
+
+See [`rocsync/benchmark/README.md`](rocsync/benchmark/README.md) for the annotation shortcuts and
+the full argument list.
+
 ## Development
 Everyone works against the same pinned environment, described by `pyproject.toml` and locked in
 `uv.lock`. Create it with:

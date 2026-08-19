@@ -1,3 +1,5 @@
+import time
+
 import cv2
 import numpy as np
 
@@ -10,6 +12,42 @@ from rocsync.camera import CameraType
 from rocsync.printer import print
 
 MIN_ARUCO_AREA_FRACTION = 0.002  # smallest marker area, as a fraction of the frame
+
+ARUCO_DICTIONARY = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+
+# Keys `rocsync.benchmark` expects to find in a stats dict, whether or not the frame decoded.
+_STATS_KEYS = (
+    "aruco_id",
+    "aruco_corners",
+    "corner_positions",
+    "homography",
+    "rectified",
+    "counter_leds",
+    "ring_leds",
+    "timestamp",
+)
+
+
+def _init_stats(stats):
+    """Give the benchmark a fully populated dict even when the frame fails early."""
+    if stats is not None:
+        stats.setdefault("steps", {})
+        for key in _STATS_KEYS:
+            stats.setdefault(key, None)
+
+
+def _record_step(stats, name, t0, **fields):
+    """Record one pipeline step's wall time and outcome."""
+    if stats is not None:
+        stats["steps"][name] = {"time_ms": (time.perf_counter() - t0) * 1000, **fields}
+
+
+def _finalize_stats(stats, t0, success, timestamp):
+    """Close out a stats dict with the total wall time and the frame's result."""
+    if stats is not None:
+        stats["total_time_ms"] = (time.perf_counter() - t0) * 1000
+        stats["success"] = success
+        stats["timestamp"] = list(timestamp) if timestamp else None
 
 
 def _make_blob_detector():
@@ -29,10 +67,9 @@ def _make_blob_detector():
 
 def _make_aruco_detector():
     """ArUco detector for the board's identifying marker."""
-    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
     parameters = cv2.aruco.DetectorParameters()
     parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
-    return cv2.aruco.ArucoDetector(dictionary, parameters)
+    return cv2.aruco.ArucoDetector(ARUCO_DICTIONARY, parameters)
 
 
 blob_detector = _make_blob_detector()
@@ -58,8 +95,9 @@ def read_led(img, x, y, radius):
     return led_intensity
 
 
-def read_ring(extracted_board, camera_type, board, draw_on=None):
+def read_ring(extracted_board, camera_type, board, draw_on=None, stats=None):
     """Ring reading of a rectified board: first and last lit LED, or None."""
+    t_start = time.perf_counter()
     radius = board.led_sample_radius
     led_coords = board.ring_led_coords(camera_type).astype(int)
     bg_coords = board.ring_led_coords(camera_type, RING_BG_OFFSET_MM).astype(int)
@@ -80,11 +118,16 @@ def read_ring(extracted_board, camera_type, board, draw_on=None):
             color = (0, 0, 255) if state else (255, 0, 0)
             cv2.circle(draw_on, (x, y), radius, color, 1)
 
-    return board.decode_ring(leds)
+    ring = board.decode_ring(leds)
+    if stats is not None:
+        stats["ring_leds"] = leds
+    _record_step(stats, "ring_reading", t_start, success=ring is not None)
+    return ring
 
 
-def read_counter(extracted_board, camera_type, board, draw_on=None):
+def read_counter(extracted_board, camera_type, board, draw_on=None, stats=None):
     """Counter reading of a rectified board."""
+    t_start = time.perf_counter()
     led_coords = board.counter_led_coords[camera_type].astype(int)
     bg_y = int(board.counter_bg_y[camera_type])
     radius = board.led_sample_radius
@@ -111,7 +154,11 @@ def read_counter(extracted_board, camera_type, board, draw_on=None):
                 1,
             )
 
-    return board.decode_counter(leds)
+    counter = board.decode_counter(leds)
+    if stats is not None:
+        stats["counter_leds"] = leds
+    _record_step(stats, "counter_reading", t_start, value=counter)
+    return counter
 
 
 def find_corners_convexhull(mask, frame_number, debug_dir=None):
@@ -208,6 +255,7 @@ def rectify_board(
     board=None,
     debug_dir=None,
     board_size=DEFAULT_BOARD_SIZE,
+    stats=None,
 ):
     """Locate the board in a frame and warp it onto a square pixel grid.
 
@@ -215,10 +263,13 @@ def rectify_board(
     rectified single-channel image or None if it could not be squared up, and the
     RectifiedBoard the reading should be decoded against.
     """
+    _init_stats(stats)
     match camera_type:
         case CameraType.RGB:
             # Detect ArUco markers
+            t0 = time.perf_counter()
             markers = find_corners_aruco(image, frame_number, debug_dir)
+            _record_step(stats, "aruco_detection", t0, success=bool(markers), count=len(markers))
             if not markers:
                 return False, None, None
 
@@ -237,6 +288,10 @@ def rectify_board(
                     return False, None, board
                 aruco_corners = markers[board.aruco_marker_id]
 
+            if stats is not None:
+                stats["aruco_id"] = board.aruco_marker_id
+                stats["aruco_corners"] = aruco_corners.tolist()
+
             # Check if aruco marker fills x % of the image to make sure the PCB was held close enough
             area = 0
             for i in range(4):
@@ -247,6 +302,8 @@ def rectify_board(
             height, width = image.shape[:2]
             image_area = width * height
             area_percentage = area / image_area
+            if stats is not None:
+                stats["aruco_area_fraction"] = area_percentage
             if area_percentage < MIN_ARUCO_AREA_FRACTION:
                 print(
                     f"Rejected {frame_number}: aruco marker only fills {area_percentage:.2%} of the image"
@@ -263,9 +320,19 @@ def rectify_board(
             rough_pcb = cv2.warpPerspective(
                 mask, rough_transformation_matrix, (board_size, board_size)
             )
+            t0 = time.perf_counter()
             corners = find_corners_dots(rough_pcb, frame_number, board, debug_dir)
+            _record_step(
+                stats,
+                "corner_detection",
+                t0,
+                success=corners is not None,
+                count=0 if corners is None else len(corners),
+            )
             if corners is None:
                 return True, None, board
+            if stats is not None:
+                stats["corner_positions"] = corners.tolist()
 
             # Only the four anchors define the transform; any extra always-on dots were
             # matched purely as a sanity check.
@@ -273,7 +340,11 @@ def rectify_board(
                 cv2.getPerspectiveTransform(corners[:4], board.transform_corners(CameraType.RGB)),
                 rough_transformation_matrix,
             )
+            t0 = time.perf_counter()
             pcb = cv2.warpPerspective(mask, transformation_matrix, (board_size, board_size))
+            _record_step(stats, "fine_rectification", t0)
+            if stats is not None:
+                stats["homography"] = transformation_matrix
 
         case CameraType.INFRARED:
             if board is None:
@@ -301,6 +372,8 @@ def rectify_board(
         case _:
             raise ValueError(f"Unsupported camera type: {camera_type!r}")
 
+    if stats is not None:
+        stats["rectified"] = pcb
     return True, pcb, board
 
 
@@ -311,23 +384,27 @@ def process_frame(
     board=None,
     debug_dir=None,
     board_size=DEFAULT_BOARD_SIZE,
+    stats=None,
 ):
     """Board time (start_ms, end_ms) read off one frame, and whether a board was seen."""
+    t_start = time.perf_counter()
+    _init_stats(stats)
     detected, pcb, board = rectify_board(
-        image, camera_type, frame_number, board, debug_dir, board_size
+        image, camera_type, frame_number, board, debug_dir, board_size, stats
     )
     if pcb is None or board is None:
+        _finalize_stats(stats, t_start, detected, None)
         return detected, None
 
     # Sample the pristine board; overlays go onto a separate canvas
     debug_canvas = cv2.cvtColor(pcb, cv2.COLOR_GRAY2BGR) if debug_dir else None
 
-    counter = read_counter(pcb, camera_type, board, draw_on=debug_canvas)
-    ring = read_ring(pcb, camera_type, board, draw_on=debug_canvas)
+    counter = read_counter(pcb, camera_type, board, draw_on=debug_canvas, stats=stats)
+    ring = read_ring(pcb, camera_type, board, draw_on=debug_canvas, stats=stats)
 
     if debug_canvas is not None:
         cv2.imwrite(f"{debug_dir}/leds_{frame_number}.png", debug_canvas)
 
-    if ring is None:
-        return True, None
-    return True, board.board_time_from_ring(counter, ring)
+    board_time = board.board_time_from_ring(counter, ring) if ring is not None else None
+    _finalize_stats(stats, t_start, True, board_time)
+    return True, board_time

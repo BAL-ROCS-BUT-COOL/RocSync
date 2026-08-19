@@ -39,7 +39,7 @@ from rocsync.benchmark.common import (
 from rocsync.board_profiles import BOARD_V1, PROFILES_BY_ARUCO, RectifiedBoard
 from rocsync.camera import CameraType
 from rocsync.timeline import frame_pts
-from rocsync.vision import ARUCO_DICTIONARY, process_frame
+from rocsync.vision import ARUCO_DICTIONARY, process_frame, read_counter, read_ring
 
 # Every board rectifies to the same pixel grid, so one radius serves the whole GUI.
 LED_RADIUS_PX = BOARD_V1.rectify().led_sample_radius
@@ -130,6 +130,40 @@ def fit_corner_homography(corners, board):
     return H
 
 
+def coarse_homography_from_aruco(stats, board):
+    """Fit original image → rectified board from the ArUco marker alone, or None.
+
+    Recomputed rather than taken from the pipeline's `rough_homography`: the annotator may
+    have resolved a different board profile, whose marker sits elsewhere in board coords.
+    """
+    corners = stats.get("aruco_corners")
+    if corners is None:
+        return None
+    src = np.array(corners, dtype=np.float32).reshape(4, 2)
+    try:
+        H = cv2.getPerspectiveTransform(src, board.aruco_corners_coords)
+    except cv2.error:
+        return None
+    if H is None or not np.isfinite(H).all():
+        return None
+    return H
+
+
+def decode_clock(rectified, board):
+    """(counter_leds, counter_value, ring_start, ring_end) read off a rectified board.
+
+    The ring is returned in the annotation's half-open ascending form; start == end means
+    no arc was found.
+    """
+    stats = {"steps": {}}
+    counter = read_counter(rectified, CameraType.RGB, board, stats=stats)
+    ring = read_ring(rectified, CameraType.RGB, board, stats=stats)
+    leds = [bool(v) for v in stats["counter_leds"]]
+    if ring is None:
+        return leds, counter, 0, 0
+    return leds, counter, int(ring[0]), int(ring[1] + 1) % board.period
+
+
 # Known ArUco marker IDs to cycle through
 ARUCO_IDS = [p.aruco_marker_id for p in PROFILES_BY_ARUCO.values()]
 
@@ -211,18 +245,13 @@ class ImageAnnotation:
             n = board.counter_bits
             ann.counter_value = sum(2 ** (n - 1 - i) for i in range(n) if counter_leds[i])
 
-        # Ring — read_ring returns inclusive (first ON, last ON).
-        # Convert to half-open [start, end) in ascending index order.
-        steps = stats.get("steps", {})
-        ring_step = steps.get("ring_reading", {})
-        if ring_step.get("success") and stats.get("timestamp"):
-            ts = stats["timestamp"]
-            counter_val = steps.get("counter_reading", {}).get("value", 0)
-            ann.ring_start = (ts[0] - counter_val * board.period) % board.period
-            ann.ring_end = (ts[1] - counter_val * board.period + 1) % board.period
-        elif stats.get("ring_leds") is not None:
-            ann.ring_start = 0
-            ann.ring_end = 0
+        # Ring — the decoded arc is inclusive (first ON, last ON). Convert to half-open
+        # [start, end) in ascending index order. An arc wrapping the period end is kept as
+        # seen; whether it yields a timestamp is reconstruct_timestamp's call, not ours.
+        ring = stats.get("ring_window")
+        if ring is not None:
+            ann.ring_start = int(ring[0])
+            ann.ring_end = int(ring[1] + 1) % board.period
 
         return ann
 
@@ -424,7 +453,9 @@ HELP_TEXT = [
     ". / ,             : Next / previous input file",
     "=== Rectified view ===",
     "Any corner edit re-fits the board view,",
-    "from 4 or more visible corner LEDs",
+    "from 4 or more visible corner LEDs, and",
+    "re-reads counter and ring off the new fit",
+    "until you annotate either by hand",
 ]
 
 
@@ -490,6 +521,9 @@ class AnnotationTool:
         # Corner the next left-panel click places; advances with each placement.
         self.placing_idx = 0
         self._cursor_left: tuple[float, float] | None = None
+        # Whether the user took over the clock / ring, which stops the auto re-decode
+        self._counter_edited = False
+        self._ring_edited = False
         self._needs_redraw = True
         self._window_sized = False
         # (annotation, board) before board-changing ArUco cycle
@@ -571,14 +605,22 @@ class AnnotationTool:
             self._set_board(board)
 
             # Load existing annotation or create from pipeline
-            if frame_key in self.ground_truth["images"]:
+            coarse_fit = False
+            saved = frame_key in self.ground_truth["images"]
+            if saved:
                 self.annotation = ImageAnnotation.from_dict(
                     self.ground_truth["images"][frame_key], board
                 )
             else:
                 self.annotation = ImageAnnotation.from_stats(self.stats, board)
-                # Use the pipeline homography for new annotations
+                # Use the pipeline homography for new annotations, falling back to the
+                # marker alone when corner detection failed — a coarse view to refine
+                # beats a black panel and corners parked at a guess.
                 H = self.stats.get("homography")
+                if H is None:
+                    H = coarse_homography_from_aruco(self.stats, board)
+                    if H is not None:
+                        coarse_fit = True
                 if H is not None:
                     self.annotation.homography = np.array(H, dtype=np.float64).tolist()
 
@@ -621,8 +663,18 @@ class AnnotationTool:
             self._cursor_left = None
             self.status_msg = ""
             self._needs_redraw = True
+            # A stored annotation was accepted as it stands, so it counts as hand-made:
+            # a corner nudge must not silently overwrite the reading it was accepted with.
+            self._counter_edited = saved
+            self._ring_edited = saved
 
             self._current_image = image
+
+            if coarse_fit:
+                # The pipeline stopped before reading anything, so seed the reading off
+                # the coarse view — wrong in detail, but a starting point to correct.
+                self._redecode_clock()
+                self.status_msg = "Coarse fit from ArUco marker — refine the corner LEDs"
             action = self._image_loop(image, frame_key)
 
             if action == "accept":
@@ -876,6 +928,7 @@ class AnnotationTool:
                 # CW first OFF → ascending start
                 self.annotation.ring_start = (idx + 1) % self.board.period
                 self.annotation.ring_end = (self._ring_start_candidate + 1) % self.board.period
+                self._ring_edited = True
                 self.mode = Mode.IDLE
                 self._ring_start_candidate = None
                 self.status_msg = ""
@@ -952,6 +1005,7 @@ class AnnotationTool:
         self._needs_redraw = True
 
     def _toggle_counter_led(self, idx):
+        self._counter_edited = True
         if self.annotation.counter_visible:
             self.annotation.counter_leds[idx] = not self.annotation.counter_leds[idx]
             self.annotation.recompute_counter()
@@ -960,6 +1014,7 @@ class AnnotationTool:
         self._needs_redraw = True
 
     def _toggle_counter_visibility(self):
+        self._counter_edited = True
         self.annotation.counter_visible = not self.annotation.counter_visible
         self._needs_redraw = True
 
@@ -1077,7 +1132,27 @@ class AnnotationTool:
         mask = original[:, :, 2]  # red channel
         bs = board.board_size
         self.stats["rectified"] = cv2.warpPerspective(mask, H, (bs, bs))
+        self._redecode_clock()
         return True
+
+    def _redecode_clock(self):
+        """Re-read counter and ring off the current rectified view.
+
+        Skips whichever the user has annotated by hand, so the auto-decode only ever fills
+        in what nobody has decided yet.
+        """
+        rectified = self.stats.get("rectified")
+        if rectified is None or (self._counter_edited and self._ring_edited):
+            return
+        leds, value, start, end = decode_clock(rectified, self.board)
+        ann = self.annotation
+        if not self._counter_edited:
+            ann.counter_visible = True
+            ann.counter_leds = leds
+            ann.counter_value = value
+        if not self._ring_edited:
+            ann.ring_start = start
+            ann.ring_end = end
 
     def _handle_ring_first_click(self, idx):
         """First ring click (CW first ON LED), then wait for CW first OFF LED."""

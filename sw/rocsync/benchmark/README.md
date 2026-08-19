@@ -40,7 +40,10 @@ The window shows two panels side-by-side:
 - **Left**: Original image
 - **Right**: Rectified 640×640 board with color-coded LED overlays
   - Red circle = ON, Blue circle = OFF, Gray circle = not visible
-  - If the pipeline failed (e.g., no ArUco detected), a black image is shown with LED positions at their expected locations.
+  - When the pipeline found the ArUco marker but failed to detect the corner LEDs, the board is
+    rectified from the marker alone and the counter and ring are read off that coarse view. It is
+    an estimate to correct, not an annotation: refine the corner LEDs and the fit tightens.
+  - If no ArUco marker was detected, a black image is shown with LED positions at their expected locations.
 
 On a video frame the top right also carries the frame's timing residual:
 
@@ -81,6 +84,11 @@ rather than the saved one, so a correction shows in the number before it is acce
 ### Mouse Interactions (right panel)
 
 **Corner LEDs** — Click on a corner LED circle to toggle visible/hidden. Drag a corner LED to refine its position.
+
+Every corner edit re-fits the homography from the visible corner LEDs and, on a frame whose
+counter and ring you have not yet annotated by hand, re-reads both off the new fit. Toggling a
+counter LED or setting the ring hands that reading over to you, and the auto-decode leaves it
+alone from then on; so does opening a frame that was already annotated.
 
 **Counter LEDs** — Click on a counter LED circle to toggle ON/OFF. Click the counter bounding box (outside individual LEDs) to toggle counter visibility.
 

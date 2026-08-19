@@ -1,6 +1,5 @@
 """Shared utilities for RocSync benchmark tools."""
 
-import subprocess
 import sys
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
@@ -11,7 +10,7 @@ import numpy as np
 
 from rocsync.board_profiles import PROFILES_BY_ARUCO
 from rocsync.dataset import VIDEO_SUFFIXES
-from rocsync.timeline import frame_pts, median_frame_period
+from rocsync.timeline import frame_pts, median_frame_period, probe_packet_field, run_ffprobe
 
 STEP_ORDER = [
     "aruco_detection",
@@ -85,21 +84,19 @@ def count_video_frames(path):
 
     Enumeration defines the keys, so an over-reported count would invent keys that no
     frame can ever fill -- and that the annotator's jump-to-unannotated would then land
-    on forever. The container's own count is checked by grabbing the frame it claims is
-    last, and only when that fails is the file demuxed to count for real.
+    on forever. The stream's packets are therefore counted rather than the count the
+    container claims taken at its word.
     """
+    counted = _probe_packet_count(path)
+    if counted:
+        return counted
+
+    # ffprobe could not answer, so demux the file here instead
     cap = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG)
     if not cap.isOpened():
         return 0
     try:
-        reported = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if reported > 0:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, reported - 1)
-            if cap.grab():
-                return reported
-
         # grab() demuxes without decoding pixels, so counting for real stays cheap
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         counted = 0
         while cap.grab():
             counted += 1
@@ -108,12 +105,13 @@ def count_video_frames(path):
         cap.release()
 
 
-def _is_positive_float(text):
-    """Whether `text` parses as a number above zero; ffprobe prints 'N/A' for some."""
-    try:
-        return float(text) > 0
-    except ValueError:
-        return False
+def _probe_packet_count(path):
+    """Packets the video stream holds, or None if ffprobe could not count them."""
+    output = run_ffprobe(
+        path, "-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0"
+    )
+    counted = (output or "").strip().rstrip(",")
+    return int(counted) if counted.isdigit() else None
 
 
 def source_frame_period_ms(video_path):
@@ -124,31 +122,7 @@ def source_frame_period_ms(video_path):
     533 ms apart. The timestamp spacing would describe the subsampling instead, and a
     tolerance scaled from that would be far too loose to catch anything.
     """
-    try:
-        output = subprocess.run(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-read_intervals",
-                "%+#50",
-                "-show_entries",
-                "frame=duration_time",
-                "-of",
-                "csv=p=0",
-                str(video_path),
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
-    except (OSError, subprocess.CalledProcessError):
-        output = ""
-
-    fields = (line.strip().rstrip(",") for line in output.splitlines())
-    durations = [float(f) for f in fields if _is_positive_float(f)]
+    durations = [d for d in probe_packet_field(video_path, "duration_time") if d > 0]
     if durations:
         # The mode, so one odd packet at a cut cannot stand for the whole recording
         return float(max(set(durations), key=durations.count)) * 1000

@@ -11,6 +11,7 @@ The result is a plain affine map, board_ms = clock_rate * pts_ms + clock_offset_
 is all any consumer needs in order to time a frame it has just decoded.
 """
 
+import subprocess
 from dataclasses import dataclass, field
 from itertools import pairwise
 from typing import cast
@@ -272,17 +273,97 @@ def summarize_timeline(
     return statistics, fit, considered, rejected, gaps
 
 
+def run_ffprobe(video_path, *args):
+    """stdout of an ffprobe query about a video's first video stream, or None.
+
+    None means ffprobe is missing or refused the file, which is what makes every caller
+    keep a way of its own to answer the question it asked.
+    """
+    try:
+        return subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", *args, str(video_path)],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def probe_packet_field(video_path, field):
+    """Values of one ffprobe packet field, in packet order, as floats.
+
+    A packet carries the numbers the container already stores, so reading it needs no
+    decoder: ffprobe's `frame=` entries decode the file and cost seconds per video,
+    `packet=` does not.
+    """
+    output = run_ffprobe(video_path, "-show_entries", f"packet={field}", "-of", "csv=p=0")
+    # A packet the container left blank prints as 'N/A', which is not a number
+    fields = (line.strip().rstrip(",") for line in (output or "").splitlines())
+    return [float(f) for f in fields if _is_float(f)]
+
+
+def _is_float(text):
+    try:
+        float(text)
+    except ValueError:
+        return False
+    return True
+
+
+def _parse_ratio(text):
+    """A 'num/den' ffprobe ratio as a float, or None if it is not one."""
+    num, _, den = (text or "").partition("/")
+    try:
+        num, den = float(num), float(den)
+    except ValueError:
+        return None
+    return num / den if den else None
+
+
 def frame_pts(video_path):
     """Presentation timestamp in ms of every frame, indexed by frame number.
 
-    Uses grab() so frames are demuxed without decoding pixels, which makes this
-    cheap enough to run before picking frames out of a video.
+    Read off the container's packets, so no frame is decoded -- which is what makes this
+    cheap enough to run before picking frames out of a video. Decoding the whole file,
+    the fallback for a container ffprobe cannot read the packet timestamps of, costs
+    seconds per video.
 
-    OpenCV reports timestamps relative to the stream's start time, so a clip whose
-    container starts at 47 s still begins at 0.0 here. `clock_offset_ms` is defined
-    against this view, which is also the one `read_frames_async` feeds the pipeline; an
-    absolute container timestamp has to have the start time subtracted first.
+    The timestamps are stored as integer ticks of the stream's time base, and are turned
+    into ms here exactly the way the decoder does it, so the two agree bit for bit rather
+    than to within the microsecond that ffprobe prints seconds to.
+
+    Timestamps are relative to the stream's start time, so a clip whose container starts
+    at 47 s still begins at 0.0 here. `clock_offset_ms` is defined against this view,
+    which is also the one `read_frames_async` feeds the pipeline; an absolute container
+    timestamp has to have the start time subtracted first.
     """
+    output = run_ffprobe(
+        video_path,
+        "-show_entries",
+        "stream=time_base,start_pts:packet=pts",
+        "-of",
+        "default=noprint_wrappers=1",
+    )
+    ticks, stream = [], {}
+    for line in (output or "").splitlines():
+        name, _, value = line.partition("=")
+        if name == "pts" and _is_float(value):
+            ticks.append(float(value))
+        elif value and value != "N/A":
+            stream[name] = value
+
+    time_base = _parse_ratio(stream.get("time_base"))
+    if ticks and time_base is not None:
+        # Packets arrive in decode order, which B-frames make differ from display order
+        ticks.sort()
+        start = float(stream.get("start_pts", ticks[0]))
+        return [(t - start) * time_base * 1000 for t in ticks]
+    return _decoded_frame_pts(video_path)
+
+
+def _decoded_frame_pts(video_path):
+    """`frame_pts` the slow way, for a file ffprobe could not read the packets of."""
     cap = cv2.VideoCapture(str(video_path), cv2.CAP_FFMPEG)
     if not cap.isOpened():
         raise OSError(f"Could not open video: {video_path}")

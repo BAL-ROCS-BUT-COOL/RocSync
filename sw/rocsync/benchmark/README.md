@@ -423,3 +423,14 @@ Timing columns are only comparable when the environments agree — check the Ope
 versions that `rocsync-evaluate` prints per column before reading `-t` output. Video decoding is
 part of that: annotations are in decoded coordinates, and OpenCV applies a container's rotation
 metadata itself, so a backend that did not would put every position in a transposed frame.
+
+## Adding videos to the benchmark
+
+I recommend to subsample videos to 1-2 fps to obtain 
+
+The following command subsamples videos to approximately 0.9 fps, while preserving exact frame timestamps:
+
+`ffmpeg -i input_video.mp4 -vf "select='isnan(prev_selected_t)+gte(t-prev_selected_t,1/0.9)'" -fps_mode passthrough -c:v libx264 -crf 18 -preset slow -an rocsync_benchmark/<subset>/output_video.mp4`
+
+When selecting the output framerate, avoid multiples of 100ms to collect frames with different ring arcs.
+I recommend 0.9 - 1.9 fps to minimize annotation cost.

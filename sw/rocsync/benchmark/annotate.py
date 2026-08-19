@@ -1229,11 +1229,20 @@ class AnnotationTool:
             board_img = cv2.cvtColor(view, cv2.COLOR_GRAY2BGR)
         else:
             board_img = np.zeros((cs, cs, 3), dtype=np.uint8)
-        # Corner ticks marking where the board proper ends and the margin begins
-        for cx, sx in ((m, 1), (m + bs - 1, -1)):
-            for cy, sy in ((m, 1), (m + bs - 1, -1)):
+        # Ticks marking where the board proper ends and the margin begins: an L at each
+        # corner, plus one centred on each edge.
+        x0, x1 = m, m + bs - 1
+        y0, y1 = m, m + bs - 1
+        half = BOARD_TICK_PX // 2
+        xc, yc = m + bs // 2, m + bs // 2
+        for cx, sx in ((x0, 1), (x1, -1)):
+            for cy, sy in ((y0, 1), (y1, -1)):
                 cv2.line(board_img, (cx, cy), (cx + sx * BOARD_TICK_PX, cy), COLOR_MARGIN, 1)
                 cv2.line(board_img, (cx, cy), (cx, cy + sy * BOARD_TICK_PX), COLOR_MARGIN, 1)
+        for y in (y0, y1):
+            cv2.line(board_img, (xc - half, y), (xc - half + BOARD_TICK_PX, y), COLOR_MARGIN, 1)
+        for x in (x0, x1):
+            cv2.line(board_img, (x, yc - half), (x, yc - half + BOARD_TICK_PX), COLOR_MARGIN, 1)
 
         # ArUco overlay (always shown)
         ax1, ay1 = self.aruco_x1 + m, self.aruco_y1 + m

@@ -22,7 +22,7 @@ Interactive GUI for creating ground truth annotations. Runs the pipeline on each
 ### Usage
 
 ```bash
-uv run rocsync-annotate [data_dir] [-o ground_truth.json] [--fit-clocks]
+uv run rocsync-annotate [data_dir] [-o ground_truth.json] [--fit-clocks] [--prune [--dry-run]]
 ```
 
 - `data_dir`: Directory containing validation images and videos (default: `validation_data/`).
@@ -30,8 +30,12 @@ uv run rocsync-annotate [data_dir] [-o ground_truth.json] [--fit-clocks]
 - `--fit-clocks`: Re-derive every video's reference clock and exit, without opening the GUI.
   Run it after editing a ground truth file by hand. It exits non-zero, naming the offending
   frames, when a video's annotations do not agree on a single clock.
+- `--prune`: Remove entries whose input is gone and exit, without opening the GUI. See
+  [Removing inputs from the benchmark](#removing-inputs-from-the-benchmark).
+- `--dry-run`: With `--prune`, list what would go without writing anything.
 
-The tool resumes from the first unannotated frame on restart.
+The tool resumes from the first unannotated frame on restart, and names on startup any entry
+whose image or video it no longer finds.
 
 ### Display
 
@@ -316,12 +320,14 @@ Video frames are decoded in the order they are walked, so a run never seeks back
 Compares benchmark results against ground truth annotations. Reports per-step detection metrics (TPR, FPR, precision, F1), value accuracy, and position errors.
 
 ```bash
-uv run rocsync-evaluate [paths...] [-g ground_truth.json] [-t]
+uv run rocsync-evaluate [paths...] [-g ground_truth.json] [-t] [--allow-partial]
 ```
 
 - `paths`: Directory with benchmark `.json` files, or one or more explicit `.json` filepaths (default: `output/benchmark/`).
 - `-g`: Path to ground truth JSON (default: `validation_data/ground_truth.json`).
 - `-t`: Include per-step timing statistics (all/positive/negative subsets).
+- `--allow-partial`: Report instead of refusing when the columns cover different frames — see
+  [Comparing branches](#comparing-branches).
 
 Metrics are computed per pipeline step:
 - **ArUco**: detection rates + corner pixel error in image space
@@ -415,9 +421,14 @@ already has, so an older one needs nothing but the files above copied in. `annot
 `retime.py` and `evaluate.py` need geometry that older checkouts lack, so they are not portable
 and are not needed there.
 
-`rocsync-evaluate` prints how many ground truth frames each column actually scores. A column that
-scores fewer was run over a different set of inputs, and its rates describe that subset — a
-prediction the run never made is skipped rather than counted as a miss.
+`rocsync-evaluate` prints how many ground truth frames each column actually scores, and refuses to
+print a report when the columns do not cover the same frames: a prediction the run never made is
+skipped by every metric rather than counted as a miss, so columns over different frame sets are
+different populations and the counts, rates and green winner mark between them mean nothing. It
+names the files behind the difference; re-run `rocsync-validate` for the column that lags, or pass
+`--allow-partial` to score each column over its own coverage anyway. Frames no column scores are
+reported separately as a stale ground truth, which
+[pruning](#removing-inputs-from-the-benchmark) clears.
 
 Timing columns are only comparable when the environments agree — check the OpenCV and NumPy
 versions that `rocsync-evaluate` prints per column before reading `-t` output. Video decoding is
@@ -434,3 +445,26 @@ The following command subsamples videos to approximately 0.9 fps, while preservi
 
 When selecting the output framerate, avoid multiples of 100ms to collect frames with different ring arcs.
 I recommend 0.9 - 1.9 fps to minimize annotation cost.
+
+## Removing inputs from the benchmark
+
+Delete the file, then clean up what described it:
+
+```bash
+rm <data_dir>/<subset>/clip.mp4
+uv run rocsync-annotate <data_dir> --prune
+```
+
+`--prune` removes the annotations and the reference clock of every input that is no longer there,
+and nothing else. It leaves alone a file that is present but would not decode — a truncated copy,
+a codec this machine lacks — because that is a reason to fix the file, not to lose the annotation
+work behind it; those are listed and make the exit code non-zero. `--dry-run` prints the same list
+without writing. A retimed clip is cut again on demand, so its entry survives the clip being
+deleted and goes only when the recording it was cut from does.
+
+Annotations whose video was re-encoded shorter are pruned too, by index; re-derive that video's
+clock afterwards with `--fit-clocks`, since its reference was fitted over frames that are now gone.
+
+Result files in `output/benchmark/` still hold predictions for the removed frames, so re-run
+`rocsync-validate` for every column you want to keep comparing — until then `rocsync-evaluate`
+refuses to put an old column next to a fresh one.

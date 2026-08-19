@@ -30,6 +30,7 @@ from rocsync.benchmark.common import (
     fit_reference_clock,
     frame_key,
     measured_residual_threshold_ms,
+    orphaned_entries,
     parse_frame_key,
     reconstruct_timestamp,
     reference_outliers,
@@ -406,6 +407,97 @@ def describe_outliers(rel_path, outliers, threshold_ms):
     return "\n".join(lines)
 
 
+def _group_by_path(keys):
+    """{relative path: [key]} for a list of frame keys, in path order."""
+    grouped = {}
+    for key in keys:
+        grouped.setdefault(parse_frame_key(key)[0], []).append(key)
+    return dict(sorted(grouped.items()))
+
+
+def describe_orphans(orphans, ground_truth):
+    """One line per file the ground truth still describes and the dataset no longer backs.
+
+    Grouped by file rather than by key: a video contributes one annotation per frame, and
+    a thousand of those say nothing a single line about the file does not.
+    """
+    images = ground_truth.get("images") or {}
+    videos = ground_truth.get("videos") or {}
+    lines = []
+    for rel_path, keys in _group_by_path(orphans.missing_images).items():
+        detail = "reference clock and " if rel_path in orphans.missing_videos else ""
+        lines.append(f"  {rel_path}: no such file ({detail}{len(keys)} annotation(s))")
+    described = set(_group_by_path(orphans.missing_images))
+    for rel_path in orphans.missing_videos:
+        if rel_path in described:
+            continue
+        # A retimed clip is orphaned by its source, which is the file to name
+        source = (videos.get(rel_path) or {}).get("source")
+        gone = f"its source {source} is gone" if source else "no such file"
+        lines.append(f"  {rel_path}: {gone} (reference clock)")
+    for rel_path, keys in _group_by_path(orphans.out_of_range_images).items():
+        lines.append(f"  {rel_path}: {len(keys)} annotation(s) past the last frame")
+    for rel_path in orphans.unreadable_videos:
+        n = sum(1 for key in images if parse_frame_key(key)[0] == rel_path)
+        kept = f"{n} annotation(s) kept" if n else "no annotations"
+        lines.append(f"  {rel_path}: could not be read, so nothing was pruned ({kept})")
+    return "\n".join(lines)
+
+
+def annotations_behind(orphans, images):
+    """How many annotations sit behind files that are present but would not decode."""
+    unreadable = set(orphans.unreadable_videos)
+    return sum(1 for key in images if parse_frame_key(key)[0] in unreadable)
+
+
+def prune(data_dir, output_path, dry_run=False):
+    """Drop ground truth entries whose input is gone. Returns a process exit code.
+
+    Removal is opt-in and never touches a file that merely failed to decode: those are
+    listed and kept, and make the exit code non-zero so a partial clean-up is not read
+    as a finished one.
+    """
+    data_dir = Path(data_dir)
+    output_path = Path(output_path) if output_path else data_dir / "ground_truth.json"
+    if not output_path.exists():
+        print(f"No ground truth at {output_path}", file=sys.stderr)
+        return 1
+
+    with open(output_path) as f:
+        ground_truth = json.load(f)
+    images = ground_truth.setdefault("images", {})
+    videos = ground_truth.setdefault("videos", {})
+
+    frames = collect_frames(data_dir, sources_only=True)
+    orphans = orphaned_entries(ground_truth, data_dir, frames)
+    if orphans.is_empty():
+        print(f"{output_path}: every entry still has its input")
+        return 0
+
+    print(describe_orphans(orphans, ground_truth))
+    if not orphans.prunable():
+        return 1
+
+    if dry_run:
+        print("Dry run, nothing written")
+        return 1 if orphans.unreadable_videos else 0
+
+    for key in orphans.missing_images + orphans.out_of_range_images:
+        del images[key]
+    for rel_path in orphans.missing_videos:
+        del videos[rel_path]
+    with open(output_path, "w") as f:
+        json.dump(ground_truth, f, indent=2)
+
+    n_images = len(orphans.missing_images) + len(orphans.out_of_range_images)
+    print(f"Removed {n_images} annotation(s) and {len(orphans.missing_videos)} video reference(s)")
+    if orphans.out_of_range_images:
+        # Those videos are still in the benchmark, and their reference was fitted over
+        # annotations that no longer all exist
+        print("Re-derive the affected clocks with --fit-clocks")
+    return 1 if annotations_behind(orphans, images) else 0
+
+
 def measured_video_entry(clock, source_period_ms, threshold_ms):
     """The `videos` entry for a clip whose timeline is the camera's own."""
     return {
@@ -571,6 +663,7 @@ class AnnotationTool:
             return
 
         self._load_ground_truth()
+        self._report_orphans()
         first = self._find_unannotated(-1, forward=True)
         if first == -1:
             print("All frames already annotated. Starting from the beginning.")
@@ -1481,6 +1574,20 @@ class AnnotationTool:
             n = len(self.ground_truth["images"])
             print(f"Loaded {n} existing annotations from {self.output_path}")
 
+    def _report_orphans(self):
+        """Say which entries no longer have an input, without touching any of them.
+
+        The GUI walks the disk, so an entry whose file is gone is otherwise invisible
+        here -- and saving would write it straight back out.
+        """
+        orphans = orphaned_entries(self.ground_truth, self.data_dir, self.frames)
+        if orphans.is_empty():
+            return
+        print(f"Ground truth entries with no input in {self.data_dir}:", file=sys.stderr)
+        print(describe_orphans(orphans, self.ground_truth), file=sys.stderr)
+        if orphans.prunable():
+            print("Run with --prune to remove them.", file=sys.stderr)
+
     def _save_ground_truth(self):
         self._update_references()
         with open(self.output_path, "w") as f:
@@ -1697,7 +1804,20 @@ def main():
         action="store_true",
         help="Re-derive every video's reference clock and exit, without opening the GUI",
     )
+    parser.add_argument(
+        "--prune",
+        action="store_true",
+        help="Remove ground truth entries whose image or video is gone, and exit",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --prune, list what would be removed without writing",
+    )
     args = parser.parse_args()
+
+    if args.prune:
+        sys.exit(prune(args.data_dir, args.output, dry_run=args.dry_run))
 
     if args.fit_clocks:
         sys.exit(fit_clocks(args.data_dir, args.output))

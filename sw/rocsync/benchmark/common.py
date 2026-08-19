@@ -154,7 +154,10 @@ def source_frame_period_ms(video_path):
         return float(max(set(durations), key=durations.count)) * 1000
 
     # Without a packet duration the spacing is all there is, subsampled or not
-    return median_frame_period(frame_pts(video_path))
+    try:
+        return median_frame_period(frame_pts(video_path))
+    except OSError:
+        return None  # a file that will not open has no period to report
 
 
 def measured_residual_threshold_ms(source_period_ms):
@@ -233,6 +236,76 @@ def collect_frames(root_dir, sources_only=False):
             frames.extend(FrameRef(path, i, frame_key(rel_path, i)) for i in range(n_frames))
     frames.sort(key=lambda ref: (str(ref.path), -1 if ref.index is None else ref.index))
     return frames
+
+
+@dataclass(frozen=True)
+class Orphans:
+    """Ground truth entries no frame on disk stands behind, split by what is wrong.
+
+    The split is what makes pruning safe to automate: a file that is gone is gone, while
+    a file that is merely unreadable today -- a truncated download, a codec the machine
+    lacks -- must not cost the annotation work behind it.
+    """
+
+    missing_images: list  # keys whose file is not there at all
+    missing_videos: list  # `videos` paths whose recording is not there at all
+    out_of_range_images: list  # keys past the last frame of a file that did decode
+    unreadable_videos: list  # present but contributed no frame; their entries are kept
+
+    def prunable(self):
+        """Whether anything here can be removed without losing recoverable work."""
+        return bool(self.missing_images or self.missing_videos or self.out_of_range_images)
+
+    def is_empty(self):
+        return not (self.prunable() or self.unreadable_videos)
+
+
+def orphaned_entries(ground_truth, data_dir, frames):
+    """Ground truth entries with no frame behind them, as an `Orphans`.
+
+    `frames` is the caller's own `collect_frames(data_dir, sources_only=True)` result:
+    annotations are keyed to the recording and never to a retimed clip, so the sources
+    walk is the one whose keys they are supposed to match.
+
+    Existence is decided by a plain directory listing rather than by that walk, because
+    the walk drops an unreadable video too, and a file that cannot be decoded right now
+    is a different thing from one that was deleted.
+    """
+    data_dir = Path(data_dir)
+    on_disk = {str(p.relative_to(data_dir)) for p in data_dir.rglob("*") if p.is_file()}
+    valid_keys = {ref.key for ref in frames}
+    enumerated = {parse_frame_key(ref.key)[0] for ref in frames}
+
+    unreadable = {
+        rel
+        for rel in on_disk
+        if Path(rel).suffix.lower() in VIDEO_SUFFIXES
+        and rel not in enumerated
+        and not is_retimed(rel)
+    }
+
+    missing_images, out_of_range_images = [], []
+    for key in ground_truth.get("images") or {}:
+        if key in valid_keys:
+            continue
+        rel_path, index = parse_frame_key(key)
+        if rel_path not in on_disk:
+            missing_images.append(key)
+        elif index is not None and rel_path not in unreadable:
+            out_of_range_images.append(key)  # the file decoded and stops before this frame
+
+    missing_videos = []
+    for rel_path, entry in (ground_truth.get("videos") or {}).items():
+        # A retimed clip is cut again on demand, so its source is what has to exist
+        if (entry.get("source") or rel_path) not in on_disk:
+            missing_videos.append(rel_path)
+
+    return Orphans(
+        missing_images=sorted(missing_images),
+        missing_videos=sorted(missing_videos),
+        out_of_range_images=sorted(out_of_range_images),
+        unreadable_videos=sorted(unreadable),
+    )
 
 
 class FrameSource:

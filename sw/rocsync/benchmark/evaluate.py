@@ -84,6 +84,26 @@ def load_ground_truth(path):
         return json.load(f)
 
 
+def coverage_report(gt_images, benchmarks):
+    """Which ground truth frames each column scores, and where the columns disagree.
+
+    Returns `(scored, uncovered, missing)`: the key set per column, the ground truth
+    frames no column scores at all, and per column the frames another column scores and
+    it does not. A prediction a run never made is skipped by every metric below, so a
+    column with a different key set answers a different question than its neighbours.
+    """
+    scored = {method: set(gt_images) & set(bm["images"]) for method, bm in benchmarks.items()}
+    covered = set().union(*scored.values()) if scored else set()
+    missing = {method: covered - keys for method, keys in scored.items() if covered - keys}
+    return scored, set(gt_images) - covered, missing
+
+
+def describe_keys(keys, indent="    "):
+    """One line per input file behind a set of frame keys, with how many it contributes."""
+    counts = Counter(parse_frame_key(key)[0] for key in keys)
+    return "\n".join(f"{indent}{path}: {n} frame(s)" for path, n in sorted(counts.items()))
+
+
 def resolve_retimed_keys(benchmark, retimed):
     """Move a run's per-frame predictions onto the keys the annotations use.
 
@@ -1080,6 +1100,12 @@ def main():
         "-t", "--timing", action="store_true", help="Include per-step timing statistics"
     )
     parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="Report instead of refusing when columns cover different frames, scoring "
+        "each over its own coverage",
+    )
+    parser.add_argument(
         "--color",
         choices=["auto", "always", "never"],
         default="auto",
@@ -1105,13 +1131,39 @@ def main():
     col_width = max(14, max(len(m) for m in methods) + 2)
 
     n_images = len(gt_images)
+    scored, uncovered, missing = coverage_report(gt_images, benchmarks)
     print(f"Ground truth: {args.ground_truth} ({n_images} frames)")
     print(f"Methods: {', '.join(methods)}")
     for m in methods:
         # A prediction the run never made is skipped silently, so say how many it covers
-        n_scored = len(set(gt_images) & set(benchmarks[m]["images"]))
-        scope = f"scores {n_scored}/{n_images}"
+        scope = f"scores {len(scored[m])}/{n_images}"
         print(f"  {m}: {_describe_run(benchmarks[m].get('config', {}))}, {scope}")
+
+    if uncovered:
+        print(
+            f"\nWARNING: {len(uncovered)} ground truth frame(s) no column scores. If those "
+            f"inputs are gone, prune them:\n"
+            f"  rocsync-annotate <data_dir> --prune\n"
+            f"{describe_keys(uncovered)}",
+            file=sys.stderr,
+        )
+
+    if missing:
+        detail = "\n".join(
+            f"  {m} does not score {len(keys)} frame(s) another column does:\n{describe_keys(keys)}"
+            for m, keys in sorted(missing.items())
+        )
+        # Every metric skips a frame a run has no prediction for, so columns over
+        # different frame sets are different populations, counts and winner alike
+        print(f"\nColumns cover different frames:\n{detail}", file=sys.stderr)
+        if not args.allow_partial:
+            print(
+                "\nRe-run rocsync-validate for the columns above, or pass --allow-partial "
+                "to score each column over its own coverage.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print("--allow-partial: each column is scored over its own frames.", file=sys.stderr)
 
     # Compute all metrics per method
     all_metrics = {}

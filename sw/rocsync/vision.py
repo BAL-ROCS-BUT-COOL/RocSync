@@ -61,9 +61,9 @@ def _make_blob_detector():
     params.filterByColor = True
     params.blobColor = 255
 
-    # Disabled: Exclude elongated blobs caused by motion blur
-    params.filterByInertia = False
-    # params.minInertiaRatio = 0.5
+    # Exclude elongated blobs caused by motion blur
+    params.filterByInertia = True
+    params.minInertiaRatio = 0.5
 
     return cv2.SimpleBlobDetector.create(params)
 

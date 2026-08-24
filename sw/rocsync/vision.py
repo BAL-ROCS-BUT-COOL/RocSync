@@ -76,11 +76,36 @@ def _make_blob_detector():
     return cv2.SimpleBlobDetector.create(params)
 
 
+class _LegacyArucoDetector:
+    """cv2.aruco.ArucoDetector's interface on OpenCV 4.5/4.6.
+
+    The class-based API arrived in 4.7. Older builds only have the free function
+    cv2.aruco.detectMarkers, which takes the dictionary and parameters per call.
+    """
+
+    def __init__(self, dictionary, parameters):
+        self._dictionary = dictionary
+        self._parameters = parameters
+
+    def detectMarkers(self, image):  # noqa: N802 - mirrors the OpenCV method name
+        return cv2.aruco.detectMarkers(  # pyright: ignore[reportAttributeAccessIssue]
+            image, self._dictionary, parameters=self._parameters
+        )
+
+
 def _make_aruco_detector():
     """ArUco detector for the board's identifying marker."""
-    parameters = cv2.aruco.DetectorParameters()
-    parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
-    return cv2.aruco.ArucoDetector(ARUCO_DICTIONARY, parameters)
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+
+    if hasattr(cv2.aruco, "DetectorParameters"):  # OpenCV >= 4.7
+        parameters = cv2.aruco.DetectorParameters()
+        parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
+        aruco_detector = cv2.aruco.ArucoDetector(dictionary, parameters)
+    else:  # OpenCV 4.5 / 4.6
+        parameters = cv2.aruco.DetectorParameters_create()  # pyright: ignore[reportAttributeAccessIssue]
+        parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
+        aruco_detector = _LegacyArucoDetector(dictionary, parameters)
+    return aruco_detector
 
 
 blob_detector = _make_blob_detector()

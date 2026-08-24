@@ -146,7 +146,7 @@ def test_a_matching_clock_scores_no_error():
     assert metrics["status"] is None
     assert metrics["clock_rate_error_ppm"] == pytest.approx(0.0, abs=1e-6)
     assert metrics["clock_offset_error_ms"] == pytest.approx(0.0, abs=1e-9)
-    assert metrics["sync_error_max_ms"] == pytest.approx(0.0, abs=1e-9)
+    assert metrics["frame_time_error_ms"] == pytest.approx(0.0, abs=1e-9)
     assert len(metrics["residuals_ms"]) == 20
 
 
@@ -157,8 +157,8 @@ def test_a_shifted_clock_is_off_by_that_shift_everywhere():
 
     assert metrics["clock_offset_error_ms"] == pytest.approx(12.5)
     # A pure offset error does not decay along the recording
-    assert metrics["sync_error_first_ms"] == pytest.approx(12.5)
-    assert metrics["sync_error_last_ms"] == pytest.approx(12.5)
+    assert metrics["first_frame_error_ms"] == pytest.approx(12.5)
+    assert metrics["last_frame_error_ms"] == pytest.approx(12.5)
     assert descriptive_stats(metrics["residuals_ms"])["mean"] == pytest.approx(12.5, abs=0.5)
 
 
@@ -167,9 +167,9 @@ def test_outlier_rejection_is_scored_against_the_annotations():
 
     metrics = compute_clock_metrics(benchmark, ground_truth)[VIDEO]
 
-    assert metrics["false_rejections"] == 1  # frame 9 decoded correctly but was thrown out
-    assert metrics["false_acceptances"] == 1  # frame 3 was misdecoded but kept
-    assert metrics["n_flagged"] == 20
+    assert metrics["rejected_but_correct"] == 1  # frame 9 decoded correctly but was thrown out
+    assert metrics["considered_but_misdecoded"] == 1  # frame 3 was misdecoded but kept
+    assert metrics["n_checked_frames"] == 20
 
 
 def test_a_run_without_a_timeline_is_reported_rather_than_scored():
@@ -193,7 +193,7 @@ def test_a_retimed_clip_is_scored_through_the_annotations_it_was_cut_from():
 
     assert VIDEO not in metrics  # scored once, through the clip that stands in for it
     assert metrics[RETIMED]["timeline"] == "synthesized"
-    assert metrics[RETIMED]["sync_error_max_ms"] == pytest.approx(0.0, abs=1e-9)
+    assert metrics[RETIMED]["frame_time_error_ms"] == pytest.approx(0.0, abs=1e-9)
     # The frames the trim cut have no prediction, so they are skipped rather than missed
     assert len(metrics[RETIMED]["residuals_ms"]) == 20 - TRIMMED
 
@@ -204,9 +204,9 @@ def test_a_misdecode_is_attributed_through_the_retiming():
 
     metrics = compute_clock_metrics(benchmark, ground_truth)[RETIMED]
 
-    assert metrics["false_acceptances"] == 1  # frame 7 was misdecoded but kept
-    assert metrics["false_rejections"] == 1  # frame 9 decoded correctly but was thrown out
-    assert metrics["n_flagged"] == 20 - TRIMMED
+    assert metrics["considered_but_misdecoded"] == 1  # frame 7 was misdecoded but kept
+    assert metrics["rejected_but_correct"] == 1  # frame 9 decoded correctly but was thrown out
+    assert metrics["n_checked_frames"] == 20 - TRIMMED
 
 
 def test_aggregation_splits_measured_from_retimed_videos():
@@ -237,7 +237,7 @@ def test_aggregation_keeps_the_worst_video_and_sums_the_frame_counts():
     assert group["clock_offset_error_ms_max_abs"] == pytest.approx(12.5)
     assert group["clock_offset_error_ms_mean_abs"] == pytest.approx(8.25)
     assert group["n_rejected_frames"] == 2  # one frame per video
-    assert group["n_flagged"] == 40
+    assert group["n_checked_frames"] == 40
     assert group["residual_vs_gt_ms"]["n"] == 40
 
 
@@ -249,4 +249,4 @@ def test_aggregation_names_the_videos_it_could_not_score():
 
     assert (group["n_scored"], group["n_videos"]) == (0, 1)
     assert group["unscored"] == "no video timeline recorded (1)"
-    assert group["sync_error_max_ms"] is None
+    assert group["frame_time_error_ms_max"] is None

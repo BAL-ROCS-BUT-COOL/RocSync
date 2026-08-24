@@ -370,29 +370,48 @@ def compute_counter_metrics(benchmark_images, gt_images):
     }
 
 
+def _ring_led_error(pred_index, gt_index, period):
+    """How many LEDs apart two ring positions sit, measured the short way around.
+
+    Modular, because index 0 and index period-1 are neighbours on the ring: a plain
+    difference would call that one-LED disagreement a full period.
+    """
+    if pred_index is None or gt_index is None or not period:
+        return None
+    diff = (int(pred_index) - int(gt_index)) % period
+    return min(diff, period - diff)
+
+
 def compute_ring_metrics(benchmark_images, gt_images):
-    """Compute ring detection + start/end value accuracy."""
+    """Compute ring detection + start/end value accuracy, exact and within one LED."""
     detection = compute_step_detection(benchmark_images, gt_images, "ring")
 
     n_compared = 0
-    start_correct = 0
-    end_correct = 0
+    correct = {"start": 0, "end": 0}
+    near = {"start": 0, "end": 0}
     for img_key, gt in gt_images.items():
         pred = benchmark_images.get(img_key)
         if pred is None:
             continue
         if not ring_visible(gt) or not ring_visible(pred):
             continue
+        board = _board_for_gt(gt)
         n_compared += 1
-        if pred.get("ring", {}).get("start") == gt.get("ring", {}).get("start"):
-            start_correct += 1
-        if pred.get("ring", {}).get("end") == gt.get("ring", {}).get("end"):
-            end_correct += 1
+        for end in ("start", "end"):
+            gt_index = gt.get("ring", {}).get(end)
+            pred_index = pred.get("ring", {}).get(end)
+            if pred_index == gt_index:
+                correct[end] += 1
+            error = _ring_led_error(pred_index, gt_index, board.period if board else None)
+            if error is not None and error <= DECODE_TOLERANCE_LEDS:
+                near[end] += 1
 
     return {
         "detection": detection,
-        "start_correct": start_correct,
-        "end_correct": end_correct,
+        "start_correct": correct["start"],
+        "end_correct": correct["end"],
+        "start_near": near["start"],
+        "end_near": near["end"],
         "value_compared": n_compared,
     }
 
@@ -403,8 +422,8 @@ def compute_overall_metrics(benchmark_images, gt_images):
 
     n_compared = 0
     n_correct = 0
-    start_errors = []
-    end_errors = []
+    n_within_tolerance = 0
+    mid_errors = []
     exposure_errors = []
 
     for img_key, gt in gt_images.items():
@@ -424,8 +443,14 @@ def compute_overall_metrics(benchmark_images, gt_images):
         if pred_ts == gt_ts:
             n_correct += 1
         if pred_ts is not None and gt_ts is not None:
-            start_errors.append(abs(pred_ts[0] - gt_ts[0]))
-            end_errors.append(abs(pred_ts[1] - gt_ts[1]))
+            # The mid-exposure instant is the timestamp a consumer actually uses, and it
+            # is the one quantity a half-lit LED at either end of the arc cannot move:
+            # reading the arc one LED long at both ends shifts start and end the same
+            # way and leaves the middle where it was.
+            mid_error = abs((pred_ts[0] + pred_ts[1]) - (gt_ts[0] + gt_ts[1])) / 2
+            mid_errors.append(mid_error)
+            if mid_error <= DECODE_TOLERANCE_LEDS:
+                n_within_tolerance += 1
             pred_exposure = pred_ts[1] - pred_ts[0]
             gt_exposure = gt_ts[1] - gt_ts[0]
             exposure_errors.append(abs(pred_exposure - gt_exposure))
@@ -433,10 +458,10 @@ def compute_overall_metrics(benchmark_images, gt_images):
     return {
         "detection": detection,
         "timestamp_correct": n_correct,
+        "timestamp_within_tolerance": n_within_tolerance,
         "timestamp_compared": n_compared,
         "timestamp_error": {
-            "start": descriptive_stats(start_errors),
-            "end": descriptive_stats(end_errors),
+            "mid": descriptive_stats(mid_errors),
             "exposure": descriptive_stats(exposure_errors),
         },
     }
@@ -506,7 +531,7 @@ def compute_clock_metrics(benchmark, gt) -> dict[str, dict]:
         # Per-frame accuracy against the annotations themselves, and whether the fit's
         # own outlier rejection agrees with them
         residuals = []
-        false_rejections = false_acceptances = n_flagged = 0
+        rejected_but_correct = considered_but_misdecoded = n_checked_frames = 0
         annotated_path = reference.get("source", rel_path)  # retimed clips borrow theirs
         for key, annotation in gt_images.items():
             path, index = parse_frame_key(key)
@@ -525,25 +550,27 @@ def compute_clock_metrics(benchmark, gt) -> dict[str, dict]:
             fit = prediction.get("fit")
             if fit is None or gt_ts is None:
                 continue
-            n_flagged += 1
+            n_checked_frames += 1
             decoded_correctly = reconstruct_timestamp(prediction, board) == gt_ts
             if decoded_correctly and not fit["inlier"]:
-                false_rejections += 1
+                rejected_but_correct += 1
             elif not decoded_correctly and fit["inlier"]:
-                false_acceptances += 1
+                considered_but_misdecoded += 1
 
         metrics[rel_path] = described(
             reference,
             status=None,
             clock_rate_error_ppm=(rate - ref.clock_rate) * 1e6,
             clock_offset_error_ms=offset - ref.clock_offset_ms,
-            sync_error_first_ms=first,
-            sync_error_last_ms=last,
-            sync_error_max_ms=max(abs(first), abs(last)),
+            first_frame_error_ms=first,
+            last_frame_error_ms=last,
+            # The clock is only ever used inside the annotated span, so the two ends of
+            # that span bound the board time it gets wrong anywhere a caller will ask.
+            frame_time_error_ms=max(abs(first), abs(last)),
             residuals_ms=residuals,
-            false_rejections=false_rejections,
-            false_acceptances=false_acceptances,
-            n_flagged=n_flagged,
+            rejected_but_correct=rejected_but_correct,
+            considered_but_misdecoded=considered_but_misdecoded,
+            n_checked_frames=n_checked_frames,
             rmse_after=pred.get("rmse_after"),
             r2_after=pred.get("r2_after"),
             n_considered_frames=pred.get("n_considered_frames"),
@@ -559,12 +586,12 @@ CLOCK_GROUPS = ("measured", "retimed")
 
 # Frame counters describe how much work a fit did, so a group reports their totals.
 CLOCK_COUNT_KEYS = (
-    "false_rejections",
-    "false_acceptances",
-    "n_flagged",
     "n_considered_frames",
     "n_rejected_frames",
     "n_dropped_frames",
+    "n_checked_frames",
+    "rejected_but_correct",
+    "considered_but_misdecoded",
 )
 
 
@@ -604,8 +631,8 @@ def _aggregate_group(videos):
         "clock_rate_error_ppm_max_abs": over_videos("clock_rate_error_ppm", max, abs),
         "clock_offset_error_ms_mean_abs": over_videos("clock_offset_error_ms", _mean, abs),
         "clock_offset_error_ms_max_abs": over_videos("clock_offset_error_ms", max, abs),
-        "sync_error_mean_ms": over_videos("sync_error_max_ms", _mean),
-        "sync_error_max_ms": over_videos("sync_error_max_ms", max),
+        "frame_time_error_ms_mean": over_videos("frame_time_error_ms", _mean),
+        "frame_time_error_ms_max": over_videos("frame_time_error_ms", max),
         "rmse_after_mean": over_videos("rmse_after", _mean),
         "rmse_after_max": over_videos("rmse_after", max),
         "r2_after_min": over_videos("r2_after", min),
@@ -818,25 +845,28 @@ def _print_metric_rows(methods, rows, get_video, col_width, label_width=LABEL_WI
 
 CLOCK_GROUP_LABELS = {"measured": "measured videos", "retimed": "retimed videos"}
 
-# The last column says which direction wins the row, or None for a row that reports what
-# a fit did rather than how well it did it.
+# Rows are named for the fields `rocsync` itself reports on a video -- clock_rate,
+# clock_offset_ms, first_frame/last_frame, rmse_after, r2_after and the frame counts --
+# so a column here reads as the error in a number the tool already prints. The last entry
+# says which direction wins the row, or None for a row that reports what a fit did rather
+# than how well it did it.
 CLOCK_AGGREGATE_ROWS = [
-    ("residual_threshold_ms_max", "reference tolerance, loosest [ms]", format_value, None),
-    ("clock_rate_error_ppm_mean_abs", "clock rate error, mean |err| [ppm]", format_value, LOWER),
-    ("clock_rate_error_ppm_max_abs", "clock rate error, worst |err| [ppm]", format_value, LOWER),
-    ("clock_offset_error_ms_mean_abs", "clock offset error, mean |err| [ms]", format_value, LOWER),
-    ("clock_offset_error_ms_max_abs", "clock offset error, worst |err| [ms]", format_value, LOWER),
-    ("sync_error_mean_ms", "sync error, mean over videos [ms]", format_value, LOWER),
-    ("sync_error_max_ms", "sync error, worst over videos [ms]", format_value, LOWER),
-    ("rmse_after_mean", "fit RMSE, mean over videos [ms]", format_value, LOWER),
-    ("rmse_after_max", "fit RMSE, worst over videos [ms]", format_value, LOWER),
-    ("r2_after_min", "fit R2, worst over videos", format_value, HIGHER),
-    ("false_rejections", "outliers rejected in error", format_value, LOWER),
-    ("false_acceptances", "misdecodes kept as inliers", format_value, LOWER),
-    ("n_flagged", "frames with both a fit and an annotation", format_value, None),
-    ("n_considered_frames", "frames in the fit", format_value, None),
-    ("n_rejected_frames", "frames rejected by the fit", format_value, None),
-    ("n_dropped_frames", "frames missing from the container", format_value, None),
+    ("residual_threshold_ms_max", "residual_threshold, loosest [ms]", format_value, None),
+    ("clock_rate_error_ppm_mean_abs", "clock_rate error, mean |err| [ppm]", format_value, LOWER),
+    ("clock_rate_error_ppm_max_abs", "clock_rate error, worst |err| [ppm]", format_value, LOWER),
+    ("clock_offset_error_ms_mean_abs", "clock_offset_ms error, mean |err|", format_value, LOWER),
+    ("clock_offset_error_ms_max_abs", "clock_offset_ms error, worst |err|", format_value, LOWER),
+    ("frame_time_error_ms_mean", "first/last_frame error, mean [ms]", format_value, LOWER),
+    ("frame_time_error_ms_max", "first/last_frame error, worst [ms]", format_value, LOWER),
+    ("rmse_after_mean", "rmse_after, mean over videos [ms]", format_value, LOWER),
+    ("rmse_after_max", "rmse_after, worst over videos [ms]", format_value, LOWER),
+    ("r2_after_min", "r2_after, worst over videos", format_value, HIGHER),
+    ("n_considered_frames", "n_considered_frames (fit inliers)", format_value, None),
+    ("n_rejected_frames", "n_rejected_frames (fit outliers)", format_value, None),
+    ("n_dropped_frames", "n_dropped_frames (gaps in container)", format_value, None),
+    ("n_checked_frames", "fit frames with an annotation", format_value, None),
+    ("rejected_but_correct", "  rejected though decoded correctly", format_value, LOWER),
+    ("considered_but_misdecoded", "  kept though misdecoded", format_value, LOWER),
 ]
 
 
@@ -982,22 +1012,16 @@ def print_report(methods, all_metrics, col_width, label_width=LABEL_WIDTH_DEFAUL
 
     print()
     print_header(methods, col_width, label_width, "Value accuracy")
-    _print_value_accuracy(
-        methods,
-        lambda m: all_metrics[m]["ring"]["value_compared"],
-        lambda m: all_metrics[m]["ring"]["start_correct"],
-        "ring.start correct",
-        col_width,
-        label_width,
-    )
-    _print_value_accuracy(
-        methods,
-        lambda m: all_metrics[m]["ring"]["value_compared"],
-        lambda m: all_metrics[m]["ring"]["end_correct"],
-        "ring.end correct",
-        col_width,
-        label_width,
-    )
+    for end in ("start", "end"):
+        for suffix, label in (("correct", "exact"), ("near", f"±{DECODE_TOLERANCE_LEDS} LED")):
+            _print_value_accuracy(
+                methods,
+                lambda m: all_metrics[m]["ring"]["value_compared"],
+                lambda m, key=f"{end}_{suffix}": all_metrics[m]["ring"][key],
+                f"ring.{end} {label}",
+                col_width,
+                label_width,
+            )
 
     # ── Overall ──────────────────────────────────────────────────────────
     print(f"{'=' * 100}")
@@ -1019,12 +1043,19 @@ def print_report(methods, all_metrics, col_width, label_width=LABEL_WIDTH_DEFAUL
         col_width,
         label_width,
     )
+    _print_value_accuracy(
+        methods,
+        lambda m: all_metrics[m]["overall"]["timestamp_compared"],
+        lambda m: all_metrics[m]["overall"]["timestamp_within_tolerance"],
+        f"mid-exposure within ±{DECODE_TOLERANCE_LEDS} ms",
+        col_width,
+        label_width,
+    )
 
     print()
     print_header(methods, col_width, label_width, "Timestamp error (ms)")
     for err_key, err_label in [
-        ("start", "start error"),
-        ("end", "end error"),
+        ("mid", "mid-exposure error"),
         ("exposure", "exposure error"),
     ]:
         print(f"  {err_label.upper():>{label_width}}")

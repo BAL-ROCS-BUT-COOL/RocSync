@@ -9,9 +9,11 @@ full error instead of dragging the line towards itself and hiding half of it.
 
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
+import rocsync.benchmark
 from rocsync.benchmark.common import (
     MEASURED_RESIDUAL_MAX_MS,
     MEASURED_RESIDUAL_MIN_MS,
@@ -108,13 +110,9 @@ def test_round_trips_through_a_dict():
 # ── Per-video tolerance ─────────────────────────────────────────────────────
 
 
-def test_the_measured_tolerance_is_a_third_of_a_source_frame():
-    assert measured_residual_threshold_ms(33.333) == pytest.approx(11.111, abs=1e-3)
-
-
 def test_the_measured_tolerance_is_clamped_at_both_ends():
-    # A 240 fps camera would ask for less than the board itself resolves
-    assert measured_residual_threshold_ms(1000 / 240) == MEASURED_RESIDUAL_MIN_MS
+    # A camera fast enough that a whole frame is below what the board itself resolves
+    assert measured_residual_threshold_ms(MEASURED_RESIDUAL_MIN_MS) == MEASURED_RESIDUAL_MIN_MS
     # and a 2 fps one for more than a ring period, which would hide a counter step
     assert measured_residual_threshold_ms(500.0) == MEASURED_RESIDUAL_MAX_MS
     # An unreadable frame rate falls back to the loosest tolerance rather than the tightest
@@ -128,7 +126,7 @@ def test_a_synthesized_timeline_is_held_to_one_led_at_each_end():
 
 def test_a_measured_timeline_is_held_to_its_own_frame_rate():
     entry = {"timeline": "measured", "source_frame_period_ms": 33.333}
-    assert residual_threshold_ms(entry) == pytest.approx(11.111, abs=1e-3)
+    assert residual_threshold_ms(entry) == measured_residual_threshold_ms(33.333)
 
 
 def test_a_stored_tolerance_outranks_the_rule_of_the_day():
@@ -137,27 +135,48 @@ def test_a_stored_tolerance_outranks_the_rule_of_the_day():
     assert residual_threshold_ms({**entry, "residual_threshold_ms": 7.5}) == 7.5
 
 
+PREPARE_CLIP = Path(rocsync.benchmark.__file__).parent / "prepare_clip.sh"
+
+
 @pytest.fixture(scope="module")
 def decimated_clip(tmp_path_factory):
-    """Every 16th frame of a 30 fps recording, the shape the dataset's clips have."""
+    """A 30 fps recording cut down to ~2 fps, the shape the dataset's clips have."""
     directory = tmp_path_factory.mktemp("decimated")
     source, decimated = directory / "src.mp4", directory / "decimated.mp4"
-    common = ["ffmpeg", "-y", "-loglevel", "error"]
     subprocess.run(
-        [*common, "-f", "lavfi", "-i", "testsrc=size=64x48:rate=30:duration=4",
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-f", "lavfi", "-i", "testsrc=size=64x48:rate=30:duration=4",
          "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)],
         check=True,
     )  # fmt: skip
-    subprocess.run(
-        [*common, "-i", str(source), "-vf", "select='not(mod(n,16))'",
-         "-fps_mode", "passthrough", "-c:v", "libx264", str(decimated)],
-        check=True,
-    )  # fmt: skip
-    return decimated
+    subprocess.run([str(PREPARE_CLIP), str(source), "1.9", str(decimated)], check=True)
+    return source, decimated
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg to synthesize the clip")
 def test_the_source_frame_period_survives_decimation(decimated_clip):
-    """The clip's timestamps sit 533 ms apart, but its packets still say 33.3 ms."""
-    assert median_frame_period(frame_pts(decimated_clip)) == pytest.approx(533, abs=1)
-    assert source_frame_period_ms(decimated_clip) == pytest.approx(1000 / 30, abs=0.1)
+    """The clip's own frames sit 533 ms apart, and it still reports the 30 fps it was cut from.
+
+    The tolerance scales from the recording's frame rate, so a clip that could only report
+    its own would be held to a bound 16 times too loose to catch anything.
+    """
+    _, clip = decimated_clip
+
+    assert median_frame_period(frame_pts(clip)) == pytest.approx(533, abs=1)
+    assert source_frame_period_ms(clip) == pytest.approx(1000 / 30, abs=0.1)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg to synthesize the clip")
+def test_a_prepared_clip_keeps_the_timestamps_it_was_cut_from(decimated_clip):
+    """The frames it kept sit where they sat in the recording.
+
+    An encoder left to itself rounds every timestamp onto the grid of the frame rate it
+    guesses, which on a real recording moves a frame by up to half a source frame -- more
+    than the tolerance a clock fitted to those frames is held to.
+    """
+    source, clip = decimated_clip
+    recorded, kept = frame_pts(source), frame_pts(clip)
+
+    assert len(kept) > 5
+    for pts in kept:
+        assert min(abs(pts - t) for t in recorded) == pytest.approx(0.0, abs=0.01)

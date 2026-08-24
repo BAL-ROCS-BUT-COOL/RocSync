@@ -10,7 +10,13 @@ import numpy as np
 
 from rocsync.board_profiles import PROFILES_BY_ARUCO
 from rocsync.dataset import VIDEO_SUFFIXES
-from rocsync.timeline import frame_pts, median_frame_period, probe_packet_field, run_ffprobe
+from rocsync.timeline import (
+    frame_pts,
+    median_frame_period,
+    parse_ratio,
+    probe_packet_field,
+    run_ffprobe,
+)
 
 STEP_ORDER = [
     "aruco_detection",
@@ -35,7 +41,7 @@ MIN_REFERENCE_FRAMES = 5  # a two-point fit is exact by construction and proves 
 # absorb the camera: the container stores a nominal frame rate while the sensor exposes
 # when it pleases, which on the dataset's 30 fps clips scatters by up to 9 ms.
 SYNTHESIZED_RESIDUAL_THRESHOLD_MS = 2.0
-MEASURED_RESIDUAL_FRACTION = 1 / 2  # of a source frame
+MEASURED_RESIDUAL_FRACTION = 1 / 3  # of a source frame
 MEASURED_RESIDUAL_MIN_MS = 2.0  # never tighter than the board itself resolves
 MEASURED_RESIDUAL_MAX_MS = 50.0  # below the ring period, so a counter step still shows
 
@@ -118,11 +124,21 @@ def _probe_packet_count(path):
 def source_frame_period_ms(video_path):
     """Frame period of the recording this file was cut from, in ms, or None.
 
-    Read from the packet duration, which survives decimation: a clip holding every 16th
-    frame of a 30 fps recording still says 33.3 ms per packet while its timestamps sit
-    533 ms apart. The timestamp spacing would describe the subsampling instead, and a
-    tolerance scaled from that would be far too loose to catch anything.
+    A decimated clip cannot say this in its timing: keeping the frames' original
+    timestamps is what the benchmark fits a clock to, and those timestamps describe the
+    subsampling, not the recording. `prepare_clip.sh` therefore writes the recording's
+    frame rate to a metadata tag, which no muxer reinterprets, and that is read first.
     """
+    tagged = run_ffprobe(
+        video_path, "-show_entries", "format_tags=source_frame_rate", "-of", "csv=p=0"
+    )
+    # csv output pads a trailing empty field with a comma, and quotes a value holding one
+    rate = parse_ratio((tagged or "").strip().strip('"').rstrip(","))
+    if rate:
+        return 1000 / rate
+
+    # A clip cut before the tag existed says it in its packets instead: an encoder that
+    # rounds timestamps onto the frame-rate grid leaves the recording's rate behind there
     durations = [d for d in probe_packet_field(video_path, "duration_time") if d > 0]
     if durations:
         # The mode, so one odd packet at a cut cannot stand for the whole recording

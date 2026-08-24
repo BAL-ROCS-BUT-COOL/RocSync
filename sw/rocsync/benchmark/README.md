@@ -190,10 +190,10 @@ Fields:
   approaching the 100 ms ring period would stop flagging a whole counter step. The stored number is what the reference was checked
   against and what scoring reports, so a frozen reference stays valid under the rule it was
   frozen by.
-- `videos[path].source_frame_period_ms`: Frame period of the recording, read from the packet
-  duration rather than the timestamp spacing. A clip holding every 16th frame of a 30 fps
-  recording still says 33.3 ms per packet while its timestamps sit 533 ms apart, and it is the
-  camera's own rate that the tolerance has to scale from.
+- `videos[path].source_frame_period_ms`: Frame period of the recording, read from the
+  `source_frame_rate` tag [`prepare_clip.sh`](#adding-videos-to-the-benchmark) writes. A clip
+  holding every 16th frame of a 30 fps recording has timestamps 533 ms apart and a frame rate of
+  its own of 1.9 fps, and it is the camera's 33.3 ms that the tolerance has to scale from.
 - `videos[path].source` / `source_frame_offset` / `anchors_digest` / `n_frames`: Present on a
   retimed clip only. Frame *j* of the clip is frame *j + source_frame_offset* of `source`, which
   is where its annotations live. The digest covers the annotations it was built from and
@@ -437,14 +437,22 @@ metadata itself, so a backend that did not would put every position in a transpo
 
 ## Adding videos to the benchmark
 
-I recommend to subsample videos to 1-2 fps to obtain 
+Every frame of a video is a benchmark frame and every one of them is annotated by hand, so a
+recording is cut down before it joins the dataset:
 
-The following command subsamples videos to approximately 0.9 fps, while preserving exact frame timestamps:
+```bash
+rocsync/benchmark/prepare_clip.sh input_video.mp4 0.9 <data_dir>/<subset>/clip.mp4
+```
 
-`ffmpeg -i input_video.mp4 -vf "select='isnan(prev_selected_t)+gte(t-prev_selected_t,1/0.9)'" -fps_mode passthrough -c:v libx264 -crf 18 -preset slow -an rocsync_benchmark/<subset>/output_video.mp4`
+0.9–1.9 fps keeps annotation affordable. Avoid rates that divide 100 ms evenly, or every frame
+catches the ring arc at the same phase.
 
-When selecting the output framerate, avoid multiples of 100ms to collect frames with different ring arcs.
-I recommend 0.9 - 1.9 fps to minimize annotation cost.
+The script keeps the frames' original timestamps — a clock is fitted to them, and left to itself
+the encoder rounds each one onto the grid of whichever frame rate it guesses, which on a 30 fps
+recording moves a frame by up to half a frame. It also writes the recording's frame rate to a
+`source_frame_rate` metadata tag, because a clip holding every 16th frame no longer says that
+anywhere in its own timing, and it is the camera's rate the residual tolerance scales from. It
+refuses to write a clip whose tag did not survive the muxer.
 
 ## Removing inputs from the benchmark
 

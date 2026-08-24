@@ -311,10 +311,16 @@ def _is_float(text):
     return True
 
 
-def _parse_ratio(text):
-    """A 'num/den' ffprobe ratio as a float, or None if it is not one."""
-    num, _, den = (text or "").partition("/")
+def parse_ratio(text):
+    """An ffprobe 'num/den' ratio as a float, or None if it is not a number at all.
+
+    A plain number is accepted too, so a field ffprobe prints as a ratio and a human
+    writes as a decimal both read the same.
+    """
+    num, sep, den = (text or "").partition("/")
     try:
+        if not sep:
+            return float(num)
         num, den = float(num), float(den)
     except ValueError:
         return None
@@ -353,7 +359,7 @@ def frame_pts(video_path):
         elif value and value != "N/A":
             stream[name] = value
 
-    time_base = _parse_ratio(stream.get("time_base"))
+    time_base = parse_ratio(stream.get("time_base"))
     if ticks and time_base is not None:
         # Packets arrive in decode order, which B-frames make differ from display order
         ticks.sort()

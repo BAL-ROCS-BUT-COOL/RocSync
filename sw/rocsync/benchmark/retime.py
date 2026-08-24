@@ -167,9 +167,11 @@ def remux(
     Frames are selected by display index but written in decode order, which is not the
     same order once B-frames are involved. A copy also cannot start mid-GOP or orphan a
     reference that a retained frame needs, so the span is widened to the enclosing
-    keyframe and to whatever decode order drags in. That can pull a few frames past the
-    annotated window; they follow the overall anchor slope, which over a handful of
-    frames costs far less than the tolerance they are never checked against anyway.
+    keyframe, and its tail grown until the frames it holds are contiguous in display
+    order -- a decode range that ends inside a B-pyramid group already holds that group's
+    later references while missing one displayed between them. That can pull a few frames
+    past the annotated window; they follow the overall anchor slope, which over a handful
+    of frames costs far less than the tolerance they are never checked against anyway.
 
     `remap` is zeroed on the first anchor, so everything is shifted up by at least
     `pad_ms` before it is written -- far enough that no decode timestamp lands below
@@ -198,8 +200,17 @@ def remux(
         while lo > 0 and not packets[lo].is_keyframe:
             lo -= 1
 
-        kept = sorted(display_of[i] for i in range(lo, hi + 1))
-        if kept != list(range(kept[0], kept[0] + len(kept))):
+        def kept_frames(lo, hi):
+            return sorted(display_of[i] for i in range(lo, hi + 1))
+
+        def is_contiguous(kept):
+            return kept == list(range(kept[0], kept[0] + len(kept)))
+
+        while hi + 1 < len(packets) and not is_contiguous(kept_frames(lo, hi)):
+            hi += 1
+
+        kept = kept_frames(lo, hi)
+        if not is_contiguous(kept):
             raise RetimeError("the frames a stream copy needs are not contiguous")
 
         # `remap` speaks the decoder's start-relative timestamps, packets the raw ones
@@ -253,7 +264,7 @@ def retime_video(data_dir, rel_path, ground_truth, jitter_ms=0.0, force=False):
     pts_by_index = dict(enumerate(frame_pts(data_dir / rel_path)))
     missing = [i for i, _ in anchors if i not in pts_by_index]
     if missing:
-        raise RetimeError(f"{rel_path}: annotated frames {missing[:5]} are not in the file")
+        raise RetimeError(f"annotated frames {missing[:5]} are not in the file")
 
     clock_rate = draw_clock(rel_path)
     remap = build_timeline(anchors, pts_by_index, clock_rate)
@@ -276,7 +287,7 @@ def retime_video(data_dir, rel_path, ground_truth, jitter_ms=0.0, force=False):
     if margin > MAX_MARGIN_FRAMES:
         Path(data_dir / out_rel).unlink(missing_ok=True)
         raise RetimeError(
-            f"{rel_path}: the codec forces {margin} frames outside the annotated window, "
+            f"the codec forces {margin} frames outside the annotated window, "
             f"more than the {MAX_MARGIN_FRAMES} that stay within tolerance"
         )
 
@@ -285,7 +296,7 @@ def retime_video(data_dir, rel_path, ground_truth, jitter_ms=0.0, force=False):
     # from the written file, not from what was handed to the muxer.
     written_pts = frame_pts(data_dir / out_rel)
     if len(written_pts) != n_frames:
-        raise RetimeError(f"{rel_path}: wrote {n_frames} frames but reads back {len(written_pts)}")
+        raise RetimeError(f"wrote {n_frames} frames but reads back {len(written_pts)}")
     anchor_pts = [written_pts[index - start_index] for index, _ in anchors]
     boards = [board_ms for _, board_ms in anchors]
     clock_offset_ms = float(
@@ -297,8 +308,7 @@ def retime_video(data_dir, rel_path, ground_truth, jitter_ms=0.0, force=False):
     if np.abs(residuals).max() > SYNTHESIZED_RESIDUAL_THRESHOLD_MS:
         Path(data_dir / out_rel).unlink(missing_ok=True)
         raise RetimeError(
-            f"{rel_path}: the muxed timeline misses its anchors by up to "
-            f"{np.abs(residuals).max():.3f} ms"
+            f"the muxed timeline misses its anchors by up to {np.abs(residuals).max():.3f} ms"
         )
     # The recording keeps its own measured reference: the two describe different
     # questions, and the report picks between them rather than needing one deleted.
@@ -330,7 +340,7 @@ def _retime_one(data_dir, rel_path, ground_truth, args):
     try:
         return retime_video(data_dir, rel_path, ground_truth, args.jitter_ms, args.force), True
     except (RetimeError, OSError) as e:
-        return f"ERROR: {e}", False
+        return f"ERROR: {rel_path}: {e}", False
 
 
 def main():

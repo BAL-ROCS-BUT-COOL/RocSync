@@ -259,7 +259,8 @@ def find_corners_dots(mask, frame_number, board, debug_dir=None):
 
     return np.array(
         [
-            assigned[i][0] if i in assigned and assigned[i][1] <= board.rough_corner_tol
+            assigned[i][0]
+            if i in assigned and assigned[i][1] <= board.rough_corner_tol
             else (np.nan, np.nan)
             for i in range(len(corner_dots))
         ],
@@ -405,9 +406,7 @@ def rectify_board(
                 src = np.vstack([aruco_corners.reshape(-1, 2), image_corners[found]]).astype(
                     np.float64
                 )
-                dst = np.vstack([board.aruco_corners_coords, corner_dots[found]]).astype(
-                    np.float64
-                )
+                dst = np.vstack([board.aruco_corners_coords, corner_dots[found]]).astype(np.float64)
                 transformation_matrix, _ = cv2.findHomography(src, dst)
                 if transformation_matrix is None:
                     return True, None, board

@@ -156,7 +156,8 @@ def main():
     parser.add_argument(
         "--try-hard",
         action="store_true",
-        help="relaxed mode: refine the homography from partial corner LED detections",
+        help="relaxed mode: refine the homography from partial corner LED detections "
+        "and accept the board at any distance",
     )
 
     args = parser.parse_args()

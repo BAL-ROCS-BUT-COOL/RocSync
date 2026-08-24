@@ -301,9 +301,11 @@ def rectify_board(
     RectifiedBoard the reading should be decoded against.
 
     `min_aruco_area_fraction` rejects frames where the board was held too far away; pass 0
-    to read whatever the marker detector found, however small.
+    to read whatever the marker detector found, however small. `try_hard` forces it to 0.
     """
     _init_stats(stats)
+    if try_hard:
+        min_aruco_area_fraction = 0.0
     match camera_type:
         case CameraType.RGB:
             # Detect ArUco markers

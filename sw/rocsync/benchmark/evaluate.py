@@ -37,6 +37,7 @@ from rocsync.board_profiles import BOARD_V1, PROFILES_BY_ARUCO
 CORNER_IMAGE_SPACE_THRESHOLD_PX = 3
 # A corner counts as found when it lands within one LED sampling disc of where it belongs.
 CORNER_BOARD_SPACE_THRESHOLD_PX = BOARD_V1.rectify().led_sample_radius
+DECODE_TOLERANCE_LEDS = 1
 LABEL_WIDTH_DEFAULT = 40
 
 
@@ -161,12 +162,20 @@ def _timestamp_extractable(gt):
     return board is not None and reconstruct_timestamp(gt, board) is not None
 
 
-def _corner_positions(entry):
-    """Annotated or predicted corner LED positions in image space, None per invisible corner."""
-    return [
+def _corner_positions(entry, n_leds=None):
+    """Annotated or predicted corner LED positions in image space, None per invisible corner.
+
+    Position i names always-on LED i on both sides, so the two lists compare slot by
+    slot. `n_leds` pads a shorter list, which is how a run that reported nothing for a
+    five-LED board still gets scored against all five annotated slots.
+    """
+    positions = [
         c["position"] if c.get("visible") and c.get("position") is not None else None
         for c in entry.get("corners", [])
     ]
+    if n_leds is None:
+        return positions
+    return (positions + [None] * n_leds)[:n_leds]
 
 
 def _to_board_space(positions, gt):
@@ -210,14 +219,17 @@ def compute_step_detection(benchmark_images, gt_images, step):
         if step == "corners":
             gt_corners = gt.get("corners", [])
             pred_corners = pred.get("corners", [])
-            gt_positions = _corner_positions(gt)
-            pred_positions = _corner_positions(pred)
+            # The annotation says how many LEDs the board has; a shorter prediction is
+            # a run that found fewer, not a board with fewer slots to find them in.
+            n_leds = len(gt_corners)
+            gt_positions = _corner_positions(gt, n_leds)
+            pred_positions = _corner_positions(pred, n_leds)
 
             gt_any_visible = any(c.get("visible", False) for c in gt_corners)
             pred_any_visible = any(c.get("visible", False) for c in pred_corners)
             any_tp = False
 
-            for i in range(min(len(gt_positions), len(pred_positions), 4)):
+            for i in range(n_leds):
                 if gt_positions[i] is None or pred_positions[i] is None:
                     continue
                 err = np.linalg.norm(np.array(pred_positions[i]) - np.array(gt_positions[i]))
@@ -294,16 +306,16 @@ def compute_corner_metrics(benchmark_images, gt_images):
         board = _board_for_gt(gt)
         gt_corners = gt.get("corners", [])
         pred_corners = pred.get("corners", [])
-        gt_positions = _corner_positions(gt)
-        pred_positions = _corner_positions(pred)
+        n_corners = len(gt_corners)
+        gt_positions = _corner_positions(gt, n_corners)
+        pred_positions = _corner_positions(pred, n_corners)
         # Board space normalises the threshold to LED sample radii, independent of apparent board size
         gt_board = _to_board_space(gt_positions, gt)
         pred_board = _to_board_space(pred_positions, gt)
-        n_corners = min(len(gt_corners), len(pred_corners))
 
         for i in range(n_corners):
             gt_vis = gt_corners[i].get("visible", False)
-            pred_vis = pred_corners[i].get("visible", False)
+            pred_vis = i < len(pred_corners) and pred_corners[i].get("visible", False)
             both = gt_positions[i] is not None and pred_positions[i] is not None
 
             # Image-space pixel error (on TPs where both are visible with positions)

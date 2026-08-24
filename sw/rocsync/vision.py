@@ -216,7 +216,16 @@ def find_corners_convexhull(mask, frame_number, debug_dir=None):
         return corners
 
 
+
 def find_corners_dots(mask, frame_number, board, debug_dir=None):
+    """Match always-on LEDs to their expected spots.
+
+    Returns one row per always-on LED of the board, in board order, holding the matched
+    position in `mask` coordinates or NaN where nothing landed close enough. A caller
+    filters on `np.isfinite` and indexes `board.always_on_leds` with the same mask to
+    recover the nominal spots. Strict mode requires every LED and returns None if any is
+    missing.
+    """
     corner_dots = board.always_on_leds[CameraType.RGB]
     points = blob_detector.detect(mask)
     if not points:
@@ -346,7 +355,7 @@ def rectify_board(
             if corners is None:
                 return True, None, board
             if stats is not None:
-                stats["corner_positions"] = corners.tolist()
+                stats["corner_positions"] = None if corners is None else corners.tolist()
 
             # Only the four anchors define the transform; any extra always-on dots were
             # matched purely as a sanity check.

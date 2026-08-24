@@ -54,8 +54,10 @@ def extract_pipeline_result(stats):
     board = PROFILES_BY_ARUCO[aruco_id] if aruco_id is not None else None
 
     # -- Corners (original image coordinates, as annotated) --
+    n_leds = len(board.always_on_leds[CameraType.RGB]) if board is not None else 4
     corners = [
-        {"visible": pos is not None, "position": pos} for pos in corner_positions_in_image(stats)
+        {"visible": pos is not None, "position": pos}
+        for pos in corner_positions_in_image(stats, n_leds)
     ]
 
     # -- Counter --

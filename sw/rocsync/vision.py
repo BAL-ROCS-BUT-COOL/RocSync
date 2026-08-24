@@ -15,6 +15,9 @@ MIN_ARUCO_AREA_FRACTION = 0.002  # smallest marker area, as a fraction of the fr
 
 ARUCO_DICTIONARY = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 
+CLAHE_CLIP_LIMIT = 2.0
+CLAHE_TILE_GRID_SIZE = (8, 8)
+
 # Keys `rocsync.benchmark` expects to find in a stats dict, whether or not the frame decoded.
 _STATS_KEYS = (
     "aruco_id",
@@ -77,6 +80,7 @@ def _make_aruco_detector():
 
 blob_detector = _make_blob_detector()
 aruco_detector = _make_aruco_detector()
+clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_GRID_SIZE)
 
 
 def draw_polygon(points, image, color):
@@ -265,9 +269,13 @@ def find_corners_dots(mask, frame_number, board, debug_dir=None):
 
 
 def find_corners_aruco(mask, frame_number, debug_dir=None):
-    markers, marker_ids, _ = aruco_detector.detectMarkers(mask)
+    """Locate the board's ArUco marker, equalizing the image first so it survives
+    under- and over-exposure."""
+    gray = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY) if mask.ndim == 3 else mask
+    normalized = clahe.apply(gray)
+    markers, marker_ids, _ = aruco_detector.detectMarkers(normalized)
     if debug_dir:
-        debug_image = mask.copy()
+        debug_image = cv2.cvtColor(normalized, cv2.COLOR_GRAY2BGR)
         cv2.aruco.drawDetectedMarkers(debug_image, markers, marker_ids)
         cv2.imwrite(f"{debug_dir}/aruco_{frame_number}.png", debug_image)
 

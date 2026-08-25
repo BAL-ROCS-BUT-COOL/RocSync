@@ -31,6 +31,7 @@ rocsync-annotate = "rocsync.benchmark.annotate:main"
 rocsync-retime = "rocsync.benchmark.retime:main"
 rocsync-validate = "rocsync.benchmark.validate:main"
 rocsync-evaluate = "rocsync.benchmark.evaluate:main"
+rocsync-inspect = "rocsync.benchmark.inspect:main"
 
 [dependency-groups]
 # av only powers rocsync-retime, which authors benchmark datasets from a checkout

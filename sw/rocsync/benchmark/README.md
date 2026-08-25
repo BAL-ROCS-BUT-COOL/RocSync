@@ -453,6 +453,40 @@ clock is fitted over every annotation on the recording. If an annotation sits ou
 window, its `first/last_frame error` reads as a small extrapolation rather than a measurement
 inside the fit.
 
+## Inspecting Results
+
+Interactive side-by-side viewer: the original input image next to the rectified board view
+reconstructed from one or more result files, one column per file.
+
+```bash
+uv run rocsync-inspect results.json [other.json ...] [--data-dir DIR] [-g ground_truth.json]
+```
+
+- `results`: One or more `rocsync-validate` output files, or a directory of them (as
+  `rocsync-evaluate` takes). Columns are labelled by filename, sorted.
+- `--data-dir`: Validation data directory. Defaults to the `config.data_dir` a result file
+  recorded when it was produced; required when only a ground truth file is given.
+- `-g`: Ground truth JSON to show as an extra column, labelled `ground_truth`.
+
+Each rectified panel is reconstructed from the file's own stored corner and ArUco positions —
+the same fit `rocsync-annotate` shows — not by re-running the pipeline, so it is a faithful
+record of what that checkout actually saw: fit from the visible corner LEDs when there are
+enough of them, falling back to the ArUco marker alone otherwise. A green ring marks a corner
+LED the file recorded as visible, red where the board's expected position is shown instead.
+The header under each column's label reads off the file's stored aruco/counter/ring values and,
+for a `rocsync-validate` output, whether the frame counted as an overall success.
+
+This is the tool for the same comparison `rocsync-evaluate` summarizes numerically — point it at
+two checkouts' outputs to see a specific frame where they disagree.
+
+### Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| D / Right arrow | Next frame |
+| A / Left arrow | Previous frame |
+| Q / Esc | Quit |
+
 ## Comparing branches
 
 `rocsync-evaluate` takes several result files and prints one column per file, named after the file,

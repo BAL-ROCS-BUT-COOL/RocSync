@@ -13,15 +13,18 @@ probe() {
     printf '%s' "${value%,}"
 }
 
-if [ $# -ne 3 ]; then
-    echo "Usage: $(basename "$0") <input_video> <fps> <output_video>" >&2
+if [ $# -lt 3 ] || [ $(( ($# - 3) % 2 )) -ne 0 ]; then
+    echo "Usage: $(basename "$0") <input_video> <fps> <output_video> [<start> <end> ...]" >&2
     echo "  fps: frames per second to keep, e.g. 1.9" >&2
+    echo "  start/end: optional time windows in seconds to restrict extraction to;" >&2
+    echo "             with none given, the whole input is used" >&2
     exit 1
 fi
 
 input=$1
 fps=$2
 output=$3
+shift 3
 
 if [ ! -f "$input" ]; then
     echo "No such file: $input" >&2
@@ -43,8 +46,28 @@ if [ -z "$source_rate" ] || [ "$source_rate" = "0/0" ]; then
     exit 1
 fi
 
+# One term per window, gated by between(t,start,end); with no windows given, the whole
+# input is a single unconditional term.
+sample_gate="(isnan(prev_selected_t)+gte(t-prev_selected_t,1/$fps))"
+if [ $# -eq 0 ]; then
+    select_expr=$sample_gate
+else
+    select_expr=""
+    while [ $# -gt 0 ]; do
+        start=$1
+        end=$2
+        shift 2
+        term="between(t,$start,$end)*$sample_gate"
+        if [ -z "$select_expr" ]; then
+            select_expr=$term
+        else
+            select_expr="$select_expr+$term"
+        fi
+    done
+fi
+
 ffmpeg -hide_banner -loglevel error -i "$input" \
-    -vf "select='isnan(prev_selected_t)+gte(t-prev_selected_t,1/$fps)'" \
+    -vf "select='$select_expr',showinfo" \
     -fps_mode passthrough -enc_time_base -1 \
     -c:v libx264 -crf 18 -preset slow -an \
     -metadata source_frame_rate="$source_rate" -movflags use_metadata_tags \

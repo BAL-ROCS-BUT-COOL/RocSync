@@ -356,8 +356,8 @@ def rectify_board(
                 # Corners are detected in this grid; the benchmark needs it to get back to image space
                 stats["rough_homography"] = rough_transformation_matrix
             t0 = time.perf_counter()
-            corners = find_corners_dots(rough_pcb, frame_number, board, debug_dir)
-            found = np.isfinite(corners).all(axis=1)
+            rough_corners = find_corners_dots(rough_pcb, frame_number, board, debug_dir)
+            found = np.isfinite(rough_corners).all(axis=1)
             _record_step(
                 stats,
                 "corner_detection",
@@ -365,17 +365,25 @@ def rectify_board(
                 success=bool(found.any()),
                 count=int(found.sum()),
             )
+
+            # Corners are matched in the rough-rectified grid; un-warp them back to image
+            # space so everything this function stores is in one coordinate space.
+            inv_rough = np.linalg.inv(rough_transformation_matrix)
+            image_corners = np.full_like(rough_corners, np.nan)
+            if found.any():
+                image_corners[found] = cv2.perspectiveTransform(
+                    rough_corners[found].reshape(1, -1, 2), inv_rough
+                ).reshape(-1, 2)
             if stats is not None:
-                stats["corner_positions"] = corners.tolist()
+                stats["corner_positions"] = image_corners.tolist()
 
             # The first four always-on LEDs are the perspective-transform anchors; without
             # all four there's nothing to fit the fine homography from. Any extra always-on
             # dots beyond those four were matched purely as a sanity check.
             if not found[:4].all():
                 return True, None, board
-            transformation_matrix = np.dot(
-                cv2.getPerspectiveTransform(corners[:4], board.transform_corners(CameraType.RGB)),
-                rough_transformation_matrix,
+            transformation_matrix = cv2.getPerspectiveTransform(
+                image_corners[:4], board.transform_corners(CameraType.RGB)
             )
             t0 = time.perf_counter()
             pcb = cv2.warpPerspective(mask, transformation_matrix, (board_size, board_size))
@@ -391,20 +399,35 @@ def rectify_board(
             gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             _, mask = cv2.threshold(gray_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+            t0 = time.perf_counter()
             corners = find_corners_convexhull(mask, frame_number, debug_dir)
+            _record_step(stats, "corner_detection", t0, success=corners is not None)
+            if corners is not None and stats is not None:
+                stats["corner_positions"] = corners.tolist()
             if corners is None:
                 return False, None, board
             transformation_matrix = cv2.getPerspectiveTransform(
                 corners, board.transform_corners(CameraType.INFRARED)
             )
+            t0 = time.perf_counter()
             pcb = cv2.warpPerspective(mask, transformation_matrix, (board_size, board_size))
+            _record_step(stats, "fine_rectification", t0)
 
-            # Find correct rotation
+            # Board orientation is ambiguous from the convex hull alone; find the rotation
+            # that reads a nonzero counter. Rotating pcb without rotating the transform that
+            # produced it would leave `homography` describing the wrong orientation, so fold
+            # each 90° step into the matrix too: it is the same rotation applied to the
+            # *board*-space side of the fit.
+            n = board_size
+            rotate_90 = np.array([[0, -1, n - 1], [1, 0, 0], [0, 0, 1]], dtype=np.float64)
             for _ in range(4):
                 if read_counter(pcb, CameraType.INFRARED, board) == 0:
                     pcb = cv2.rotate(pcb, cv2.ROTATE_90_CLOCKWISE)
+                    transformation_matrix = rotate_90 @ transformation_matrix
             if read_counter(pcb, CameraType.INFRARED, board) == 0:
                 return True, None, board  # Counter was 0, orientation undeterminable
+            if stats is not None:
+                stats["homography"] = transformation_matrix
 
         case _:
             raise ValueError(f"Unsupported camera type: {camera_type!r}")

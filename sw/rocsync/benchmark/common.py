@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from rocsync.board_profiles import PROFILES_BY_ARUCO
+from rocsync.camera import CameraType
 from rocsync.dataset import VIDEO_SUFFIXES
 from rocsync.timeline import (
     frame_pts,
@@ -393,29 +394,19 @@ class FrameSource:
 def corner_positions_in_image(stats, n_leds=4):
     """Detected corner LED positions in original image coordinates, one slot per LED.
 
-    The pipeline detects corners in the rough-rectified grid, whose scale is a
-    property of the branch under test. Un-warping through that grid's own
-    homography yields the annotated quantity, comparable across branches.
-
-    The pipeline reports one row per always-on LED, NaN where it found none; this is
-    where that becomes the None the annotation format uses, so position i always names
-    LED i. `n_leds` only sizes the all-None result for a frame that reported nothing.
+    The pipeline reports these already in image space (`rocsync.vision.rectify_board`
+    un-warps its own rough-rectified detections before storing them), one row per
+    always-on LED with NaN where it found none; this is where that becomes the None
+    the annotation format uses, so position i always names LED i. `n_leds` only sizes
+    the all-None result for a frame that reported nothing.
     """
     positions = stats.get("corner_positions")
-    rough_H = stats.get("rough_homography")
-    if positions is None or rough_H is None:
+    if positions is None:
         return [None] * n_leds
 
     positions = np.array(positions, dtype=np.float64).reshape(-1, 2)
     found = np.isfinite(positions).all(axis=1)
-    slots = [None] * len(positions)
-    if found.any():
-        inv_rough = np.linalg.inv(np.array(rough_H, dtype=np.float64))
-        pts = positions[found].reshape(1, -1, 2)
-        mapped = cv2.perspectiveTransform(pts, inv_rough).reshape(-1, 2).tolist()
-        for i, point in zip(np.flatnonzero(found), mapped, strict=True):
-            slots[i] = point
-    return slots
+    return [positions[i].tolist() if found[i] else None for i in range(len(positions))]
 
 
 def rectification_errors(pred_H, gt_H, points):
@@ -466,6 +457,11 @@ def reconstruct_timestamp(image_data, board):
     # Annotations hold a half-open interval; the board decodes an inclusive one
     timestamp = board.board_time_from_ring(counter_value, (start, (end - 1) % board.period))
     return list(timestamp) if timestamp is not None else None
+
+
+def annotation_camera(entry):
+    """The `CameraType` an annotation was made under."""
+    return CameraType(entry.get("camera", CameraType.RGB.value))
 
 
 def annotated_board_time(entry):

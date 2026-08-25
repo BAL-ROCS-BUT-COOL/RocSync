@@ -23,10 +23,13 @@ from tqdm import tqdm
 from rocsync.benchmark.common import (
     STEP_ORDER,
     FrameSource,
+    annotation_camera,
     collect_frames,
     corner_positions_in_image,
     frame_key,
     parse_frame_key,
+    retimed_videos,
+    source_key,
 )
 from rocsync.board_profiles import PROFILES_BY_ARUCO
 from rocsync.camera import CameraType
@@ -39,8 +42,13 @@ def _matrix(H):
     return np.asarray(H, dtype=np.float64).tolist() if H is not None else None
 
 
-def extract_pipeline_result(stats):
+def extract_pipeline_result(stats, camera, board):
     """Extract a ground-truth-compatible result dict from pipeline stats.
+
+    `camera` and `board` are the mode and profile the frame was run under — an
+    explicit annotation, or RGB with auto-resolution when there is none — so a run
+    can be scored against the layout it actually used rather than one re-derived
+    from the ArUco marker, which IR never detects.
 
     Returns a dict with keys: aruco, corners, counter, ring, timestamp,
     homography, rough_homography. Structure mirrors ground_truth.json to
@@ -49,7 +57,6 @@ def extract_pipeline_result(stats):
     steps = stats.get("steps", {})
 
     # -- ArUco --
-    aruco_id = stats.get("aruco_id", None)
     aruco_step = steps.get("aruco_detection", {})
     aruco_visible = aruco_step.get("success", False)
     aruco = {
@@ -57,10 +64,9 @@ def extract_pipeline_result(stats):
         "id": stats.get("aruco_id") if aruco_visible else None,
         "corners": stats.get("aruco_corners") if aruco_visible else None,
     }
-    board = PROFILES_BY_ARUCO[aruco_id] if aruco_id is not None else None
 
     # -- Corners (original image coordinates, as annotated) --
-    n_leds = len(board.always_on_leds[CameraType.RGB]) if board is not None else 4
+    n_leds = len(board.always_on_leds[camera]) if board is not None else 4
     corners = [
         {"visible": pos is not None, "position": pos}
         for pos in corner_positions_in_image(stats, n_leds)
@@ -138,8 +144,19 @@ def run_provenance(data_dir, n_images):
     }
 
 
-def run_benchmark(frames, debug_dir=None):
-    """Run pipeline on all frames, returning results dict keyed by frame key."""
+def run_benchmark(frames, ground_truth=None, debug_dir=None):
+    """Run pipeline on all frames, returning results dict keyed by frame key.
+
+    `ground_truth`, when given, decides each frame's camera mode and board: IR has no
+    marker to auto-resolve either from, so a frame with no annotation falls back to RGB
+    with the board left for the pipeline to detect, exactly as an unannotated run always
+    has. The validator walks retimed clips while annotations are keyed to the recordings
+    they were cut from, so a retimed frame's key is resolved back to its source first.
+    """
+    ground_truth = ground_truth or {}
+    images = ground_truth.get("images") or {}
+    retimed = retimed_videos(ground_truth)
+
     results = {}
     with FrameSource() as source:
         for i, ref in enumerate(tqdm(frames)):
@@ -148,16 +165,23 @@ def run_benchmark(frames, debug_dir=None):
                 print(f"  WARNING: could not read {ref.key}", file=sys.stderr)
                 continue
 
+            entry = images.get(source_key(ref.key, retimed))
+            camera = annotation_camera(entry) if entry is not None else CameraType.RGB
+            aruco_id = entry.get("aruco", {}).get("id") if entry is not None else None
+            profile = PROFILES_BY_ARUCO.get(aruco_id)
+
             stats = {}
             success, timestamp = process_frame(
                 image,
-                CameraType.RGB,
+                camera,
                 i,
+                board=profile,
                 debug_dir=debug_dir,
                 stats=stats,
             )
 
-            result = extract_pipeline_result(stats)
+            result_board = profile or PROFILES_BY_ARUCO.get(stats.get("aruco_id"))
+            result = extract_pipeline_result(stats, camera, result_board)
             timing = extract_pipeline_timing(stats)
 
             results[ref.key] = {
@@ -249,6 +273,13 @@ def main():
         default="benchmark_results.json",
         help="Output JSON file (default: benchmark_results.json)",
     )
+    parser.add_argument(
+        "-g",
+        "--ground-truth",
+        default=None,
+        help="Ground truth JSON, for each frame's camera mode and board "
+        "(default: <data_dir>/ground_truth.json)",
+    )
     parser.add_argument("--debug", default=None, help="Directory for debug images")
     args = parser.parse_args()
 
@@ -261,13 +292,22 @@ def main():
     if args.debug:
         Path(args.debug).mkdir(parents=True, exist_ok=True)
 
+    gt_path = Path(args.ground_truth) if args.ground_truth else data_dir / "ground_truth.json"
+    ground_truth = None
+    if gt_path.is_file():
+        with open(gt_path) as f:
+            ground_truth = json.load(f)
+    elif args.ground_truth:
+        print(f"No ground truth at {gt_path}", file=sys.stderr)
+        sys.exit(1)
+
     n_stills = sum(1 for ref in frames if ref.index is None)
     n_videos = len({ref.path for ref in frames if ref.index is not None})
     print(
         f"Found {len(frames)} frames: {n_stills} images and "
         f"{len(frames) - n_stills} frames from {n_videos} videos"
     )
-    results = run_benchmark(frames, debug_dir=args.debug)
+    results = run_benchmark(frames, ground_truth=ground_truth, debug_dir=args.debug)
 
     n_success = sum(1 for r in results.values() if r["success"])
     print(f"Detection rate: {n_success}/{len(results)} ({n_success / len(results):.1%})")

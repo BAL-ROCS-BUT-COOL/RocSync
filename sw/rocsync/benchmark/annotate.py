@@ -25,6 +25,7 @@ import numpy as np
 from rocsync.benchmark.common import (
     MIN_REFERENCE_FRAMES,
     FrameSource,
+    annotation_camera,
     collect_frames,
     corner_positions_in_image,
     fit_reference_clock,
@@ -53,20 +54,20 @@ BOARD_TICK_PX = 10
 # ── Board geometry helpers ──────────────────────────────────────────────────
 
 
-def ring_led_positions(board):
+def ring_led_positions(board, camera):
     """Return list of (x, y) tuples for ring LEDs in rectified board coords."""
-    return [(int(x), int(y)) for x, y in board.ring_led_coords(CameraType.RGB)]
+    return [(int(x), int(y)) for x, y in board.ring_led_coords(camera)]
 
 
-def counter_led_positions(board):
+def counter_led_positions(board, camera):
     """Return list of (x, y) tuples for counter LEDs in rectified board coords."""
-    coords = board.counter_led_coords[CameraType.RGB]
+    coords = board.counter_led_coords[camera]
     return [(int(p[0]), int(p[1])) for p in coords]
 
 
-def corner_led_positions(board):
+def corner_led_positions(board, camera):
     """Return list of (x, y) tuples for corner LEDs in rectified board coords."""
-    return [(int(p[0]), int(p[1])) for p in board.always_on_leds[CameraType.RGB]]
+    return [(int(p[0]), int(p[1])) for p in board.always_on_leds[camera]]
 
 
 def counter_bbox(counter_pos):
@@ -106,13 +107,13 @@ def _determines_homography(points, min_area):
     )
 
 
-def fit_corner_homography(corners, board):
+def fit_corner_homography(corners, board, camera):
     """Fit original image → rectified board from the visible corner LEDs, or None.
 
     None means the visible corners do not determine a map: too few of them, board
     coordinates that are degenerate, or a fit that came out singular.
     """
-    board_pos = board.always_on_leds[CameraType.RGB]
+    board_pos = board.always_on_leds[camera]
     visible = [i for i, c in enumerate(corners) if c["visible"]]
     if len(visible) < MIN_HOMOGRAPHY_CORNERS:
         return None
@@ -167,15 +168,15 @@ def board_from_view(view, board, margin=BOARD_MARGIN_PX):
     return view[margin : margin + bs, margin : margin + bs].copy()
 
 
-def decode_clock(rectified, board):
+def decode_clock(rectified, board, camera):
     """(counter_leds, counter_value, ring_start, ring_end) read off a rectified board.
 
     The ring is returned in the annotation's half-open ascending form; start == end means
     no arc was found.
     """
     stats = {"steps": {}}
-    counter = read_counter(rectified, CameraType.RGB, board, stats=stats)
-    ring = read_ring(rectified, CameraType.RGB, board, stats=stats)
+    counter = read_counter(rectified, camera, board, stats=stats)
+    ring = read_ring(rectified, camera, board, stats=stats)
     leds = [bool(v) for v in stats["counter_leds"]]
     if ring is None:
         return leds, counter, 0, 0
@@ -208,6 +209,7 @@ class ImageAnnotation:
     """
 
     board: RectifiedBoard  # not serialized
+    camera: CameraType  # not serialized directly; drives which LED layout applies
 
     aruco_visible: bool = False
     aruco_id: int = 0
@@ -228,15 +230,15 @@ class ImageAnnotation:
 
     def __post_init__(self):
         if not self.corners:
-            corner_pos = corner_led_positions(self.board)
+            corner_pos = corner_led_positions(self.board, self.camera)
             self.corners = [{"visible": False, "position": list(p)} for p in corner_pos]
         if not self.counter_leds:
             self.counter_leds = [False] * self.board.counter_bits
 
     @classmethod
-    def from_stats(cls, stats, board):
+    def from_stats(cls, stats, board, camera):
         """Pre-populate annotation from pipeline stats dict."""
-        ann = cls(board=board)
+        ann = cls(board=board, camera=camera)
 
         # Homography (original → rectified)
         H = stats.get("homography")
@@ -247,9 +249,9 @@ class ImageAnnotation:
         # ArUco
         aruco_id = stats.get("aruco_id")
         ann.aruco_visible = aruco_id is not None
-        ann.aruco_id = aruco_id if aruco_id is not None else 0
+        ann.aruco_id = aruco_id if aruco_id is not None else board.aruco_marker_id
 
-        # Corner LEDs — the pipeline detects them in rough-rectified space
+        # Corner LEDs — the pipeline reports these in original image space
         for i, pos in enumerate(corner_positions_in_image(stats)):
             if i < len(ann.corners) and pos is not None:
                 ann.corners[i]["visible"] = True
@@ -305,15 +307,14 @@ class ImageAnnotation:
                 corners.append({"visible": False})
 
         result = {
-            "aruco": {"visible": self.aruco_visible},
+            "camera": self.camera.value,
+            "aruco": {"visible": self.aruco_visible, "id": self.aruco_id},
             "corners": corners,
             "homography": self.homography,
             "counter": {"visible": self.counter_visible},
             "ring": {},
         }
 
-        if self.aruco_visible:
-            result["aruco"]["id"] = self.aruco_id
         if self.counter_visible:
             result["counter"]["value"] = self.counter_value
         if self.ring_start == self.ring_end:
@@ -325,15 +326,15 @@ class ImageAnnotation:
         return result
 
     @classmethod
-    def from_dict(cls, data, board):
-        ann = cls(board=board)
+    def from_dict(cls, data, board, camera):
+        ann = cls(board=board, camera=camera)
         aruco = data.get("aruco", {})
         ann.aruco_visible = aruco.get("visible", False)
-        ann.aruco_id = aruco.get("id", 0)
+        ann.aruco_id = aruco.get("id", board.aruco_marker_id)
 
         ann.homography = data.get("homography")
 
-        corner_pos = corner_led_positions(board)
+        corner_pos = corner_led_positions(board, camera)
         for i, c in enumerate(data.get("corners", [])):
             if i < len(ann.corners):
                 if "position" in c:
@@ -515,7 +516,7 @@ class Mode(Enum):
     IDLE = "idle"
     DRAGGING_CORNER = "dragging"
     RING_AWAITING_END = "ring_end"
-    ARUCO_CONFIRM = "aruco_confirm"  # board profile changed, Esc to revert
+    LAYOUT_CONFIRM = "layout_confirm"  # board, marker, or camera mode changed, Esc to revert
 
 
 # ── Display and interaction ─────────────────────────────────────────────────
@@ -555,11 +556,13 @@ HELP_TEXT = [
     "Drag corner LED   : Refine position",
     "Click counter LED : Toggle ON / OFF",
     "Click counter box : Toggle counter visibility",
-    "Click ArUco area  : Cycle ID 0 / ID 21 / none",
+    "Click ArUco area  : Cycle ID 0 visible/hidden,",
+    "                    then ID 21 visible/hidden",
     "Click ring LED    : Set first ON, then first OFF",
     "                    (same LED = undecodable)",
     "=== Keys ===",
     "0-N               : Place that corner next",
+    "M                 : Toggle camera mode (RGB / IR)",
     ". / ,             : Next / previous input file",
     "=== Rectified view ===",
     "Any corner edit re-fits the board view,",
@@ -600,11 +603,12 @@ class AnnotationTool:
         self._video_threshold: dict[str, tuple[float | None, float]] = {}
         self._dirty_videos: set[str] = set()
 
-        # Board profile and derived geometry (set per-image)
+        # Board profile, camera mode, and derived geometry (set per-image)
         self.board = BOARD_V1.rectify()
-        self.ring_pos = ring_led_positions(self.board)
-        self.counter_pos = counter_led_positions(self.board)
-        self.corner_pos = corner_led_positions(self.board)
+        self.camera = CameraType.RGB
+        self.ring_pos = ring_led_positions(self.board, self.camera)
+        self.counter_pos = counter_led_positions(self.board, self.camera)
+        self.corner_pos = corner_led_positions(self.board, self.camera)
         self.counter_box = counter_bbox(self.counter_pos)
         self.aruco_x1 = int(self.board.aruco_corners_coords[0][0])
         self.aruco_y1 = int(self.board.aruco_corners_coords[0][1])
@@ -637,15 +641,18 @@ class AnnotationTool:
         self._ring_edited = False
         self._needs_redraw = True
         self._window_sized = False
-        # (annotation, board) before board-changing ArUco cycle
-        self._aruco_snapshot: tuple[ImageAnnotation, RectifiedBoard] | None = None
+        # Annotation snapshots keyed by (aruco_id, camera.value), taken before a layout
+        # change; lets a mis-click on a board or mode change undo without losing work.
+        self._layout_snapshots: dict[tuple[int, str], ImageAnnotation] = {}
+        self._layout_original: tuple[ImageAnnotation, RectifiedBoard, CameraType] | None = None
 
-    def _set_board(self, board):
-        """Update board profile and recompute derived geometry."""
+    def _set_layout(self, board, camera):
+        """Update board profile, camera mode, and recompute derived geometry."""
         self.board = board
-        self.ring_pos = ring_led_positions(board)
-        self.counter_pos = counter_led_positions(board)
-        self.corner_pos = corner_led_positions(board)
+        self.camera = camera
+        self.ring_pos = ring_led_positions(board, camera)
+        self.counter_pos = counter_led_positions(board, camera)
+        self.corner_pos = corner_led_positions(board, camera)
         self.counter_box = counter_bbox(self.counter_pos)
         self.aruco_x1 = int(board.aruco_corners_coords[0][0])
         self.aruco_y1 = int(board.aruco_corners_coords[0][1])
@@ -694,13 +701,34 @@ class AnnotationTool:
             unreadable = 0
             self._pump()
 
+            # Resolve camera mode and a board guess from the saved annotation if there is
+            # one, else stay on whatever the previous frame left `self.camera`/`self.board`
+            # at — a video's frames are usually all the same mode, so this is what keeps a
+            # long IR clip from needing `M` pressed once per frame.
+            saved = frame_key in self.ground_truth["images"]
+            entry = self.ground_truth["images"].get(frame_key)
+            camera = annotation_camera(entry) if entry is not None else self.camera
+            guess_profile = (
+                PROFILES_BY_ARUCO.get(entry.get("aruco", {}).get("id"), self.board.profile)
+                if entry is not None
+                else self.board.profile
+            )
+
             # Run pipeline
             self.stats = {}
             try:
                 # No area gate: the annotator should see every marker the detector found,
                 # however small — rejecting it is the benchmark's call, not the ground truth's.
+                # IR has no marker to auto-resolve a board from, so it always needs an
+                # explicit guess; RGB stays free to auto-resolve on an unannotated frame.
+                board_hint = guess_profile if saved or camera == CameraType.INFRARED else None
                 process_frame(
-                    image, CameraType.RGB, 0, stats=self.stats, min_aruco_area_fraction=0.0
+                    image,
+                    camera,
+                    0,
+                    board=board_hint,
+                    stats=self.stats,
+                    min_aruco_area_fraction=0.0,
                 )
             except Exception as e:  # noqa: BLE001 — a bad frame must not kill the session
                 print(f"Pipeline error on {frame_key}: {e}", file=sys.stderr)
@@ -710,25 +738,20 @@ class AnnotationTool:
 
             # Resolve board profile from pipeline detection or saved annotation
             aruco_id = self.stats.get("aruco_id")
-            if frame_key in self.ground_truth["images"]:
-                saved_id = self.ground_truth["images"][frame_key].get("aruco", {}).get("id")
-                if saved_id is not None:
-                    aruco_id = saved_id
-            profile = (
-                PROFILES_BY_ARUCO.get(aruco_id, BOARD_V1) if aruco_id is not None else BOARD_V1
-            )
+            if entry is not None:
+                aruco_id = entry.get("aruco", {}).get("id", aruco_id)
+            elif aruco_id is None:
+                aruco_id = guess_profile.aruco_marker_id
+            profile = PROFILES_BY_ARUCO.get(aruco_id, BOARD_V1)
             board = profile.rectify()
-            self._set_board(board)
+            self._set_layout(board, camera)
 
             # Load existing annotation or create from pipeline
             coarse_fit = False
-            saved = frame_key in self.ground_truth["images"]
             if saved:
-                self.annotation = ImageAnnotation.from_dict(
-                    self.ground_truth["images"][frame_key], board
-                )
+                self.annotation = ImageAnnotation.from_dict(entry, board, camera)
             else:
-                self.annotation = ImageAnnotation.from_stats(self.stats, board)
+                self.annotation = ImageAnnotation.from_stats(self.stats, board, camera)
                 # Use the pipeline homography for new annotations, falling back to the
                 # marker alone when corner detection failed — a coarse view to refine
                 # beats a black panel and corners parked at a guess.
@@ -865,40 +888,42 @@ class AnnotationTool:
 
     def _process_key(self, key):
         if key in (13, 10, 32):  # Enter or Space
-            self._commit_aruco_change()
+            self._commit_layout_change()
             return "accept"
         elif key == 83 or key == ord("d"):  # Right arrow
-            self._commit_aruco_change()
+            self._commit_layout_change()
             return "skip"
         elif key == 81 or key == ord("a"):  # Left arrow
-            self._commit_aruco_change()
+            self._commit_layout_change()
             return "back"
         elif key in (ord("n"), ord("N")):
-            self._commit_aruco_change()
+            self._commit_layout_change()
             return "next_unannotated"
         elif key in (ord("b"), ord("B")):
-            self._commit_aruco_change()
+            self._commit_layout_change()
             return "prev_unannotated"
         elif key == ord("."):
-            self._commit_aruco_change()
+            self._commit_layout_change()
             return "next_source"
         elif key == ord(","):
-            self._commit_aruco_change()
+            self._commit_layout_change()
             return "prev_source"
         elif key in (ord("c"), ord("C"), 8, 127):  # C or Backspace
-            self._commit_aruco_change()
+            self._commit_layout_change()
             return "clear"
         elif key in (ord("q"), ord("Q")):
-            self._commit_aruco_change()
+            self._commit_layout_change()
             return "quit"
         elif key in (ord("h"), ord("H")):
             self.show_help = not self.show_help
             self._needs_redraw = True
+        elif key in (ord("m"), ord("M")):
+            self._cycle_camera()
         elif ord("0") <= key <= ord("9"):
             self._select_placing_corner(key - ord("0"))
         elif key == 27:  # Escape
-            if self.mode == Mode.ARUCO_CONFIRM:
-                self._revert_aruco_change()
+            if self.mode == Mode.LAYOUT_CONFIRM:
+                self._revert_layout_change()
             elif self.mode == Mode.RING_AWAITING_END:
                 self.mode = Mode.IDLE
                 self._ring_start_candidate = None
@@ -981,7 +1006,7 @@ class AnnotationTool:
             if event == cv2.EVENT_MOUSEMOVE:
                 self._needs_redraw = True
             if event == cv2.EVENT_LBUTTONDOWN:
-                self._commit_aruco_change()
+                self._commit_layout_change()
                 idx = self._hit_test_corner_original(ox, oy)
                 if idx is not None:
                     # On a corner overlay: hold for a drag, release without one to place.
@@ -1055,7 +1080,7 @@ class AnnotationTool:
 
         elem, idx = self._hit_test(bx, by)
         if elem != "aruco":
-            self._commit_aruco_change()
+            self._commit_layout_change()
         if elem == "corner":
             self._drag_idx = idx
             self._drag_start = (bx, by)
@@ -1138,90 +1163,105 @@ class AnnotationTool:
         self._needs_redraw = True
 
     def _cycle_aruco(self):
+        """Cycle (marker id, visible) through every board with the marker shown or hidden.
+
+        Four states for two board revisions: id0 visible → id0 hidden → id1 visible →
+        id1 hidden → … A board must stay selectable with the marker hidden — the ArUco
+        marker itself is never visible in IR — so `visible` toggles independently of which
+        board is picked, rather than `none` being a single shared third state as before.
+        """
         ann = self.annotation
+        states = [(marker_id, visible) for marker_id in ARUCO_IDS for visible in (True, False)]
+        try:
+            idx = states.index((ann.aruco_id, ann.aruco_visible))
+        except ValueError:
+            idx = -1
+        new_id, new_visible = states[(idx + 1) % len(states)]
+        new_board = PROFILES_BY_ARUCO[new_id].rectify() if new_id in PROFILES_BY_ARUCO else self.board
+        self._switch_layout(new_board, self.camera, new_visible, new_id)
 
-        # Determine the new ArUco state
-        new_visible = ann.aruco_visible
-        new_id = ann.aruco_id
-        if not ann.aruco_visible:
-            new_visible = True
-            new_id = ARUCO_IDS[0]
-        else:
-            try:
-                idx = ARUCO_IDS.index(ann.aruco_id)
-                if idx + 1 < len(ARUCO_IDS):
-                    new_id = ARUCO_IDS[idx + 1]
-                else:
-                    new_visible = False
-            except ValueError:
-                new_visible = False
+    def _cycle_camera(self):
+        """Toggle RGB / IR, keeping the current board and marker selection."""
+        new_camera = CameraType.INFRARED if self.camera == CameraType.RGB else CameraType.RGB
+        ann = self.annotation
+        self._switch_layout(self.board, new_camera, ann.aruco_visible, ann.aruco_id)
 
-        # Snapshot on first cycle; subsequent cycles update in-place
-        if self._aruco_snapshot is None:
-            self._aruco_snapshot = (copy.deepcopy(self.annotation), self.board)
+    def _switch_layout(self, new_board, new_camera, new_aruco_visible, new_aruco_id):
+        """Switch to a different board / camera / marker layout.
 
-        # Check if the board profile changes. Rectified boards are cached per profile,
-        # so identity comparison is enough to spot a change.
-        new_board = self.board
-        if new_visible and new_id in PROFILES_BY_ARUCO:
-            new_board = PROFILES_BY_ARUCO[new_id].rectify()
-        board_changes = new_board is not self.board
+        Snapshotted per (board id, camera), so returning to a layout already visited this
+        frame restores the annotation made under it rather than resetting it — a mis-click
+        on `M` or the ArUco region must not lose work. RGB and IR corner LEDs are different
+        physical LEDs, and so are v1's and v2's, so a layout that has not been visited yet
+        starts from a fresh annotation rather than carrying positions over.
+        """
+        ann = self.annotation
+        geometry_changes = new_board is not self.board or new_camera != self.camera
 
-        if board_changes:
-            snap_ann, snap_board = self._aruco_snapshot
-            self._set_board(new_board)
+        # Snapshot on the first change this frame; later changes update in place
+        if self._layout_original is None:
+            self._layout_original = (copy.deepcopy(ann), self.board, self.camera)
 
-            if new_board is snap_board:
-                # Cycling back to the snapshot's board — restore full annotations
-                self.annotation = copy.deepcopy(snap_ann)
-                self.annotation.aruco_visible = new_visible
-                self.annotation.aruco_id = new_id
-            else:
-                # Different board — build fresh annotation
-                new_ann = ImageAnnotation(board=new_board)
-                new_ann.aruco_visible = new_visible
-                new_ann.aruco_id = new_id
-                # Carry over board-independent state
-                new_ann.homography = ann.homography
-                if new_board.period == ann.board.period:
-                    new_ann.ring_start = ann.ring_start
-                    new_ann.ring_end = ann.ring_end
-                # Place corners at the new board's default positions.
-                # If a homography is available, convert to original image coords.
-                new_corner_pos = corner_led_positions(new_board)
-                for i, c in enumerate(new_ann.corners):
-                    if new_ann.homography is not None:
-                        c["position"] = new_ann.to_original(*new_corner_pos[i])
-                    else:
-                        c["position"] = list(new_corner_pos[i])
-                    c["visible"] = False
-                self.annotation = new_ann
-
-            self.status_msg = f"Board changed to {new_board.profile.name} — Esc to undo"
-        else:
-            ann.aruco_visible = new_visible
-            ann.aruco_id = new_id
+        if not geometry_changes:
+            ann.aruco_visible = new_aruco_visible
+            ann.aruco_id = new_aruco_id
             self.status_msg = "ArUco changed — Esc to undo"
+            self.mode = Mode.LAYOUT_CONFIRM
+            self._needs_redraw = True
+            return
 
-        self.mode = Mode.ARUCO_CONFIRM
+        old_key = (self.board.aruco_marker_id, self.camera.value)
+        new_key = (new_board.aruco_marker_id, new_camera.value)
+        self._layout_snapshots[old_key] = copy.deepcopy(ann)
+        self._set_layout(new_board, new_camera)
+
+        if new_key in self._layout_snapshots:
+            # Layout visited before this frame — restore its annotation
+            self.annotation = self._layout_snapshots.pop(new_key)
+            self.annotation.aruco_visible = new_aruco_visible
+            self.annotation.aruco_id = new_aruco_id
+        else:
+            new_ann = ImageAnnotation(board=new_board, camera=new_camera)
+            new_ann.aruco_visible = new_aruco_visible
+            new_ann.aruco_id = new_aruco_id
+            # Carry over layout-independent state
+            new_ann.homography = ann.homography
+            if new_board.period == ann.board.period:
+                new_ann.ring_start = ann.ring_start
+                new_ann.ring_end = ann.ring_end
+            # Place corners at the new layout's default positions.
+            # If a homography is available, convert to original image coords.
+            new_corner_pos = corner_led_positions(new_board, new_camera)
+            for i, c in enumerate(new_ann.corners):
+                if new_ann.homography is not None:
+                    c["position"] = new_ann.to_original(*new_corner_pos[i])
+                else:
+                    c["position"] = list(new_corner_pos[i])
+                c["visible"] = False
+            self.annotation = new_ann
+
+        self.status_msg = f"Layout changed to {new_board.profile.name}/{new_camera.value} — Esc to undo"
+        self.mode = Mode.LAYOUT_CONFIRM
         self._needs_redraw = True
 
-    def _commit_aruco_change(self):
-        """Discard ArUco snapshot, committing the board profile change."""
-        if self._aruco_snapshot is not None:
-            self._aruco_snapshot = None
-            if self.mode == Mode.ARUCO_CONFIRM:
+    def _commit_layout_change(self):
+        """Discard layout snapshots, committing the board / camera / marker in place."""
+        if self._layout_original is not None:
+            self._layout_original = None
+            self._layout_snapshots.clear()
+            if self.mode == Mode.LAYOUT_CONFIRM:
                 self.mode = Mode.IDLE
                 self.status_msg = ""
                 self._needs_redraw = True
 
-    def _revert_aruco_change(self):
-        """Restore annotation and board profile from snapshot."""
-        if self._aruco_snapshot is None:
+    def _revert_layout_change(self):
+        """Restore annotation, board and camera from the pre-change snapshot."""
+        if self._layout_original is None:
             return
-        self.annotation, old_board = self._aruco_snapshot
-        self._aruco_snapshot = None
-        self._set_board(old_board)
+        self.annotation, old_board, old_camera = self._layout_original
+        self._layout_original = None
+        self._layout_snapshots.clear()
+        self._set_layout(old_board, old_camera)
         self.mode = Mode.IDLE
         self.status_msg = ""
         self._needs_redraw = True
@@ -1234,7 +1274,7 @@ class AnnotationTool:
         """
         ann = self.annotation
         board = self.board
-        H = fit_corner_homography(ann.corners, board)
+        H = fit_corner_homography(ann.corners, board, self.camera)
         if H is None:
             n = sum(1 for c in ann.corners if c["visible"])
             self.status_msg = (
@@ -1262,7 +1302,7 @@ class AnnotationTool:
         rectified = self.stats.get("rectified")
         if rectified is None or (self._counter_edited and self._ring_edited):
             return
-        leds, value, start, end = decode_clock(rectified, self.board)
+        leds, value, start, end = decode_clock(rectified, self.board, self.camera)
         ann = self.annotation
         if not self._counter_edited:
             ann.counter_visible = True
@@ -1403,7 +1443,8 @@ class AnnotationTool:
             pos = (round(x * self.board_scale), round(y * self.board_scale))
             draw_text(board_scaled, text, pos, color)
 
-        aruco_label = f"ArUco ID {ann.aruco_id}" if ann.aruco_visible else "ArUco: none"
+        marker_state = f"ArUco ID {ann.aruco_id}" if ann.aruco_visible else "ArUco: hidden"
+        aruco_label = f"{self.camera.value.upper()}  {self.board.profile.name}  {marker_state}"
         board_text(aruco_label, ax1, ay1 - 8, (128, 128, 128))
         counter_text = f"Counter: {ann.counter_value}" if ann.counter_visible else "Counter: n/a"
         board_text(counter_text, bx1, by1 - 8, COLOR_BOARD_TEXT)
@@ -1442,7 +1483,7 @@ class AnnotationTool:
         # Row 2: keyboard shortcuts, shrunk if they would reach past the panel split
         shortcuts = (
             "Enter/Space=Accept  Left/Right=Prev/Next  N/B=Skip to unannotated  "
-            ",/.=Prev/Next file  0-N=Pick corner  C=Clear  Q=Quit  H=Help"
+            ",/.=Prev/Next file  0-N=Pick corner  M=Camera mode  C=Clear  Q=Quit  H=Help"
         )
         draw_text(
             status_bar,

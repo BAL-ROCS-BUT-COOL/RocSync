@@ -49,7 +49,7 @@ def board_error(H, board, indices):
 def test_too_few_corners_have_no_fit(name):
     """Three points leave a projective map undetermined, so no fit is offered."""
     board = BOARDS[name]
-    assert fit_corner_homography(annotation_corners(board, {0, 1, 2}), board) is None
+    assert fit_corner_homography(annotation_corners(board, {0, 1, 2}), board, CameraType.RGB) is None
 
 
 @pytest.mark.parametrize("name", sorted(BOARDS))
@@ -57,7 +57,7 @@ def test_four_corners_fit_exactly(name):
     """The minimum the tool now accepts, and it reproduces the pose it was built from."""
     board = BOARDS[name]
     indices = [0, 1, 2, 3]
-    H = fit_corner_homography(annotation_corners(board, set(indices)), board)
+    H = fit_corner_homography(annotation_corners(board, set(indices)), board, CameraType.RGB)
     assert H is not None
     assert board_error(H, board, indices) < 1e-3
 
@@ -67,14 +67,14 @@ def test_a_collinear_corner_set_has_no_fit():
     board = BOARDS["v2"]
     indices = {0, 1, 2, 4}
     assert len(indices) == MIN_HOMOGRAPHY_CORNERS
-    assert fit_corner_homography(annotation_corners(board, indices), board) is None
+    assert fit_corner_homography(annotation_corners(board, indices), board, CameraType.RGB) is None
 
 
 def test_all_five_corners_fit_by_least_squares():
     """The over-determined case still lands on the modelled layout."""
     board = BOARDS["v2"]
     indices = [0, 1, 2, 3, 4]
-    H = fit_corner_homography(annotation_corners(board, set(indices)), board)
+    H = fit_corner_homography(annotation_corners(board, set(indices)), board, CameraType.RGB)
     assert H is not None
     assert board_error(H, board, indices) < 1.0
 
@@ -84,7 +84,7 @@ def test_one_hidden_corner_still_fits(hidden):
     """v2 keeps a usable board view through the occlusions that leave a proper quad."""
     board = BOARDS["v2"]
     indices = [i for i in range(5) if i != hidden]
-    H = fit_corner_homography(annotation_corners(board, set(indices)), board)
+    H = fit_corner_homography(annotation_corners(board, set(indices)), board, CameraType.RGB)
     assert H is not None
     assert board_error(H, board, indices) < 1.0
 
@@ -94,4 +94,4 @@ def test_hiding_a_far_corner_leaves_a_collinear_set(hidden):
     """Losing 2 or 3 leaves LEDs 0, 1 and 4 plus one — one line and a point, no fit."""
     board = BOARDS["v2"]
     indices = {i for i in range(5) if i != hidden}
-    assert fit_corner_homography(annotation_corners(board, indices), board) is None
+    assert fit_corner_homography(annotation_corners(board, indices), board, CameraType.RGB) is None

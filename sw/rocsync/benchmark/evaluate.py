@@ -23,6 +23,7 @@ import numpy as np
 from rocsync.benchmark.common import (
     STEP_ORDER,
     ReferenceClock,
+    annotation_camera,
     confusion_metrics,
     descriptive_stats,
     parse_frame_key,
@@ -34,7 +35,6 @@ from rocsync.benchmark.common import (
     source_key,
 )
 from rocsync.board_profiles import BOARD_V1, PROFILES_BY_ARUCO
-from rocsync.camera import CameraType
 
 CORNER_IMAGE_SPACE_THRESHOLD_PX = 3
 # A point counts as landing correctly when it sits within one LED sampling disc of where
@@ -374,7 +374,7 @@ def compute_homography_metrics(benchmark_images, gt_images, key):
         pred_positive = pred_H is not None
 
         if gt_positive and pred_positive:
-            errors = rectification_errors(pred_H, gt_H, board.layout_coords(CameraType.RGB))
+            errors = rectification_errors(pred_H, gt_H, board.layout_coords(annotation_camera(gt)))
             if errors is None:
                 fn += 1
                 continue

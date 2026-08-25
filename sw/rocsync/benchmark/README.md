@@ -455,8 +455,8 @@ inside the fit.
 
 ## Inspecting Results
 
-Interactive side-by-side viewer: the original input image next to the rectified board view
-reconstructed from one or more result files, one column per file.
+Interactive viewer: the original input image alongside the rectified board view reconstructed
+from one or more result files, one panel per file.
 
 ```bash
 uv run rocsync-inspect results.json [other.json ...] [--data-dir DIR] [-g ground_truth.json]
@@ -471,10 +471,23 @@ uv run rocsync-inspect results.json [other.json ...] [--data-dir DIR] [-g ground
 Each rectified panel is reconstructed from the file's own stored corner and ArUco positions —
 the same fit `rocsync-annotate` shows — not by re-running the pipeline, so it is a faithful
 record of what that checkout actually saw: fit from the visible corner LEDs when there are
-enough of them, falling back to the ArUco marker alone otherwise. A green ring marks a corner
-LED the file recorded as visible, red where the board's expected position is shown instead.
-The header under each column's label reads off the file's stored aruco/counter/ring values and,
-for a `rocsync-validate` output, whether the frame counted as an overall success.
+enough of them, falling back to the ArUco marker alone otherwise.
+
+The panel carries the same overlay `rocsync-annotate` draws on its rectified view, decoded
+straight from the file's own stored reading rather than redrawn from a live pipeline run:
+the ArUco marker with its ID, each corner LED (green when the file recorded it visible, red
+at its expected position otherwise), the counter's bounding box and per-bit LEDs colored from
+the decoded value, and the ring LEDs colored by whether the file's `start`/`end` arc covers
+them. Seeing the decoded counter and ring lit up against the corresponding pixels in the input
+image is what makes a wrong timestamp -- an off-by-one on the ring, a counter bit the pipeline
+missed -- obvious at a glance, the same way it is while annotating. The header below each
+label repeats the same reading as text, plus, for a `rocsync-validate` output, whether the
+frame counted as an overall success.
+
+The input image and every rectified panel tile into a 2D grid — including the input, letterboxed
+into a cell the same size as the rest — rather than a single row, and the column count is chosen
+to keep the window close to a 16:9 shape. Comparing several checkouts at once stays on screen
+instead of running off the side.
 
 This is the tool for the same comparison `rocsync-evaluate` summarizes numerically — point it at
 two checkouts' outputs to see a specific frame where they disagree.

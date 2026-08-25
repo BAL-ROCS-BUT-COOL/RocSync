@@ -18,6 +18,7 @@ Usage:
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -26,20 +27,29 @@ import numpy as np
 
 from rocsync.benchmark.annotate import (
     BOARD_MARGIN_PX,
+    COLOR_NOT_VIS,
+    COLOR_OFF,
+    COLOR_ON,
+    LED_RADIUS_PX,
     coarse_homography_from_aruco,
+    counter_bbox,
+    counter_led_positions,
     draw_text,
     fit_corner_homography,
     fit_scale,
+    ring_led_positions,
 )
 from rocsync.benchmark.common import FrameRef, FrameSource, parse_frame_key
 from rocsync.board_profiles import DEFAULT_BOARD_SIZE, PROFILES_BY_ARUCO
 from rocsync.camera import CameraType
+from rocsync.vision import ARUCO_DICTIONARY
 
 WINDOW_NAME = "RocSync Inspect"
 
 PANEL_SIDE = DEFAULT_BOARD_SIZE + 2 * BOARD_MARGIN_PX  # rectified panels are fixed at this size
 HEADER_H = 52
 TITLE_H = 30
+DIVIDER_PX = 2
 
 FONT_SCALE = 0.6
 LABEL_SCALE = 0.65
@@ -48,8 +58,8 @@ COLOR_TEXT = (255, 255, 255)
 COLOR_TITLE_BG = (60, 60, 60)
 COLOR_HEADER_BG = (40, 40, 40)
 COLOR_MISSING = (55, 55, 55)
-COLOR_LED_VISIBLE = (0, 255, 0)
-COLOR_LED_HIDDEN = (0, 0, 255)
+
+TARGET_ASPECT = 16 / 9  # grid shape is chosen to make the window roughly this wide
 
 
 def load_columns(paths):
@@ -95,9 +105,10 @@ def frame_keys(columns):
 def resolve_board(entry):
     """The `RectifiedBoard` an entry's ArUco reading identifies, or None."""
     aruco = (entry or {}).get("aruco") or {}
-    if not aruco.get("visible"):
+    board_id = aruco.get("id")
+    if not aruco.get("visible") or board_id is None:
         return None
-    profile = PROFILES_BY_ARUCO.get(aruco.get("id"))
+    profile = PROFILES_BY_ARUCO.get(board_id)
     return None if profile is None else profile.rectify(DEFAULT_BOARD_SIZE)
 
 
@@ -124,14 +135,77 @@ def reconstruct_view(entry, image, margin=BOARD_MARGIN_PX):
     return view, board, None
 
 
-def draw_corner_overlay(view, entry, board, margin=BOARD_MARGIN_PX):
-    """Mark each corner LED where the fit says it should land -- green if it was
-    actually seen there, red if the position is only the board's expectation."""
-    corners = (entry or {}).get("corners") or []
+def _ring_arc_color(idx, start, end):
+    """Color for ring LED `idx` in the half-open arc `[start, end)`, wraparound included.
+
+    Mirrors `AnnotationTool._led_in_ring_arc`: the annotator's own reading of the arc.
+    """
+    if start == end:
+        return COLOR_NOT_VIS
+    in_arc = start <= idx < end if start < end else (idx >= start or idx < end)
+    return COLOR_ON if in_arc else COLOR_OFF
+
+
+def _counter_bit_colors(board, value, visible):
+    """Per-LED color for the counter, decoded from `value` -- most significant bit first."""
+    if not visible or value is None:
+        return [COLOR_NOT_VIS] * board.counter_bits
+    return [
+        COLOR_ON if (value >> (board.counter_bits - 1 - i)) & 1 else COLOR_OFF
+        for i in range(board.counter_bits)
+    ]
+
+
+def draw_overlay(view, entry, board, margin=BOARD_MARGIN_PX):
+    """Draw the entry's decoded aruco/corner/counter/ring reading onto its rectified view.
+
+    Same overlay `rocsync-annotate` shows on the right panel, so a decoded timestamp --
+    or a wrong one -- reads the same way here as it does while annotating.
+    """
+    aruco = entry.get("aruco") or {}
+    counter = entry.get("counter") or {}
+    ring = entry.get("ring") or {}
+    corners = entry.get("corners") or []
+
+    # ArUco marker
+    ax1, ay1 = (int(v) + margin for v in board.aruco_corners_coords[0])
+    ax2, ay2 = (int(v) + margin for v in board.aruco_corners_coords[2])
+    if aruco.get("visible") and aruco.get("id") is not None:
+        marker = cv2.aruco.generateImageMarker(ARUCO_DICTIONARY, aruco["id"], ax2 - ax1)
+        marker_bgr = cv2.cvtColor(marker, cv2.COLOR_GRAY2BGR)
+        region = view[ay1:ay2, ax1:ax2]
+        view[ay1:ay2, ax1:ax2] = cv2.addWeighted(region, 0.5, marker_bgr, 0.5, 0)
+        draw_text(view, f"ArUco {aruco['id']}", (ax1, ay1 - 8), (180, 180, 180))
+    else:
+        cv2.rectangle(view, (ax1, ay1), (ax2, ay2), COLOR_NOT_VIS, 2)
+        cv2.line(view, (ax1, ay1), (ax2, ay2), COLOR_NOT_VIS, 2)
+        cv2.line(view, (ax2, ay1), (ax1, ay2), COLOR_NOT_VIS, 2)
+
+    # Corner LEDs, at the fit's own expected positions
     for i, (x, y) in enumerate(board.always_on_leds[CameraType.RGB]):
+        cx, cy = int(x) + margin, int(y) + margin
         visible = i < len(corners) and corners[i].get("visible", False)
-        color = COLOR_LED_VISIBLE if visible else COLOR_LED_HIDDEN
-        cv2.circle(view, (int(x + margin), int(y + margin)), 5, color, 1, cv2.LINE_AA)
+        color = COLOR_ON if visible else COLOR_NOT_VIS
+        cv2.circle(view, (cx, cy), LED_RADIUS_PX + 4, color, 2)
+        draw_text(view, str(i), (cx + LED_RADIUS_PX + 6, cy + 6), color)
+
+    # Counter
+    bx1, by1, bx2, by2 = (round(v) + margin for v in counter_bbox(counter_led_positions(board)))
+    counter_visible = counter.get("visible", False)
+    cv2.rectangle(view, (bx1, by1), (bx2, by2), COLOR_TEXT if counter_visible else COLOR_NOT_VIS, 1)
+    value = counter.get("value")
+    for (cx, cy), color in zip(
+        counter_led_positions(board), _counter_bit_colors(board, value, counter_visible), strict=True
+    ):
+        cv2.circle(view, (cx + margin, cy + margin), LED_RADIUS_PX, color, 1)
+    counter_text = f"Counter: {value}" if counter_visible else "Counter: n/a"
+    draw_text(view, counter_text, (bx1, by1 - 8), COLOR_TEXT)
+
+    # Ring
+    start, end = ring.get("start", 0), ring.get("end", 0)
+    for i, (rx, ry) in enumerate(ring_led_positions(board)):
+        color = _ring_arc_color(i, start, end)
+        cv2.circle(view, (rx + margin, ry + margin), LED_RADIUS_PX, color, 1)
 
 
 def status_text(entry):
@@ -151,6 +225,39 @@ def status_text(entry):
     return "  ".join(parts)
 
 
+def fit_into_square(image, side):
+    """`image` letterboxed onto a `side`x`side` black square, aspect ratio preserved.
+
+    Lets the input image join the grid as a cell the same shape as every rectified
+    panel, rather than needing a differently-shaped slot of its own.
+    """
+    h, w = image.shape[:2]
+    scale = min(side / h, side / w)
+    resized = cv2.resize(image, (round(w * scale), round(h * scale)))
+    canvas = np.zeros((side, side, 3), dtype=np.uint8)
+    y0 = (side - resized.shape[0]) // 2
+    x0 = (side - resized.shape[1]) // 2
+    canvas[y0 : y0 + resized.shape[0], x0 : x0 + resized.shape[1]] = resized
+    return canvas
+
+
+def choose_grid_cols(n, cell_w, cell_h, target_aspect=TARGET_ASPECT):
+    """Column count whose grid best matches `target_aspect`, ties broken by fewest gaps.
+
+    Every cell is the same fixed size, so the window's shape is entirely a function of
+    how many columns it wraps at -- chosen here instead of a plain ceil(sqrt(n)), which
+    packs cells into a square regardless of what shape actually fits the screen.
+    """
+    best_cols, best_score = 1, None
+    for cols in range(1, n + 1):
+        rows = math.ceil(n / cols)
+        aspect = (cols * cell_w) / (rows * cell_h)
+        score = (abs(math.log(aspect / target_aspect)), rows * cols - n)
+        if best_score is None or score < best_score:
+            best_cols, best_score = cols, score
+    return best_cols
+
+
 def make_panel(body, header_lines, width, height):
     """A header bar over an image (or a blank body when there is none)."""
     canvas = np.zeros((HEADER_H + height, width, 3), dtype=np.uint8)
@@ -165,16 +272,38 @@ def make_panel(body, header_lines, width, height):
     return canvas
 
 
+def build_grid(panels, cols):
+    """Panels of equal size, tiled into `cols` columns wrapping to as many rows as needed.
+
+    A leftover cell in the last row is filled in blank, so panel count need not be a
+    multiple of `cols` -- e.g. 5 results tile as a 3x2 grid with one empty cell, not a
+    single row 5 panels wide.
+    """
+    rows = math.ceil(len(panels) / cols)
+    cell_h, cell_w = panels[0].shape[:2]
+    blank = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
+    cells = list(panels) + [blank] * (rows * cols - len(panels))
+
+    v_divider = np.zeros((cell_h, DIVIDER_PX, 3), dtype=np.uint8)
+    row_imgs = []
+    for r in range(rows):
+        row_cells = cells[r * cols : (r + 1) * cols]
+        row = row_cells[0]
+        for cell in row_cells[1:]:
+            row = np.hstack([row, v_divider, cell])
+        row_imgs.append(row)
+
+    h_divider = np.zeros((DIVIDER_PX, row_imgs[0].shape[1], 3), dtype=np.uint8)
+    grid = row_imgs[0]
+    for row_img in row_imgs[1:]:
+        grid = np.vstack([grid, h_divider, row_img])
+    return grid
+
+
 def render_frame(image, key, columns, idx, total):
-    """The full composite: title bar, input panel, one rectified panel per column."""
-    if image is not None:
-        h, w = image.shape[:2]
-        scale = PANEL_SIDE / h
-        left_body = cv2.resize(image, (round(w * scale), PANEL_SIDE))
-    else:
-        left_body = None
-    left_w = left_body.shape[1] if left_body is not None else PANEL_SIDE
-    panels = [make_panel(left_body, [("input", LABEL_SCALE)], left_w, PANEL_SIDE)]
+    """The full composite: title bar over a grid of the input image and every rectified panel."""
+    input_body = fit_into_square(image, PANEL_SIDE) if image is not None else None
+    panels = [make_panel(input_body, [("input", LABEL_SCALE)], PANEL_SIDE, PANEL_SIDE)]
 
     for label in sorted(columns):
         entry = ((columns[label].get("images") or {}).get(key)) if image is not None else None
@@ -185,22 +314,21 @@ def render_frame(image, key, columns, idx, total):
         else:
             view, board, reason = reconstruct_view(entry, image)
             if view is not None:
-                draw_corner_overlay(view, entry, board)
+                draw_overlay(view, entry, board)
 
         header = [(label, LABEL_SCALE), (status_text(entry), FONT_SCALE)]
         panel = make_panel(view, header, PANEL_SIDE, PANEL_SIDE)
         if view is None:
+            reason = reason or "unknown"
             size = cv2.getTextSize(reason, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
             org = ((PANEL_SIDE - size[0]) // 2, HEADER_H + PANEL_SIDE // 2)
             draw_text(panel, reason, org, COLOR_TEXT, 0.8, 2)
         panels.append(panel)
 
-    divider = np.zeros((panels[0].shape[0], 2, 3), dtype=np.uint8)
-    row = panels[0]
-    for panel in panels[1:]:
-        row = np.hstack([row, divider, panel])
+    cols = choose_grid_cols(len(panels), PANEL_SIDE, HEADER_H + PANEL_SIDE)
+    grid = build_grid(panels, cols)
 
-    title = np.full((TITLE_H, row.shape[1], 3), COLOR_TITLE_BG, dtype=np.uint8)
+    title = np.full((TITLE_H, grid.shape[1], 3), COLOR_TITLE_BG, dtype=np.uint8)
     draw_text(
         title,
         f"[{idx + 1}/{total}] {key}    a/d: prev/next   q: quit",
@@ -208,7 +336,7 @@ def render_frame(image, key, columns, idx, total):
         COLOR_TEXT,
         FONT_SCALE,
     )
-    return np.vstack([title, row])
+    return np.vstack([title, grid])
 
 
 def run_viewer(data_dir, keys, columns):

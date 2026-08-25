@@ -220,16 +220,11 @@ def find_corners_convexhull(mask, frame_number, debug_dir=None):
 def find_corners_dots(mask, frame_number, board, debug_dir=None):
     """Match always-on LEDs to their expected spots.
 
-    Returns one row per always-on LED of the board, in board order, holding the matched
-    position in `mask` coordinates or NaN where nothing landed close enough. A caller
-    filters on `np.isfinite` and indexes `board.always_on_leds` with the same mask to
-    recover the nominal spots. Strict mode requires every LED and returns None if any is
-    missing.
+    Returns one row per always-on LED of the board, in board order, holding the
+    matched position in `mask` coordinates or NaN where nothing landed close enough.
     """
     corner_dots = board.always_on_leds[CameraType.RGB]
     points = blob_detector.detect(mask)
-    if not points:
-        return
     if debug_dir:
         debug_image = cv2.drawKeypoints(
             mask,
@@ -239,17 +234,34 @@ def find_corners_dots(mask, frame_number, board, debug_dir=None):
             cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS,
         )
         cv2.imwrite(f"{debug_dir}/corner_{frame_number}.png", debug_image)
+    if not points:
+        return np.full((len(corner_dots), 2), np.nan, dtype=np.float32)
 
-    closest_points = [
-        min(points, key=lambda p: np.linalg.norm(p.pt - target)).pt for target in corner_dots
-    ]
-    max_distance = max(
-        [np.linalg.norm(act - exp) for act, exp in zip(closest_points, corner_dots, strict=True)]
+    # For each target, find its closest available blob; commit the globally closest
+    # target/blob pair first and remove that blob, so no blob is claimed by two targets.
+    available = list(points)
+    assigned = {}
+    while available and len(assigned) < len(corner_dots):
+        best = None
+        for i, target in enumerate(corner_dots):
+            if i in assigned:
+                continue
+            blob = min(available, key=lambda p: np.linalg.norm(p.pt - target))
+            dist = np.linalg.norm(blob.pt - target)
+            if best is None or dist < best[2]:
+                best = (i, blob, dist)
+        i, blob, dist = best
+        assigned[i] = (blob.pt, dist)
+        available.remove(blob)
+
+    return np.array(
+        [
+            assigned[i][0] if i in assigned and assigned[i][1] <= board.rough_corner_tol
+            else (np.nan, np.nan)
+            for i in range(len(corner_dots))
+        ],
+        dtype=np.float32,
     )
-    if max_distance > board.rough_corner_tol:
-        return  # Some corner is too far away from where it should be
-
-    return np.array(closest_points, dtype=np.float32)
 
 
 def find_corners_aruco(mask, frame_number, debug_dir=None):
@@ -345,20 +357,22 @@ def rectify_board(
                 stats["rough_homography"] = rough_transformation_matrix
             t0 = time.perf_counter()
             corners = find_corners_dots(rough_pcb, frame_number, board, debug_dir)
+            found = np.isfinite(corners).all(axis=1)
             _record_step(
                 stats,
                 "corner_detection",
                 t0,
-                success=corners is not None,
-                count=0 if corners is None else len(corners),
+                success=bool(found.any()),
+                count=int(found.sum()),
             )
-            if corners is None:
-                return True, None, board
             if stats is not None:
-                stats["corner_positions"] = None if corners is None else corners.tolist()
+                stats["corner_positions"] = corners.tolist()
 
-            # Only the four anchors define the transform; any extra always-on dots were
-            # matched purely as a sanity check.
+            # The first four always-on LEDs are the perspective-transform anchors; without
+            # all four there's nothing to fit the fine homography from. Any extra always-on
+            # dots beyond those four were matched purely as a sanity check.
+            if not found[:4].all():
+                return True, None, board
             transformation_matrix = np.dot(
                 cv2.getPerspectiveTransform(corners[:4], board.transform_corners(CameraType.RGB)),
                 rough_transformation_matrix,

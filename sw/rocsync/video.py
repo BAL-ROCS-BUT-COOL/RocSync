@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 from rocsync.clips import MAX_FRAMES_IN_FLIGHT
 from rocsync.printer import errprint, print, printresult, warnprint
-from rocsync.timeline import summarize_timeline
+from rocsync.timeline import source_frame_period_ms, summarize_timeline
 from rocsync.video_statistics import VideoStatistics
 from rocsync.vision import CameraType, process_frame
 
@@ -270,6 +270,10 @@ def process_video(
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
 
+    # The true sensor frame period, immune to a file that is itself a decimated clip --
+    # sizes the clock fit's inlier band instead of the possibly-subsampled frame spacing
+    frame_period_ms = source_frame_period_ms(video_path)
+
     # Whether the reported span and dropouts describe the file or just the windows
     timeline_windowed = bool(windows)
 
@@ -306,6 +310,7 @@ def process_video(
             fps,
             window_frame_times=window_frame_times,
             timeline_windowed=timeline_windowed,
+            frame_period_ms=frame_period_ms,
         )
     except ValueError as e:
         errprint(f"Error: {e}")

@@ -15,19 +15,22 @@ import pytest
 
 import rocsync.benchmark
 from rocsync.benchmark.common import (
-    MEASURED_RESIDUAL_MAX_MS,
-    MEASURED_RESIDUAL_MIN_MS,
     MIN_REFERENCE_FRAMES,
     SYNTHESIZED_RESIDUAL_THRESHOLD_MS,
     ReferenceClock,
     fit_reference_clock,
-    measured_residual_threshold_ms,
     reference_outliers,
     reference_residual,
     residual_threshold_ms,
+)
+from rocsync.timeline import (
+    MEASURED_RESIDUAL_MAX_MS,
+    MEASURED_RESIDUAL_MIN_MS,
+    frame_pts,
+    measured_residual_threshold_ms,
+    median_frame_period,
     source_frame_period_ms,
 )
-from rocsync.timeline import frame_pts, median_frame_period
 
 PERIOD = 500.0  # ms between frames
 THRESHOLD_MS = 2.0

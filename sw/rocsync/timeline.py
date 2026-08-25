@@ -101,11 +101,36 @@ def detect_dropouts(pts, period):
     return len(gaps), n_dropped, float(largest_gap), gaps
 
 
+# A RANSAC inlier band has to be wide enough to absorb real jitter (the sensor exposes
+# when it pleases, not on the container's nominal grid) but tight enough that a genuine
+# misdecode -- typically off by whole ring/counter periods -- still falls outside it.
+# Scaling off the frame period keeps that band meaningful at any frame rate; the clamp
+# keeps it meaningful when the period itself is very small or unknown.
+MEASURED_RESIDUAL_FRACTION = 1 / 3  # of a source frame
+MEASURED_RESIDUAL_MIN_MS = 2.0  # never tighter than the board itself resolves
+MEASURED_RESIDUAL_MAX_MS = 50.0  # below the ring period, so a counter step still shows
+
+
+def measured_residual_threshold_ms(frame_period_ms):
+    """How far a fitted frame may sit from its decoded board time and still be an inlier.
+
+    Deliberately not derived from the spacing between the frames actually offered to a
+    fit: a subsampled/decimated recording's frames are spaced by the sampling, not the
+    sensor, so that spacing would inflate the threshold enough to accept a misdecode
+    that is wrong by whole ring or counter periods. `frame_period_ms` should be the true
+    sensor frame period instead, e.g. from `source_frame_period_ms`.
+    """
+    if not frame_period_ms:
+        return MEASURED_RESIDUAL_MAX_MS
+    scaled = frame_period_ms * MEASURED_RESIDUAL_FRACTION
+    return min(max(scaled, MEASURED_RESIDUAL_MIN_MS), MEASURED_RESIDUAL_MAX_MS)
+
+
 def fit_timeline(
     frame_times,
     timestamps,
     residual_threshold=None,
-    fallback_period=None,
+    frame_period_ms=None,
     max_trials=1000,
 ):
     """Robustly fit board time against a source clock.
@@ -116,11 +141,15 @@ def fit_timeline(
     For video, the source clock is the container's presentation timestamp and
     the keys are frame indices. For a device that reports its own clock, pass
     an identity map and an explicit `residual_threshold`; without one the
-    threshold is the median frame period, i.e. at most one frame of deviation.
+    threshold is derived from `frame_period_ms`, the true sensor frame period
+    (see `measured_residual_threshold_ms`) -- deliberately not measured off
+    `frame_times` itself, since a subsampled/decimated recording's frames are
+    spaced by the sampling, not the sensor, and would otherwise inflate the
+    threshold enough to accept far-too-large misdecodes as inliers.
 
     Only frames present in both dicts are used. Raises ValueError if fewer than
-    two such frames exist, if no usable threshold can be determined, or if the
-    fit is degenerate (a non-positive or non-finite clock rate).
+    two such frames exist, or if the fit is degenerate (a non-positive or
+    non-finite clock rate).
     """
     order = sorted(k for k in timestamps if frame_times.get(k) is not None)
     if len(order) < 2:
@@ -136,9 +165,7 @@ def fit_timeline(
 
     threshold = residual_threshold
     if threshold is None:
-        threshold = median_frame_period(frame_times.values(), fallback=fallback_period)
-    if not threshold or threshold <= 0:
-        raise ValueError("Unable to determine a usable residual threshold.")
+        threshold = measured_residual_threshold_ms(frame_period_ms)
 
     model = RANSACRegressor(
         residual_threshold=threshold,  # max one frame deviation
@@ -182,6 +209,7 @@ def summarize_timeline(
     fps,
     window_frame_times=None,
     timeline_windowed=False,
+    frame_period_ms=None,
 ):
     """Fit board time against the container clock and describe the result.
 
@@ -193,6 +221,11 @@ def summarize_timeline(
     `window_frame_times` lists the frames of each search window separately, because a
     gap between two disjoint windows is not a dropout. Callers that scanned the whole
     file can leave it out.
+
+    `frame_period_ms` is the true sensor frame period, used to size the fit's inlier
+    band (see `measured_residual_threshold_ms`); pass it whenever it's known, e.g. via
+    `source_frame_period_ms`, since a subsampled/decimated input's own frame spacing is
+    not a safe stand-in. Without one, the container's nominal fps is used instead.
 
     Returns (statistics, fit, considered, rejected, gaps). Raises ValueError when the
     timeline cannot be fitted.
@@ -209,7 +242,7 @@ def summarize_timeline(
         raise ValueError("Unable to determine the frame period.")
 
     try:
-        fit = fit_timeline(frame_times, timestamps, fallback_period=nominal_period)
+        fit = fit_timeline(frame_times, timestamps, frame_period_ms=frame_period_ms or nominal_period)
     except ValueError as e:
         raise ValueError(f"Unable to fit the frame timeline: {e}") from e
 
@@ -366,6 +399,36 @@ def frame_pts(video_path):
         start = float(stream.get("start_pts", ticks[0]))
         return [(t - start) * time_base * 1000 for t in ticks]
     return _decoded_frame_pts(video_path)
+
+
+def source_frame_period_ms(video_path):
+    """Frame period of the recording this file was cut from, in ms, or None.
+
+    A decimated clip cannot say this in its timing: keeping the frames' original
+    timestamps is what a clock is fitted to, and those timestamps describe the
+    subsampling, not the recording. `prepare_clip.sh` therefore writes the recording's
+    frame rate to a metadata tag, which no muxer reinterprets, and that is read first.
+    """
+    tagged = run_ffprobe(
+        video_path, "-show_entries", "format_tags=source_frame_rate", "-of", "csv=p=0"
+    )
+    # csv output pads a trailing empty field with a comma, and quotes a value holding one
+    rate = parse_ratio((tagged or "").strip().strip('"').rstrip(","))
+    if rate:
+        return 1000 / rate
+
+    # A clip cut before the tag existed says it in its packets instead: an encoder that
+    # rounds timestamps onto the frame-rate grid leaves the recording's rate behind there
+    durations = [d for d in probe_packet_field(video_path, "duration_time") if d > 0]
+    if durations:
+        # The mode, so one odd packet at a cut cannot stand for the whole recording
+        return float(max(set(durations), key=durations.count)) * 1000
+
+    # Without a packet duration the spacing is all there is, subsampled or not
+    try:
+        return median_frame_period(frame_pts(video_path))
+    except OSError:
+        return None  # a file that will not open has no period to report
 
 
 def _decoded_frame_pts(video_path):

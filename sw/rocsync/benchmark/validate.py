@@ -30,7 +30,7 @@ from rocsync.benchmark.common import (
 )
 from rocsync.board_profiles import PROFILES_BY_ARUCO
 from rocsync.camera import CameraType
-from rocsync.timeline import frame_pts, summarize_timeline
+from rocsync.timeline import frame_pts, source_frame_period_ms, summarize_timeline
 from rocsync.vision import process_frame
 
 
@@ -196,7 +196,11 @@ def fit_videos(frames, results):
 
         try:
             statistics, _, considered, rejected, _ = summarize_timeline(
-                timestamps, frame_times, len(frame_times), fps
+                timestamps,
+                frame_times,
+                len(frame_times),
+                fps,
+                frame_period_ms=source_frame_period_ms(path),
             )
         except ValueError as e:
             videos[rel_path] = {

@@ -37,9 +37,8 @@ from rocsync.benchmark.common import (
     is_retimed,
     parse_frame_key,
     retimed_path,
-    source_frame_period_ms,
 )
-from rocsync.timeline import frame_pts
+from rocsync.timeline import frame_pts, source_frame_period_ms
 
 try:
     import av

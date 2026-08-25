@@ -12,10 +12,9 @@ from rocsync.board_profiles import PROFILES_BY_ARUCO
 from rocsync.dataset import VIDEO_SUFFIXES
 from rocsync.timeline import (
     frame_pts,
-    median_frame_period,
-    parse_ratio,
-    probe_packet_field,
+    measured_residual_threshold_ms,
     run_ffprobe,
+    source_frame_period_ms,
 )
 
 STEP_ORDER = [
@@ -37,13 +36,11 @@ SEEK_BACKOFF_FRAMES = 32  # retry margin for a seek that landed past the frame w
 MIN_REFERENCE_FRAMES = 5  # a two-point fit is exact by construction and proves nothing
 
 # A synthesized timeline is built from the annotations themselves, so the only slack it
-# needs covers reading the ring arc one LED out at either end. A measured one has to
-# absorb the camera: the container stores a nominal frame rate while the sensor exposes
-# when it pleases, which on the dataset's 30 fps clips scatters by up to 9 ms.
+# needs covers reading the ring arc one LED out at either end. A measured one uses
+# `measured_residual_threshold_ms` from `rocsync.timeline` instead, which absorbs the
+# camera: the container stores a nominal frame rate while the sensor exposes when it
+# pleases, which on the dataset's 30 fps clips scatters by up to 9 ms.
 SYNTHESIZED_RESIDUAL_THRESHOLD_MS = 2.0
-MEASURED_RESIDUAL_FRACTION = 1 / 3  # of a source frame
-MEASURED_RESIDUAL_MIN_MS = 2.0  # never tighter than the board itself resolves
-MEASURED_RESIDUAL_MAX_MS = 50.0  # below the ring period, so a counter step still shows
 
 RETIMED_MARKER = ".retimed"  # `clip.retimed.mp4` is `clip.mp4` on a synthesized timeline
 
@@ -119,44 +116,6 @@ def _probe_packet_count(path):
     )
     counted = (output or "").strip().rstrip(",")
     return int(counted) if counted.isdigit() else None
-
-
-def source_frame_period_ms(video_path):
-    """Frame period of the recording this file was cut from, in ms, or None.
-
-    A decimated clip cannot say this in its timing: keeping the frames' original
-    timestamps is what the benchmark fits a clock to, and those timestamps describe the
-    subsampling, not the recording. `prepare_clip.sh` therefore writes the recording's
-    frame rate to a metadata tag, which no muxer reinterprets, and that is read first.
-    """
-    tagged = run_ffprobe(
-        video_path, "-show_entries", "format_tags=source_frame_rate", "-of", "csv=p=0"
-    )
-    # csv output pads a trailing empty field with a comma, and quotes a value holding one
-    rate = parse_ratio((tagged or "").strip().strip('"').rstrip(","))
-    if rate:
-        return 1000 / rate
-
-    # A clip cut before the tag existed says it in its packets instead: an encoder that
-    # rounds timestamps onto the frame-rate grid leaves the recording's rate behind there
-    durations = [d for d in probe_packet_field(video_path, "duration_time") if d > 0]
-    if durations:
-        # The mode, so one odd packet at a cut cannot stand for the whole recording
-        return float(max(set(durations), key=durations.count)) * 1000
-
-    # Without a packet duration the spacing is all there is, subsampled or not
-    try:
-        return median_frame_period(frame_pts(video_path))
-    except OSError:
-        return None  # a file that will not open has no period to report
-
-
-def measured_residual_threshold_ms(source_period_ms):
-    """How far an annotated frame may sit from a clock fitted to a recorded timeline."""
-    if not source_period_ms:
-        return MEASURED_RESIDUAL_MAX_MS
-    scaled = source_period_ms * MEASURED_RESIDUAL_FRACTION
-    return min(max(scaled, MEASURED_RESIDUAL_MIN_MS), MEASURED_RESIDUAL_MAX_MS)
 
 
 def residual_threshold_ms(video_entry):

@@ -1230,13 +1230,21 @@ class AnnotationTool:
                 new_ann.ring_start = ann.ring_start
                 new_ann.ring_end = ann.ring_end
             # Place corners at the new layout's default positions.
-            # If a homography is available, convert to original image coords.
+            # If a homography is available, convert to original image coords; otherwise
+            # center a scaled copy of the board layout on the image, matching the
+            # centering a freshly loaded frame gets in `run()`.
             new_corner_pos = corner_led_positions(new_board, new_camera)
+            if new_ann.homography is None:
+                img_h, img_w = self._current_image.shape[:2]
+                scale = 0.5 * min(img_w, img_h) / new_board.board_size
+                ox = (img_w - new_board.board_size * scale) / 2
+                oy = (img_h - new_board.board_size * scale) / 2
             for i, c in enumerate(new_ann.corners):
                 if new_ann.homography is not None:
                     c["position"] = new_ann.to_original(*new_corner_pos[i])
                 else:
-                    c["position"] = list(new_corner_pos[i])
+                    bx, by = new_corner_pos[i]
+                    c["position"] = [ox + bx * scale, oy + by * scale]
                 c["visible"] = False
             self.annotation = new_ann
 
@@ -1393,10 +1401,16 @@ class AnnotationTool:
             cv2.line(board_img, (ax1, ay1), (ax2, ay2), COLOR_NOT_VIS, 2)
             cv2.line(board_img, (ax2, ay1), (ax1, ay2), COLOR_NOT_VIS, 2)
 
-        # Corner LEDs (positions stored in original image space, transform to board)
+        # Corner LEDs (positions stored in original image space, transform to board).
+        # Without a homography there is nothing to project through — `to_board` would
+        # fall back to treating the image-space position as board coordinates, which
+        # scrambles the layout — so draw the board's own default corner positions instead.
         corner_labels = []
         for i, c in enumerate(ann.corners):
-            cx, cy = ann.to_board(*c["position"])
+            if ann.homography is None:
+                cx, cy = self.corner_pos[i]
+            else:
+                cx, cy = ann.to_board(*c["position"])
             cx, cy = cx + m, cy + m
             color = COLOR_ON if c["visible"] else COLOR_NOT_VIS
             cv2.circle(board_img, (cx, cy), LED_RADIUS_PX + 4, color, 2)

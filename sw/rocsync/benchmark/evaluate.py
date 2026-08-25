@@ -359,7 +359,7 @@ def compute_homography_metrics(benchmark_images, gt_images, key):
     fitted from.
     """
     tp = fp = fn = tn = 0
-    frame_means, frame_maxes = [], []
+    errors_px = []
     leds_within = leds_compared = 0
 
     for img_key, gt in gt_images.items():
@@ -382,8 +382,7 @@ def compute_homography_metrics(benchmark_images, gt_images, key):
             threshold = board.led_sample_radius
             leds_within += int(np.count_nonzero(errors <= threshold))
             leds_compared += len(errors)
-            frame_means.append(float(np.mean(errors)))
-            frame_maxes.append(float(np.max(errors)))
+            errors_px.extend(errors.tolist())
             if float(np.max(errors)) <= threshold:
                 tp += 1
             else:
@@ -397,8 +396,7 @@ def compute_homography_metrics(benchmark_images, gt_images, key):
 
     return {
         "detection": confusion_metrics(tp, fp, fn, tn),
-        "error_mean_px": descriptive_stats(frame_means),
-        "error_max_px": descriptive_stats(frame_maxes),
+        "error_px": descriptive_stats(errors_px),
         "leds_within": leds_within,
         "leds_compared": leds_compared,
     }
@@ -856,11 +854,13 @@ def _print_detection(methods, get_det, col_width, label_width=LABEL_WIDTH_DEFAUL
         )
 
 
-def _print_error_stats(methods, get_stats, col_width, label_width=LABEL_WIDTH_DEFAULT):
+def _print_error_stats(
+    methods, get_stats, col_width, label_width=LABEL_WIDTH_DEFAULT, label_fmt="{stat}"
+):
     """Print descriptive statistics (mean/median/std/min/max/n)."""
     for stat in ["mean", "std", "min", "median", "max", "n"]:
         print_row(
-            stat,
+            label_fmt.format(stat=stat),
             [get_stats(m).get(stat) for m in methods],
             col_width,
             label_width,
@@ -905,7 +905,7 @@ def _print_metric_rows(methods, rows, get_video, col_width, label_width=LABEL_WI
 def _print_rectification_block(
     methods, all_metrics, fit, label, col_width, label_width=LABEL_WIDTH_DEFAULT
 ):
-    """Print one fit's (fine/rough) detection, LED-within-threshold, and error rows."""
+    """Print one fit's (fine/rough) detection and LED error rows."""
 
     def get(m):
         return all_metrics[m]["rectification"][fit]
@@ -914,7 +914,7 @@ def _print_rectification_block(
     _print_detection(methods, lambda m: get(m)["detection"], col_width, label_width)
 
     print()
-    print_header(methods, col_width, label_width, f"{label} — LED positions")
+    print_header(methods, col_width, label_width, f"{label} — LED error")
     _print_value_accuracy(
         methods,
         lambda m: get(m)["leds_compared"],
@@ -923,14 +923,13 @@ def _print_rectification_block(
         col_width,
         label_width,
     )
-
-    print()
-    print_header(methods, col_width, label_width, f"{label} — per-frame mean error (board px)")
-    _print_error_stats(methods, lambda m: get(m)["error_mean_px"], col_width, label_width)
-
-    print()
-    print_header(methods, col_width, label_width, f"{label} — per-frame worst LED (board px)")
-    _print_error_stats(methods, lambda m: get(m)["error_max_px"], col_width, label_width)
+    _print_error_stats(
+        methods,
+        lambda m: get(m)["error_px"],
+        col_width,
+        label_width,
+        label_fmt="{stat} (board px)",
+    )
 
 
 CLOCK_GROUP_LABELS = {"measured": "measured videos", "retimed": "retimed videos"}

@@ -357,9 +357,11 @@ Rectification scores the homography itself rather than the corners it was fitted
 the board model knows about (`board.layout_coords`) is mapped through the predicted homography and
 back through the annotated one, and the round trip's residual is the rectification's own error in
 board px, at every LED position including the ring and counter — regions the four fitted anchors
-only extrapolate into. A frame is a detection when its worst LED still lands inside the sample
-radius. The coarse ArUco-only row is not a competing method; it is the floor the fit degrades to
-when corner refinement fails, so the gap between the two rows is what refinement is worth.
+only extrapolate into. The reported error statistics pool every LED's residual over every scored
+frame, the same board-px population the corner detection section reports, so the two are directly
+comparable. A frame is a detection when its worst LED still lands inside the sample radius. The
+coarse ArUco-only row is not a competing method; it is the floor the fit degrades to when corner
+refinement fails, so the gap between the two rows is what refinement is worth.
 
 Reading position and rectification errors: the annotator pre-fills each image from a pipeline run,
 so on every frame accepted without correction the annotation *is* that pipeline's output — its

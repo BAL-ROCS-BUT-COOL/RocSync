@@ -418,6 +418,29 @@ def corner_positions_in_image(stats, n_leds=4):
     return slots
 
 
+def rectification_errors(pred_H, gt_H, points):
+    """Board-space distance between where each modelled point lands under the two fits.
+
+    Sends every `points` (board px) back to image space through the predicted
+    homography and forward again through the ground-truth one; the round trip
+    is the identity only where the two fits agree, so the residual isolates the
+    rectification's own accuracy from whatever fed it. None when either matrix
+    is missing or the predicted one cannot be inverted.
+    """
+    if pred_H is None or gt_H is None:
+        return None
+    pred_H = np.array(pred_H, dtype=np.float64)
+    gt_H = np.array(gt_H, dtype=np.float64)
+    try:
+        inv_pred = np.linalg.inv(pred_H)
+    except np.linalg.LinAlgError:
+        return None
+    pts = np.array([points], dtype=np.float64)
+    image_pts = cv2.perspectiveTransform(pts, inv_pred)
+    board_pts = cv2.perspectiveTransform(image_pts, gt_H).reshape(-1, 2)
+    return np.linalg.norm(board_pts - np.asarray(points, dtype=np.float64), axis=1)
+
+
 def ring_visible(image_data):
     """Ring is visible when start != end (half-open interval has nonzero length)."""
     ring = image_data.get("ring", {})

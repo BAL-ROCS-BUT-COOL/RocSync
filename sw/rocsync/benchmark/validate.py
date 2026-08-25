@@ -34,11 +34,17 @@ from rocsync.timeline import frame_pts, source_frame_period_ms, summarize_timeli
 from rocsync.vision import process_frame
 
 
+def _matrix(H):
+    """A homography as a JSON-safe nested list, or None."""
+    return np.asarray(H, dtype=np.float64).tolist() if H is not None else None
+
+
 def extract_pipeline_result(stats):
     """Extract a ground-truth-compatible result dict from pipeline stats.
 
-    Returns a dict with keys: aruco, corners, counter, ring, timestamp.
-    Structure mirrors ground_truth.json to simplify comparison.
+    Returns a dict with keys: aruco, corners, counter, ring, timestamp,
+    homography, rough_homography. Structure mirrors ground_truth.json to
+    simplify comparison.
     """
     steps = stats.get("steps", {})
 
@@ -89,6 +95,8 @@ def extract_pipeline_result(stats):
         "counter": counter,
         "ring": ring,
         "timestamp": timestamp,
+        "homography": _matrix(stats.get("homography")),
+        "rough_homography": _matrix(stats.get("rough_homography")),
     }
 
 

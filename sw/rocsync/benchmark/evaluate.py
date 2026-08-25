@@ -27,16 +27,22 @@ from rocsync.benchmark.common import (
     descriptive_stats,
     parse_frame_key,
     reconstruct_timestamp,
+    rectification_errors,
     residual_threshold_ms,
     retimed_videos,
     ring_visible,
     source_key,
 )
 from rocsync.board_profiles import BOARD_V1, PROFILES_BY_ARUCO
+from rocsync.camera import CameraType
 
 CORNER_IMAGE_SPACE_THRESHOLD_PX = 3
-# A corner counts as found when it lands within one LED sampling disc of where it belongs.
-CORNER_BOARD_SPACE_THRESHOLD_PX = BOARD_V1.rectify().led_sample_radius
+# A point counts as landing correctly when it sits within one LED sampling disc of where
+# it belongs — used for both board-space corner matching and rectification accuracy, since
+# both ask whether a read would sample the right LED. Every scored frame uses its own
+# board's radius (`_board_for_gt(gt).led_sample_radius`); this is only the header display
+# value, since today every profile resolves to the same radius at the default board size.
+LED_DISC_THRESHOLD_PX = BOARD_V1.rectify().led_sample_radius
 DECODE_TOLERANCE_LEDS = 1
 LABEL_WIDTH_DEFAULT = 40
 
@@ -202,11 +208,7 @@ def _to_board_space(positions, gt):
 
 
 def compute_step_detection(benchmark_images, gt_images, step):
-    """Compute TP/FP/FN/TN and derived rates for a single step.
-
-    Corner detection uses per-corner matching against the annotated positions,
-    with a threshold of CORNER_IMAGE_SPACE_THRESHOLD_PX in image coordinates.
-    """
+    """Compute TP/FP/FN/TN and derived rates for a single step."""
     gt_pos_fn = STEP_GT_POSITIVE[step]
     pred_pos_fn = STEP_PRED_POSITIVE[step]
     tp = fp = fn = tn = 0
@@ -216,48 +218,45 @@ def compute_step_detection(benchmark_images, gt_images, step):
         if pred is None:
             continue
 
-        if step == "corners":
-            gt_corners = gt.get("corners", [])
-            pred_corners = pred.get("corners", [])
-            # The annotation says how many LEDs the board has; a shorter prediction is
-            # a run that found fewer, not a board with fewer slots to find them in.
-            n_leds = len(gt_corners)
-            gt_positions = _corner_positions(gt, n_leds)
-            pred_positions = _corner_positions(pred, n_leds)
+        gt_positive = gt_pos_fn(gt)
+        pred_positive = pred_pos_fn(pred)
 
-            gt_any_visible = any(c.get("visible", False) for c in gt_corners)
-            pred_any_visible = any(c.get("visible", False) for c in pred_corners)
-            any_tp = False
-
-            for i in range(n_leds):
-                if gt_positions[i] is None or pred_positions[i] is None:
-                    continue
-                err = np.linalg.norm(np.array(pred_positions[i]) - np.array(gt_positions[i]))
-                if err <= CORNER_IMAGE_SPACE_THRESHOLD_PX:
-                    any_tp = True
-
-            if gt_any_visible and any_tp:
-                tp += 1
-            elif not gt_any_visible and pred_any_visible:
-                fp += 1
-            elif gt_any_visible and not any_tp:
-                fn += 1
-            else:
-                tn += 1
+        if gt_positive and pred_positive:
+            tp += 1
+        elif not gt_positive and pred_positive:
+            fp += 1
+        elif gt_positive and not pred_positive:
+            fn += 1
         else:
-            gt_positive = gt_pos_fn(gt)
-            pred_positive = pred_pos_fn(pred)
-
-            if gt_positive and pred_positive:
-                tp += 1
-            elif not gt_positive and pred_positive:
-                fp += 1
-            elif gt_positive and not pred_positive:
-                fn += 1
-            else:
-                tn += 1
+            tn += 1
 
     return confusion_metrics(tp, fp, fn, tn)
+
+
+def _corner_confusion(gt_corners, pred_corners, gt_positions, pred_positions, threshold):
+    """TP/FP/FN/TN over one frame's corner slots, matched at `threshold`.
+
+    A slot is a TP only when both sides placed it within threshold; visibility alone
+    (no matching position) still counts as a miss or a false alarm. Image space and
+    board space both go through this so the two rows answer the same question.
+    """
+    tp = fp = fn = tn = 0
+    for i in range(len(gt_positions)):
+        gt_vis = i < len(gt_corners) and gt_corners[i].get("visible", False)
+        pred_vis = i < len(pred_corners) and pred_corners[i].get("visible", False)
+        if gt_positions[i] is not None and pred_positions[i] is not None:
+            err = np.linalg.norm(np.array(pred_positions[i]) - np.array(gt_positions[i]))
+            if err <= threshold:
+                tp += 1
+            else:
+                fn += 1
+        elif gt_vis:
+            fn += 1
+        elif pred_vis:
+            fp += 1
+        else:
+            tn += 1
+    return tp, fp, fn, tn
 
 
 def compute_aruco_metrics(benchmark_images, gt_images):
@@ -291,9 +290,7 @@ def compute_aruco_metrics(benchmark_images, gt_images):
 
 def compute_corner_metrics(benchmark_images, gt_images):
     """Compute corner LED metrics: image-space and board-space detection + errors."""
-    detection_image = compute_step_detection(benchmark_images, gt_images, "corners")
-
-    # Per-corner board-space detection and pixel errors in both spaces
+    tp_image = fp_image = fn_image = tn_image = 0
     tp_board = fp_board = fn_board = tn_board = 0
     errors_image = []
     errors_board = []
@@ -310,38 +307,100 @@ def compute_corner_metrics(benchmark_images, gt_images):
         gt_positions = _corner_positions(gt, n_corners)
         pred_positions = _corner_positions(pred, n_corners)
         # Board space normalises the threshold to LED sample radii, independent of apparent board size
-        gt_board = _to_board_space(gt_positions, gt)
-        pred_board = _to_board_space(pred_positions, gt)
+        if board is not None:
+            gt_board = _to_board_space(gt_positions, gt)
+            pred_board = _to_board_space(pred_positions, gt)
+        else:
+            gt_board = pred_board = [None] * n_corners
 
         for i in range(n_corners):
-            gt_vis = gt_corners[i].get("visible", False)
-            pred_vis = i < len(pred_corners) and pred_corners[i].get("visible", False)
-            both = gt_positions[i] is not None and pred_positions[i] is not None
+            if gt_positions[i] is not None and pred_positions[i] is not None:
+                errors_image.append(
+                    float(np.linalg.norm(np.array(pred_positions[i]) - np.array(gt_positions[i])))
+                )
+            if gt_board[i] is not None and pred_board[i] is not None:
+                errors_board.append(
+                    float(np.linalg.norm(np.array(pred_board[i]) - np.array(gt_board[i])))
+                )
 
-            # Image-space pixel error (on TPs where both are visible with positions)
-            if both:
-                err_img = np.linalg.norm(np.array(pred_positions[i]) - np.array(gt_positions[i]))
-                errors_image.append(float(err_img))
+        tp, fp, fn, tn = _corner_confusion(
+            gt_corners, pred_corners, gt_positions, pred_positions, CORNER_IMAGE_SPACE_THRESHOLD_PX
+        )
+        tp_image += tp
+        fp_image += fp
+        fn_image += fn
+        tn_image += tn
 
-            if both and board is not None and gt_board[i] is not None:
-                err_board = np.linalg.norm(np.array(pred_board[i]) - np.array(gt_board[i]))
-                errors_board.append(float(err_board))
-                if err_board <= CORNER_BOARD_SPACE_THRESHOLD_PX:
-                    tp_board += 1
-                else:
-                    fn_board += 1
-            elif gt_vis:
-                fn_board += 1
-            elif pred_vis:
-                fp_board += 1
-            else:
-                tn_board += 1
+        # Each frame's own board sets its radius, so a mix of profiles is scored
+        # correctly even if a future one resolves to a different radius than BOARD_V1.
+        board_threshold = board.led_sample_radius if board is not None else LED_DISC_THRESHOLD_PX
+        tp, fp, fn, tn = _corner_confusion(
+            gt_corners, pred_corners, gt_board, pred_board, board_threshold
+        )
+        tp_board += tp
+        fp_board += fp
+        fn_board += fn
+        tn_board += tn
 
     return {
-        "detection_image": detection_image,
+        "detection_image": confusion_metrics(tp_image, fp_image, fn_image, tn_image),
         "detection_board": confusion_metrics(tp_board, fp_board, fn_board, tn_board),
         "error_image_px": descriptive_stats(errors_image),
         "error_board_px": descriptive_stats(errors_board),
+    }
+
+
+def compute_homography_metrics(benchmark_images, gt_images, key):
+    """Score one predicted homography (`key`: "homography" or "rough_homography").
+
+    Reprojects every modelled LED (`rectification_errors`) rather than reusing the
+    annotated corners, so the score covers the ring and counter regions a fit built
+    from just the four anchors is extrapolating into, not only the points it was
+    fitted from.
+    """
+    tp = fp = fn = tn = 0
+    frame_means, frame_maxes = [], []
+    leds_within = leds_compared = 0
+
+    for img_key, gt in gt_images.items():
+        pred = benchmark_images.get(img_key)
+        if pred is None:
+            continue
+
+        board = _board_for_gt(gt)
+        gt_H = gt.get("homography")
+        pred_H = pred.get(key)
+        gt_positive = board is not None and gt_H is not None
+        pred_positive = pred_H is not None
+
+        if gt_positive and pred_positive:
+            errors = rectification_errors(pred_H, gt_H, board.layout_coords(CameraType.RGB))
+            if errors is None:
+                fn += 1
+                continue
+            # This frame's own board sets the radius its LEDs are actually sampled at.
+            threshold = board.led_sample_radius
+            leds_within += int(np.count_nonzero(errors <= threshold))
+            leds_compared += len(errors)
+            frame_means.append(float(np.mean(errors)))
+            frame_maxes.append(float(np.max(errors)))
+            if float(np.max(errors)) <= threshold:
+                tp += 1
+            else:
+                fn += 1
+        elif not gt_positive and pred_positive:
+            fp += 1
+        elif gt_positive and not pred_positive:
+            fn += 1
+        else:
+            tn += 1
+
+    return {
+        "detection": confusion_metrics(tp, fp, fn, tn),
+        "error_mean_px": descriptive_stats(frame_means),
+        "error_max_px": descriptive_stats(frame_maxes),
+        "leds_within": leds_within,
+        "leds_compared": leds_compared,
     }
 
 
@@ -843,6 +902,37 @@ def _print_metric_rows(methods, rows, get_video, col_width, label_width=LABEL_WI
         )
 
 
+def _print_rectification_block(
+    methods, all_metrics, fit, label, col_width, label_width=LABEL_WIDTH_DEFAULT
+):
+    """Print one fit's (fine/rough) detection, LED-within-threshold, and error rows."""
+
+    def get(m):
+        return all_metrics[m]["rectification"][fit]
+
+    print_header(methods, col_width, label_width, f"{label} — detection")
+    _print_detection(methods, lambda m: get(m)["detection"], col_width, label_width)
+
+    print()
+    print_header(methods, col_width, label_width, f"{label} — LED positions")
+    _print_value_accuracy(
+        methods,
+        lambda m: get(m)["leds_compared"],
+        lambda m: get(m)["leds_within"],
+        "LEDs within sample radius",
+        col_width,
+        label_width,
+    )
+
+    print()
+    print_header(methods, col_width, label_width, f"{label} — per-frame mean error (board px)")
+    _print_error_stats(methods, lambda m: get(m)["error_mean_px"], col_width, label_width)
+
+    print()
+    print_header(methods, col_width, label_width, f"{label} — per-frame worst LED (board px)")
+    _print_error_stats(methods, lambda m: get(m)["error_max_px"], col_width, label_width)
+
+
 CLOCK_GROUP_LABELS = {"measured": "measured videos", "retimed": "retimed videos"}
 
 # Rows are named for the fields `rocsync` itself reports on a video -- clock_rate,
@@ -957,7 +1047,7 @@ def print_report(methods, all_metrics, col_width, label_width=LABEL_WIDTH_DEFAUL
         methods,
         col_width,
         label_width,
-        f"Detection (thres: {CORNER_BOARD_SPACE_THRESHOLD_PX}px in board space)",
+        f"Detection (thres: {LED_DISC_THRESHOLD_PX}px in board space)",
     )
     _print_detection(
         methods, lambda m: all_metrics[m]["corners"]["detection_board"], col_width, label_width
@@ -979,6 +1069,17 @@ def print_report(methods, all_metrics, col_width, label_width=LABEL_WIDTH_DEFAUL
         lambda m: all_metrics[m]["corners"]["error_board_px"],
         col_width,
         label_width,
+    )
+
+    # ── Rectification (final homography) ─────────────────────────────────
+    print(f"{'=' * 100}")
+    print("  RECTIFICATION (image → board homography)")
+    print(f"{'=' * 100}")
+
+    _print_rectification_block(methods, all_metrics, "fine", "Final fit", col_width, label_width)
+    print()
+    _print_rectification_block(
+        methods, all_metrics, "rough", "Coarse (ArUco-only) fit", col_width, label_width
     )
 
     # ── Counter reading ──────────────────────────────────────────────────
@@ -1215,6 +1316,10 @@ def main():
         all_metrics[m] = {
             "aruco": compute_aruco_metrics(bm, gt_images),
             "corners": compute_corner_metrics(bm, gt_images),
+            "rectification": {
+                "fine": compute_homography_metrics(bm, gt_images, "homography"),
+                "rough": compute_homography_metrics(bm, gt_images, "rough_homography"),
+            },
             "counter": compute_counter_metrics(bm, gt_images),
             "ring": compute_ring_metrics(bm, gt_images),
             "overall": compute_overall_metrics(bm, gt_images),

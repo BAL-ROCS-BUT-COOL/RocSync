@@ -298,7 +298,7 @@ uv run rocsync-validate [data_dir] [-o results.json] [--debug DIR]
 - `-o`: Output JSON file (default: `benchmark_results.json`).
 - `--debug`: Directory for debug images.
 
-Results JSON contains a `config` section and an `images` section with per-frame aruco, corners, counter, ring, timestamp, success flag, and timing breakdown. Keys match the ground truth's, so `n_images` in `config` counts benchmark frames rather than files. Corner positions are in original image coordinates, matching the ground truth: the pipeline detects them in the rough-rectified grid, whose scale is a property of the checkout being measured, so they are un-warped through that grid's own homography before being stored.
+Results JSON contains a `config` section and an `images` section with per-frame aruco, corners, counter, ring, timestamp, success flag, homography, rough_homography, and timing breakdown. Keys match the ground truth's, so `n_images` in `config` counts benchmark frames rather than files. Corner positions are in original image coordinates, matching the ground truth: the pipeline detects them in the rough-rectified grid, whose scale is a property of the checkout being measured, so they are un-warped through that grid's own homography before being stored. `homography` and `rough_homography` are the pipeline's own image → rectified-board matrices — the fine one fitted from the corner LEDs, the coarse one from the ArUco marker alone — saved as-is so `rocsync-evaluate` can score the rectification itself rather than only the LEDs it was fitted from.
 
 Every video additionally gets its clock fitted, by the same code a `rocsync` run uses, and a
 `videos` section records the resulting `VideoStatistics` — clock rate and offset, R²/RMSE
@@ -331,7 +331,10 @@ uv run rocsync-evaluate [paths...] [-g ground_truth.json] [-t] [--allow-partial]
 
 Metrics are computed per pipeline step:
 - **ArUco**: detection rates + corner pixel error in image space
-- **Corners**: detection rates in image space and board space + pixel errors in both spaces
+- **Corners**: per-corner detection rates in image space and board space + pixel errors in both spaces
+- **Rectification**: the final and the coarse (ArUco-only) homography, each scored at every
+  modelled LED position (always-on, ring, and counter) in board px against the LED sampling
+  radius — see below
 - **Counter**: detection rates + value accuracy
 - **Ring**: detection rates + start/end value accuracy, wrapping arcs included
 - **Overall**: timestamp detection + exact match accuracy + start/end/exposure error statistics,
@@ -347,14 +350,25 @@ Metrics are computed per pipeline step:
 Corner positions are compared against the annotated coordinates. Board space is derived by mapping
 both sides through the annotated homography, which normalises the threshold to LED sample radii —
 a fixed pixel threshold in image space means different things depending on how large the board
-appears in the frame.
+appears in the frame. Each frame is scored against its own board's sample radius, so a mix of
+board profiles is never scored against the wrong one's threshold.
 
-Reading position errors: the annotator pre-fills each image from a pipeline run, so on every frame
-accepted without correction the annotation *is* that pipeline's output. Position error therefore
-reads as zero for whichever checkout produced the annotations, and a non-zero error for another
-checkout measures divergence from it rather than distance from truth. Detection rates do not suffer
-this — the ground truth's positives include everything annotated by hand on frames where the
-pipeline failed.
+Rectification scores the homography itself rather than the corners it was fitted from: every LED
+the board model knows about (`board.layout_coords`) is mapped through the predicted homography and
+back through the annotated one, and the round trip's residual is the rectification's own error in
+board px, at every LED position including the ring and counter — regions the four fitted anchors
+only extrapolate into. A frame is a detection when its worst LED still lands inside the sample
+radius. The coarse ArUco-only row is not a competing method; it is the floor the fit degrades to
+when corner refinement fails, so the gap between the two rows is what refinement is worth.
+
+Reading position and rectification errors: the annotator pre-fills each image from a pipeline run,
+so on every frame accepted without correction the annotation *is* that pipeline's output — its
+`homography` field is copied straight from the pipeline's own `stats["homography"]`, and only a
+corner edit ever refits it. Position and rectification error therefore read as zero for whichever
+checkout produced the annotations, and a non-zero error for another checkout measures divergence
+from it rather than distance from truth; only hand-corrected frames carry independent signal.
+Detection rates do not suffer this — the ground truth's positives include everything annotated by
+hand on frames where the pipeline failed.
 
 A ring arc that wraps the end of the period was exposed across a counter increment, so the
 counter no longer says which period the arc belongs to and no timestamp follows from it. The

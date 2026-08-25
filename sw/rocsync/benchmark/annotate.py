@@ -1451,19 +1451,6 @@ class AnnotationTool:
         for text, cx, cy, color in corner_labels:
             board_text(text, cx, cy, color)
 
-        # Annotation status label in top-right corner
-        is_annotated = frame_key in self.ground_truth["images"]
-        annotation_label = "Annotated" if is_annotated else "UNANNOTATED"
-        thickness = 1 if is_annotated else 2
-        (tw, th), _ = cv2.getTextSize(annotation_label, FONT, FONT_SCALE, thickness)
-        draw_text(
-            board_scaled,
-            annotation_label,
-            (h - tw - 10, th + 10),
-            (0, 255, 0) if is_annotated else (0, 0, 255),
-            thickness=thickness,
-        )
-
         self._draw_loupe(left_scaled, original)
 
         # Status bar (3 rows). Left of the panel split: progress, shortcuts, legend.
@@ -1474,11 +1461,23 @@ class AnnotationTool:
         status_bar = np.full((status_h, total_w, 3), COLOR_STATUS_BG, dtype=np.uint8)
         right_x = left_scaled.shape[1] + 8
 
-        # Row 1: progress + file path
+        # Row 1: progress + file path, plus this frame's annotated state on the right
         n_annotated = len(self.ground_truth["images"])
         progress = f"[{self.current_idx + 1}/{len(self.frames)}] ({n_annotated} annotated)"
         info = f"{progress}  {frame_key}"
         draw_text(status_bar, info, (8, row_h - 10), COLOR_TEXT, fit_scale(info, left_w - 16))
+
+        is_annotated = frame_key in self.ground_truth["images"]
+        annotation_label = "Annotated" if is_annotated else "UNANNOTATED"
+        thickness = 1 if is_annotated else 2
+        (tw, _), _ = cv2.getTextSize(annotation_label, FONT, FONT_SCALE, thickness)
+        draw_text(
+            status_bar,
+            annotation_label,
+            (total_w - tw - 10, row_h - 10),
+            (0, 255, 0) if is_annotated else (0, 0, 255),
+            thickness=thickness,
+        )
 
         # Row 2: keyboard shortcuts, shrunk if they would reach past the panel split
         shortcuts = (

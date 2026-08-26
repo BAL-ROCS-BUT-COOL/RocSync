@@ -302,8 +302,10 @@ prediction about its frame *j* resolves back to frame *j + offset* of the record
 
 That is also why **the annotator walks the recordings and never a retimed clip**: the sources are
 untrimmed, so frames outside the current window stay annotatable, which is how a window grows.
-`rocsync-validate` and `rocsync-evaluate` do the opposite — a recording with a retimed clip beside
-it is skipped in favour of it, so the same footage is never benchmarked twice.
+`rocsync-validate` and `rocsync-evaluate` do the opposite for per-frame metrics — a recording with
+a retimed clip beside it is skipped in favour of it, so the same footage is never benchmarked
+twice. Its clock is still fitted, though: the clip's decoded frames stand in for the recording's,
+so the recording gets its own clock fit without being decoded a second time.
 
 ### Re-running
 
@@ -333,9 +335,17 @@ Results JSON contains a `config` section and an `images` section with per-frame 
 Every video additionally gets its clock fitted, by the same code a `rocsync` run uses, and a
 `videos` section records the resulting `VideoStatistics` — clock rate and offset, R²/RMSE
 before and after outlier rejection, frame period, dropouts and exposure. A video whose
-timeline could not be fitted carries an `error` instead of the fit. Each frame of a video
-gains its presentation timestamp as `pts_ms` and, once fitted, a `fit` of
-`{"residual_ms", "inlier"}`, so the per-frame outcome stays next to the frame it belongs to.
+timeline could not be fitted carries an `error` instead of the fit. Each video record also
+carries a `frames` table keyed like the ground truth's `images`, giving each of its frames a
+`pts_ms` and, once fitted, `residual_ms` and `inlier` — a frame's outcome stays with the fit
+that produced it rather than with the frame, since a recording and a retimed clip cut from it
+each fit a different clock over the same frames.
+
+A recording that has a retimed clip beside it is not decoded again: the clip is a stream copy,
+so its decoded frames stand in for the recording's, and its board times are re-fitted against
+the recording's own presentation timestamps to derive the recording's clock. Such a video
+record carries `derived_from` naming the clip and `timeline_windowed: true`, since the fit
+only covers the clip's window rather than the whole file.
 
 Unlike a real run, which analyzes roughly one frame per second, every frame that decoded
 feeds the fit: the benchmark has already paid to decode them all, and using all of them keeps
@@ -375,7 +385,8 @@ Metrics are computed per pipeline step:
   measured and retimed timelines are summarized separately, because a measured one also
   carries the camera's own timestamp error. Fit errors are the mean and the worst over the
   group's videos, frame counters their totals, residuals pooled over every frame the group
-  scored. A recording whose retimed clip the run scored is not reported separately
+  scored. A recording behind a retimed clip is decoded once, through the clip, but reported in
+  the measured group from its own derived fit
 
 Corner positions are compared against the annotated coordinates. Board space is derived by mapping
 both sides through the annotated homography, which normalises the threshold to LED sample radii —
@@ -410,28 +421,37 @@ every clock fit, the reference included. Annotations are unaffected: record what
 and the scoring sorts out what is decodable.
 
 The clock-fit block reads the reference out of the ground truth and never re-fits it. Read a
-sync error against the `reference tolerance` on the same block: a 0.5 ms error against a
-synthesized timeline is a real measurement, while against a measured one it is inside the
-camera's own noise. Its rows:
+fit error against `residual_threshold, loosest [ms]` on the same block: a 0.5 ms error against
+a synthesized timeline is a real measurement, while against a measured one it is inside the
+camera's own noise. Its rows, one block per group (measured videos, retimed videos):
 
 | Row | Meaning |
 | --- | --- |
-| `timeline` | `measured` for a recording, `synthesized` for a [retimed clip](#retimed-videos) |
-| `reference tolerance [ms]` | how far an annotation may sit from the reference, which is what makes those two comparable |
-| `clock rate error [ppm]` | fitted rate minus reference rate; the raw difference is ~1e-5 and unreadable otherwise |
-| `clock offset error [ms]` | fitted board time at `pts == 0` minus the reference's |
-| `sync error, first/last/worst [ms]` | how far the two clocks disagree at either end of the annotated span |
-| `outliers rejected in error` | frames the fit threw out whose decode the annotation confirms |
-| `misdecodes kept as inliers` | frames the fit kept whose decode the annotation contradicts |
-| `residual vs annotations` | fitted board time minus annotated board time, per frame |
+| `residual_threshold, loosest [ms]` | the loosest per-video tolerance in the group, which is what makes fit errors across it comparable |
+| `clock_rate error [ppm]` | fitted rate minus reference rate, mean and worst \|video\| |
+| `clock_offset_ms error` | fitted board time at `pts == 0` minus the reference's, mean and worst \|video\| |
+| `first/last_frame error [ms]` | how far the two clocks disagree at either end of the annotated span |
+| `rmse_after`, `r2_after` | the fit's own diagnostics against its own decoded frames |
+| `n_considered_frames` / `n_rejected_frames` | fit inliers and outliers, summed over the group |
+| `n_dropped_frames` | container gaps the fit found, summed over the group |
+| `fit frames with an annotation` | frames the fit and the ground truth both cover |
+| `rejected though decoded correctly` / `kept though misdecoded` | where the fit's own outlier rejection disagrees with the annotation |
 
-Read `sync error` first. Rate and offset trade off against each other — they cancel at
-`pts == 0` and diverge everywhere else — so either one alone can look bad while the clock is
-fine, or look fine while the clock is not. The sync error is what actually lands on a frame.
+Below the table, `Residual vs annotations` pools the fitted board time minus the annotated one
+over every frame the group scored — the per-frame error a caller of that clock actually sees.
+
+Read `first/last_frame error` first. Rate and offset trade off against each other — they cancel
+at `pts == 0` and diverge everywhere else — so either one alone can look bad while the clock is
+fine, or look fine while the clock is not. The frame error is what actually lands on a frame.
 
 Unlike the position errors above, this block does not favour whichever checkout pre-filled
 the annotations: the reference is fitted over annotated *values*, not copied from a pipeline's
 output. A decoding bias present in both annotations and predictions still cancels.
+
+A recording's derived fit only covers the window its retimed clip spans, while its reference
+clock is fitted over every annotation on the recording. If an annotation sits outside that
+window, its `first/last_frame error` reads as a small extrapolation rather than a measurement
+inside the fit.
 
 ## Comparing branches
 

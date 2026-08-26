@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rocsync"
-version = "0.1.0"
-authors = [{ name = "Jaro Meyer", email = "jaro.meyer@protonmail.com" }]
+version = "0.2.0"
+authors = [{ name = "Jaro Meyer", email = "jaro.meyer@protonmail.com" }, { name = "Jonas Hein", email = "jonas@hein-s.de" }]
 description = "RocSync: Millisecond-Accurate Temporal Synchronization for Heterogeneous Camera Systems"
 readme = "README.md"
 requires-python = ">=3.10"

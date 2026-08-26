@@ -51,5 +51,6 @@ DOI = {10.3390/s26031036}
 
 - **Frédéric Giraud**: Creator of the initial prototype.
 - **Lilian Calvet**: Conceptual designer.
+- **Jonas Hein**: Maintainer.
 
 Feel free to explore, contribute, and use RocSync in your projects!

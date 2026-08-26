@@ -117,12 +117,26 @@ def resolve_retimed_keys(benchmark, retimed):
     A retimed clip carries no annotations of its own, so a prediction about its frame
     j is a prediction about frame j + offset of the recording it was cut from. Doing
     this once at load leaves every per-frame metric comparing keys as it always has.
-    The `videos` section needs no such move: both sides key it by the retimed clip.
+    Each video's own `frames` table is remapped the same way; a table already keyed by
+    annotation keys, like a derived recording's, passes through unchanged.
     """
     if not retimed:
         return benchmark
     images = {source_key(key, retimed): value for key, value in benchmark["images"].items()}
-    return {**benchmark, "images": images}
+    result = {**benchmark, "images": images}
+    if benchmark.get("videos"):
+        result["videos"] = {
+            path: {
+                **record,
+                "frames": {
+                    source_key(key, retimed): frame for key, frame in record["frames"].items()
+                },
+            }
+            if "frames" in record
+            else record
+            for path, record in benchmark["videos"].items()
+        }
+    return result
 
 
 # ── Geometry helpers ─────────────────────────────────────────────────────────
@@ -555,19 +569,10 @@ def compute_clock_metrics(benchmark, gt) -> dict[str, dict]:
             for rel_path, reference in references.items()
         }
 
-    # A recording whose retimed clip this run scored is not separately unscored
-    shadowed = {
-        reference["source"]
-        for path, reference in references.items()
-        if reference.get("source") and path in predictions
-    }
-
     gt_images = gt["images"]
     bm_images = benchmark["images"]
     metrics: dict[str, dict] = {}
     for rel_path, reference in references.items():
-        if rel_path in shadowed:
-            continue
         pred = predictions.get(rel_path)
         if pred is None:
             metrics[rel_path] = described(reference, status="not in this run")
@@ -578,6 +583,7 @@ def compute_clock_metrics(benchmark, gt) -> dict[str, dict]:
 
         ref = ReferenceClock.from_dict(reference)
         rate, offset = pred["clock_rate"], pred["clock_offset_ms"]
+        pred_frames = pred.get("frames") or {}
 
         def predict(pts, rate=rate, offset=offset):
             return rate * pts + offset
@@ -595,23 +601,23 @@ def compute_clock_metrics(benchmark, gt) -> dict[str, dict]:
             if index is None or path != annotated_path:
                 continue
             prediction = bm_images.get(key)
-            if prediction is None:
+            frame = pred_frames.get(key)
+            if prediction is None or frame is None:
                 continue
 
             board = _board_for_gt(annotation)
             gt_ts = reconstruct_timestamp(annotation, board) if board is not None else None
-            pts = prediction.get("pts_ms")
+            pts = frame.get("pts_ms")
             if gt_ts is not None and pts is not None:
                 residuals.append(predict(pts) - gt_ts[0])
 
-            fit = prediction.get("fit")
-            if fit is None or gt_ts is None:
+            if "inlier" not in frame or gt_ts is None:
                 continue
             n_checked_frames += 1
             decoded_correctly = reconstruct_timestamp(prediction, board) == gt_ts
-            if decoded_correctly and not fit["inlier"]:
+            if decoded_correctly and not frame["inlier"]:
                 rejected_but_correct += 1
-            elif not decoded_correctly and fit["inlier"]:
+            elif not decoded_correctly and frame["inlier"]:
                 considered_but_misdecoded += 1
 
         metrics[rel_path] = described(

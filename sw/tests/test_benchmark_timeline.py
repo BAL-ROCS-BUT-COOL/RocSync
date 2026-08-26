@@ -62,15 +62,13 @@ def dataset(n=20, offset_error_ms=0.0, misdecoded=(), rejected=()):
 
     images = {}
     predictions = {}
+    frames = {}
     for i in range(n):
         key = frame_key(VIDEO, i)
         images[key] = as_annotation(starts[i])
         decoded = starts[i] + (37 if i in misdecoded else 0)
-        predictions[key] = {
-            **as_annotation(decoded),
-            "pts_ms": pts[i],
-            "fit": {"residual_ms": 0.0, "inlier": i not in rejected},
-        }
+        predictions[key] = as_annotation(decoded)
+        frames[key] = {"pts_ms": pts[i], "residual_ms": 0.0, "inlier": i not in rejected}
 
     ground_truth = {
         "images": images,
@@ -88,6 +86,7 @@ def dataset(n=20, offset_error_ms=0.0, misdecoded=(), rejected=()):
                 "n_rejected_frames": len(rejected),
                 "n_dropped_frames": 0,
                 "error": None,
+                "frames": frames,
             }
         },
     }
@@ -109,7 +108,16 @@ def retimed_dataset(**kwargs):
             "source_frame_offset": TRIMMED,
         }
     }
-    benchmark["videos"] = {RETIMED: benchmark["videos"][VIDEO]}
+    source_video = benchmark["videos"][VIDEO]
+    benchmark["videos"] = {
+        RETIMED: {
+            **source_video,
+            "frames": {
+                frame_key(RETIMED, index - TRIMMED): source_video["frames"][frame_key(VIDEO, index)]
+                for index in range(TRIMMED, len(source_video["frames"]))
+            },
+        }
+    }
     source_images = benchmark["images"]
     benchmark["images"] = {
         frame_key(RETIMED, index - TRIMMED): source_images[frame_key(VIDEO, index)]

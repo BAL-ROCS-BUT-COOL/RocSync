@@ -193,12 +193,64 @@ def run_benchmark(frames, ground_truth=None, debug_dir=None):
     return results
 
 
-def fit_videos(frames, results):
-    """Fit a clock per video and fold the per-frame outcome back into `results`.
+def _container_fps(path):
+    """Nominal frame rate the container reports."""
+    cap = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    return fps
+
+
+def _fit_record(rel_path, timestamps, frame_times, fps, frame_period_ms, timeline_windowed=False):
+    """Fit one video's clock, returning its summary plus a per-frame table keyed like `images`.
+
+    A frame's pts is its own whether or not the fit succeeds, so `frames` is built first and
+    the fit's own residual/inlier verdict folded in afterward. Kept on the video record rather
+    than in `results`, because a retimed clip and the recording it was cut from can each carry
+    a different fit over the same frame -- one field per frame per fit, not two fields on one.
+    """
+    frames = {
+        frame_key(rel_path, index): {"pts_ms": pts_ms} for index, pts_ms in frame_times.items()
+    }
+    try:
+        statistics, _, considered, rejected, _ = summarize_timeline(
+            timestamps,
+            frame_times,
+            len(frame_times),
+            fps,
+            timeline_windowed=timeline_windowed,
+            frame_period_ms=frame_period_ms,
+        )
+    except ValueError as e:
+        print(f"  WARNING: no clock for {rel_path}: {e}", file=sys.stderr)
+        return {
+            "n_frames": len(frame_times),
+            "n_timestamped_frames": len(timestamps),
+            "error": str(e),
+            "frames": frames,
+        }
+
+    for index, (*_, residual) in {**considered, **rejected}.items():
+        frames[frame_key(rel_path, index)].update(
+            residual_ms=float(residual), inlier=index in considered
+        )
+
+    record = statistics.to_dict()
+    # The per-frame residuals now live in this record's own `frames` table
+    del record["considered_timestamps"], record["rejected_timestamps"]
+    return {**record, "n_timestamped_frames": len(timestamps), "error": None, "frames": frames}
+
+
+def fit_videos(frames, results, data_dir, ground_truth=None):
+    """Fit a clock per video, plus a derived one for each recording behind a retimed clip.
 
     Runs the production summarization over every frame that decoded, rather than the
     one-per-second sample a real run takes: the benchmark has already paid to decode
     them all, and using all of them keeps fit quality separate from sampling policy.
+
+    A retimed clip is a stream copy, so its decoded frame j is the recording's frame
+    j + offset, pixel for pixel. Re-fitting those same decodes against the recording's own
+    timestamps reports the recording's clock too, without decoding it a second time.
     """
     by_path = defaultdict(list)
     for ref in frames:
@@ -206,57 +258,51 @@ def fit_videos(frames, results):
             by_path[ref.path].append(ref)
 
     videos = {}
+    decoded = {}
+    clip_frame_times = {}
     for path in sorted(by_path):
         refs = by_path[path]
         rel_path, _ = parse_frame_key(refs[0].key)
         frame_times = dict(enumerate(frame_pts(path)))
-
-        cap = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        cap.release()
-
-        # A frame's presentation timestamp is its own, whether or not the fit succeeds
-        for ref in refs:
-            if ref.key in results and ref.index in frame_times:
-                results[ref.key]["pts_ms"] = frame_times[ref.index]
-
         timestamps = {
             ref.index: tuple(results[ref.key]["timestamp"])
             for ref in refs
             if results.get(ref.key, {}).get("timestamp") is not None
         }
+        decoded[rel_path] = timestamps
+        clip_frame_times[rel_path] = frame_times
+        videos[rel_path] = _fit_record(
+            rel_path, timestamps, frame_times, _container_fps(path), source_frame_period_ms(path)
+        )
 
-        try:
-            statistics, _, considered, rejected, _ = summarize_timeline(
-                timestamps,
-                frame_times,
-                len(frame_times),
-                fps,
-                frame_period_ms=source_frame_period_ms(path),
-            )
-        except ValueError as e:
-            videos[rel_path] = {
-                "n_frames": len(frame_times),
-                "n_timestamped_frames": len(timestamps),
-                "error": str(e),
-            }
-            print(f"  WARNING: no clock for {rel_path}: {e}", file=sys.stderr)
+    for clip in retimed_videos(ground_truth or {}).values():
+        if clip.path not in decoded or clip.source in videos:
+            continue  # nothing decoded for the clip, or the recording was benchmarked itself
+        source_path = data_dir / clip.source
+        if not source_path.is_file():
             continue
+        source_pts = dict(enumerate(frame_pts(source_path)))
+        # Every clip frame counts, not just the ones that decoded a timestamp, so a
+        # misdecode does not masquerade as a dropped frame in the recording's own gaps
+        window = {
+            index + clip.frame_offset: source_pts[index + clip.frame_offset]
+            for index in clip_frame_times[clip.path]
+            if index + clip.frame_offset in source_pts
+        }
+        timestamps = {index + clip.frame_offset: ts for index, ts in decoded[clip.path].items()}
+        videos[clip.source] = {
+            **_fit_record(
+                clip.source,
+                timestamps,
+                window,
+                _container_fps(source_path),
+                source_frame_period_ms(source_path),
+                timeline_windowed=True,
+            ),
+            "derived_from": clip.path,
+        }
 
-        for index, (*_, residual) in {**considered, **rejected}.items():
-            key = frame_key(rel_path, index)
-            if key in results:
-                results[key]["fit"] = {
-                    "residual_ms": float(residual),
-                    "inlier": index in considered,
-                }
-
-        record = statistics.to_dict()
-        # The per-frame residuals now live next to the frames they belong to
-        del record["considered_timestamps"], record["rejected_timestamps"]
-        videos[rel_path] = {**record, "n_timestamped_frames": len(timestamps), "error": None}
-
-    return videos
+    return dict(sorted(videos.items()))
 
 
 def main():
@@ -312,13 +358,14 @@ def main():
     n_success = sum(1 for r in results.values() if r["success"])
     print(f"Detection rate: {n_success}/{len(results)} ({n_success / len(results):.1%})")
 
-    videos = fit_videos(frames, results)
+    videos = fit_videos(frames, results, data_dir, ground_truth)
     for rel_path, video in videos.items():
+        derived = f" (derived from {video['derived_from']})" if "derived_from" in video else ""
         if video["error"] is not None:
-            print(f"{rel_path}: no clock ({video['error']})")
+            print(f"{rel_path}{derived}: no clock ({video['error']})")
             continue
         print(
-            f"{rel_path}: {video['clock_rate']:.6f}x, "
+            f"{rel_path}{derived}: {video['clock_rate']:.6f}x, "
             f"offset {video['clock_offset_ms']:.1f} ms, "
             f"RMSE {video['rmse_after']:.2f} ms, "
             f"{video['n_considered_frames']}/{video['n_timestamped_frames']} inliers"

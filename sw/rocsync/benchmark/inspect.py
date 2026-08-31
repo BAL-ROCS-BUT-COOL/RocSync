@@ -39,9 +39,8 @@ from rocsync.benchmark.annotate import (
     fit_scale,
     ring_led_positions,
 )
-from rocsync.benchmark.common import FrameRef, FrameSource, parse_frame_key
+from rocsync.benchmark.common import FrameRef, FrameSource, annotation_camera, parse_frame_key
 from rocsync.board_profiles import DEFAULT_BOARD_SIZE, PROFILES_BY_ARUCO
-from rocsync.camera import CameraType
 from rocsync.vision import ARUCO_DICTIONARY
 
 WINDOW_NAME = "RocSync Inspect"
@@ -123,7 +122,8 @@ def reconstruct_view(entry, image, margin=BOARD_MARGIN_PX):
     if board is None:
         return None, None, "no aruco"
 
-    H = fit_corner_homography(entry.get("corners") or [], board)
+    camera = annotation_camera(entry)
+    H = fit_corner_homography(entry.get("corners") or [], board, camera)
     if H is None:
         H = coarse_homography_from_aruco({"aruco_corners": entry["aruco"].get("corners")}, board)
     if H is None:
@@ -166,6 +166,7 @@ def draw_overlay(view, entry, board, margin=BOARD_MARGIN_PX):
     counter = entry.get("counter") or {}
     ring = entry.get("ring") or {}
     corners = entry.get("corners") or []
+    camera = annotation_camera(entry)
 
     # ArUco marker
     ax1, ay1 = (int(v) + margin for v in board.aruco_corners_coords[0])
@@ -182,7 +183,7 @@ def draw_overlay(view, entry, board, margin=BOARD_MARGIN_PX):
         cv2.line(view, (ax2, ay1), (ax1, ay2), COLOR_NOT_VIS, 2)
 
     # Corner LEDs, at the fit's own expected positions
-    for i, (x, y) in enumerate(board.always_on_leds[CameraType.RGB]):
+    for i, (x, y) in enumerate(board.always_on_leds[camera]):
         cx, cy = int(x) + margin, int(y) + margin
         visible = i < len(corners) and corners[i].get("visible", False)
         color = COLOR_ON if visible else COLOR_NOT_VIS
@@ -190,12 +191,16 @@ def draw_overlay(view, entry, board, margin=BOARD_MARGIN_PX):
         draw_text(view, str(i), (cx + LED_RADIUS_PX + 6, cy + 6), color)
 
     # Counter
-    bx1, by1, bx2, by2 = (round(v) + margin for v in counter_bbox(counter_led_positions(board)))
+    bx1, by1, bx2, by2 = (
+        round(v) + margin for v in counter_bbox(counter_led_positions(board, camera))
+    )
     counter_visible = counter.get("visible", False)
     cv2.rectangle(view, (bx1, by1), (bx2, by2), COLOR_TEXT if counter_visible else COLOR_NOT_VIS, 1)
     value = counter.get("value")
     for (cx, cy), color in zip(
-        counter_led_positions(board), _counter_bit_colors(board, value, counter_visible), strict=True
+        counter_led_positions(board, camera),
+        _counter_bit_colors(board, value, counter_visible),
+        strict=True,
     ):
         cv2.circle(view, (cx + margin, cy + margin), LED_RADIUS_PX, color, 1)
     counter_text = f"Counter: {value}" if counter_visible else "Counter: n/a"
@@ -203,7 +208,7 @@ def draw_overlay(view, entry, board, margin=BOARD_MARGIN_PX):
 
     # Ring
     start, end = ring.get("start", 0), ring.get("end", 0)
-    for i, (rx, ry) in enumerate(ring_led_positions(board)):
+    for i, (rx, ry) in enumerate(ring_led_positions(board, camera)):
         color = _ring_arc_color(i, start, end)
         cv2.circle(view, (rx + margin, ry + margin), LED_RADIUS_PX, color, 1)
 

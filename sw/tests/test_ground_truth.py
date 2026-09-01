@@ -25,19 +25,16 @@ import cv2
 import numpy as np
 import pytest
 
-from rocsync.benchmark.annotate import (
-    annotated_starts,
-    derive_reference_clock,
-    fit_corner_homography,
-    video_rel_paths,
-)
+from rocsync.benchmark.annotate import derive_reference_clock, fit_corner_homography
 from rocsync.benchmark.common import (
     MIN_REFERENCE_FRAMES,
     ReferenceClock,
+    annotated_starts,
     annotation_camera,
     collect_frames,
     reference_outliers,
     residual_threshold_ms,
+    video_rel_paths,
 )
 from rocsync.board_profiles import PROFILES_BY_ARUCO
 from rocsync.timeline import frame_pts

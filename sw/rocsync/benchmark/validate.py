@@ -27,13 +27,16 @@ from rocsync.benchmark.common import (
     collect_frames,
     corner_positions_in_image,
     frame_key,
+    ground_truth_path,
+    load_ground_truth,
     parse_frame_key,
+    pts_by_index,
     retimed_videos,
     source_key,
 )
 from rocsync.board_profiles import PROFILES_BY_ARUCO
 from rocsync.camera import CameraType
-from rocsync.timeline import frame_pts, source_frame_period_ms, summarize_timeline
+from rocsync.timeline import source_frame_period_ms, summarize_timeline
 from rocsync.vision import process_frame
 
 
@@ -265,7 +268,7 @@ def fit_videos(frames, results, data_dir, ground_truth=None):
     for path in sorted(by_path):
         refs = by_path[path]
         rel_path, _ = parse_frame_key(refs[0].key)
-        frame_times = dict(enumerate(frame_pts(path)))
+        frame_times = pts_by_index(path)
         timestamps = {
             ref.index: tuple(results[ref.key]["timestamp"])
             for ref in refs
@@ -283,7 +286,7 @@ def fit_videos(frames, results, data_dir, ground_truth=None):
         source_path = data_dir / clip.source
         if not source_path.is_file():
             continue
-        source_pts = dict(enumerate(frame_pts(source_path)))
+        source_pts = pts_by_index(source_path)
         # Every clip frame counts, not just the ones that decoded a timestamp, so a
         # misdecode does not masquerade as a dropped frame in the recording's own gaps
         window = {
@@ -346,11 +349,10 @@ def main():
     if args.debug:
         Path(args.debug).mkdir(parents=True, exist_ok=True)
 
-    gt_path = Path(args.ground_truth) if args.ground_truth else data_dir / "ground_truth.json"
+    gt_path = ground_truth_path(data_dir, args.ground_truth)
     ground_truth = None
     if gt_path.is_file():
-        with open(gt_path) as f:
-            ground_truth = json.load(f)
+        ground_truth = load_ground_truth(gt_path)
     elif args.ground_truth:
         print(f"No ground truth at {gt_path}", file=sys.stderr)
         sys.exit(1)

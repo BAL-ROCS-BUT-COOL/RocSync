@@ -5,8 +5,11 @@ import numpy as np
 
 from rocsync.board_detection import find_corners_layout
 from rocsync.board_profiles import (
+    COUNTER_ZERO,
     DEFAULT_BOARD_SIZE,
+    NO_CORNERS,
     PROFILES_BY_ARUCO,
+    RING,
     RING_BG_OFFSET_MM,
 )
 from rocsync.camera import CameraType
@@ -18,17 +21,6 @@ ARUCO_DICTIONARY = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 
 CLAHE_CLIP_LIMIT = 2.0
 CLAHE_TILE_GRID_SIZE = (8, 8)
-
-# Why process_frame produced no board_time, distinct from succeeding. These are worth
-# telling apart because they call for different responses: NO_CORNERS means the board
-# (or its camera) is not in view at all; COUNTER_ZERO means it is in view but has not
-# started counting (or, for a v1 board, its 4-fold-symmetric orientation could not be
-# resolved -- see the IR branch below); RING means an arc was found but was unusable,
-# either split or sitting across the counter's wrap, both of which are refused rather
-# than guessed at. Without this, all three collapse onto the same `(True, None)`.
-NO_CORNERS = "no_corners"
-COUNTER_ZERO = "counter_zero"
-RING = "ring"
 
 # Keys `rocsync.benchmark` expects to find in a stats dict, whether or not the frame decoded.
 _STATS_KEYS = (

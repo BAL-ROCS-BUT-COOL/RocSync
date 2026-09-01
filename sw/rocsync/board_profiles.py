@@ -24,6 +24,18 @@ FIDUCIAL_TOL_PITCH_FRACTION = 0.45  # of the ring pitch; below 0.5 keeps neighbo
 
 RING_EDGE_MARGIN = 1  # ring LEDs of slack required at either end of the period
 
+# Why a decode attempt produced no board_time. Shared vocabulary across every decode
+# path -- image, 3D fiducial, 2D blob -- so a caller pooling results across routes
+# counts the same three reasons rather than each route inventing its own strings.
+# NO_CORNERS: the board itself was not located. COUNTER_ZERO: a quad was accepted but
+# the counter read zero, so either the count has not started or (for a board whose
+# orientation the accepted quad left ambiguous) the ring index would be meaningless.
+# RING: the counter is running but no single usable arc was read -- no contiguous lit
+# run, or one sitting across the wrap where the counter incremented mid-exposure.
+NO_CORNERS = "no_corners"
+COUNTER_ZERO = "counter_zero"
+RING = "ring"
+
 
 def _ring(radius_mm, period, centre):
     """Ring LED centres (mm), index 0 at the top, running counter-clockwise."""

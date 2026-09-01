@@ -1,5 +1,6 @@
 """Shared utilities for RocSync benchmark tools."""
 
+import json
 import sys
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
@@ -187,6 +188,73 @@ def collect_frames(root_dir, sources_only=False):
             frames.extend(FrameRef(path, i, frame_key(rel_path, i)) for i in range(n_frames))
     frames.sort(key=lambda ref: (str(ref.path), -1 if ref.index is None else ref.index))
     return frames
+
+
+def load_result_files(paths):
+    """{label: parsed json} for a set of result files, keyed by filename stem.
+
+    A single directory is expanded to every `.json` file in it, matching the
+    `output/benchmark/` layout `rocsync-evaluate` and `rocsync-inspect` both read.
+    """
+    if len(paths) == 1 and Path(paths[0]).is_dir():
+        files = sorted(Path(paths[0]).glob("*.json"))
+    else:
+        files = [Path(p) for p in paths]
+    columns = {}
+    for path in files:
+        with open(path) as f:
+            columns[path.stem] = json.load(f)
+    return columns
+
+
+def ground_truth_path(data_dir, override):
+    """Where a tool reads its ground truth from: `override` if given, else the default."""
+    return Path(override) if override else Path(data_dir) / "ground_truth.json"
+
+
+def load_ground_truth(path):
+    """Ground truth JSON at `path`, with both top-level tables always present."""
+    with open(path) as f:
+        ground_truth = json.load(f)
+    ground_truth.setdefault("images", {})
+    ground_truth.setdefault("videos", {})
+    return ground_truth
+
+
+def pts_by_index(path):
+    """Presentation timestamps of a video, keyed by frame index."""
+    return dict(enumerate(frame_pts(path)))
+
+
+def group_keys_by_path(keys):
+    """{relative path: [key]} for a list of frame keys, in path order."""
+    grouped = {}
+    for key in keys:
+        grouped.setdefault(parse_frame_key(key)[0], []).append(key)
+    return dict(sorted(grouped.items()))
+
+
+def find_file_boundary(paths, from_idx, forward=True):
+    """Index of the first frame of the next/previous file in `paths`, wrapping around.
+
+    `paths` names the file each entry of some longer, same-length list belongs to (a
+    video contributes one entry per frame), so stepping past one otherwise costs a step
+    per frame instead of one keypress.
+    """
+    n = len(paths)
+    current = paths[from_idx]
+    step = 1 if forward else -1
+    for k in range(1, n + 1):
+        idx = (from_idx + k * step) % n
+        if paths[idx] == current:
+            continue
+        if not forward:
+            # Going back lands on that file's last frame; rewind to its first
+            found = paths[idx]
+            while paths[(idx - 1) % n] == found:
+                idx = (idx - 1) % n
+        return idx
+    return from_idx
 
 
 @dataclass(frozen=True)
@@ -409,6 +477,17 @@ def corner_positions_in_image(stats, n_leds=4):
     return [positions[i].tolist() if found[i] else None for i in range(len(positions))]
 
 
+def counter_value_from_bits(bits):
+    """MSB-first LED bits -> the counter value they encode."""
+    n = len(bits)
+    return sum(2 ** (n - 1 - i) for i in range(n) if bits[i])
+
+
+def counter_bits_from_value(value, n_bits):
+    """A counter value's MSB-first bits, one bool per LED."""
+    return [bool(value & (2 ** (n_bits - 1 - i))) for i in range(n_bits)]
+
+
 def rectification_errors(pred_H, gt_H, points):
     """Board-space distance between where each modelled point lands under the two fits.
 
@@ -436,6 +515,19 @@ def ring_visible(image_data):
     """Ring is visible when start != end (half-open interval has nonzero length)."""
     ring = image_data.get("ring", {})
     return ring.get("start", 0) != ring.get("end", 0)
+
+
+def led_in_ring_arc(idx, start, end):
+    """Whether ring LED `idx` is ON in the half-open arc `[start, end)`, wraparound included.
+
+    Ascending index order: start, start+1, ..., end-1 are ON, end is the first OFF.
+    start == end means undecodable, so nothing counts as ON.
+    """
+    if start == end:
+        return False
+    if start < end:
+        return start <= idx < end
+    return idx >= start or idx < end
 
 
 def reconstruct_timestamp(image_data, board):
@@ -474,6 +566,19 @@ def annotated_board_time(entry):
         return None
     timestamp = reconstruct_timestamp(entry, board)
     return None if timestamp is None else timestamp[0]
+
+
+def annotated_starts(images, rel_path):
+    """Annotated board start time in ms per frame index, for one video."""
+    starts = {}
+    for key, entry in images.items():
+        path, index = parse_frame_key(key)
+        if index is None or path != rel_path:
+            continue
+        board_ms = annotated_board_time(entry)
+        if board_ms is not None:
+            starts[index] = board_ms
+    return starts
 
 
 def descriptive_stats(values):
@@ -630,6 +735,11 @@ def retimed_videos(ground_truth):
     return videos
 
 
+def video_rel_paths(frames):
+    """Relative paths of the videos in a frame list, sorted."""
+    return sorted({parse_frame_key(ref.key)[0] for ref in frames if ref.index is not None})
+
+
 def source_key(key, retimed):
     """The annotation key a frame key refers to, unchanged for anything not retimed."""
     path, index = parse_frame_key(key)
@@ -637,3 +747,33 @@ def source_key(key, retimed):
     if video is None or index is None:
         return key
     return frame_key(video.source, index + video.frame_offset)
+
+
+def resolve_retimed_keys(benchmark, retimed):
+    """Move a run's per-frame predictions onto the keys the annotations use.
+
+    A retimed clip carries no annotations of its own, so a prediction about its frame
+    j is a prediction about frame j + offset of the recording it was cut from. Doing
+    this once at load leaves every per-frame metric comparing keys as it always has.
+    Each video's own `frames` table is remapped the same way; a table already keyed by
+    annotation keys, like a derived recording's, passes through unchanged.
+    """
+    if not retimed:
+        return benchmark
+    images = {
+        source_key(key, retimed): value for key, value in (benchmark.get("images") or {}).items()
+    }
+    result = {**benchmark, "images": images}
+    if benchmark.get("videos"):
+        result["videos"] = {
+            path: {
+                **record,
+                "frames": {
+                    source_key(key, retimed): frame for key, frame in record["frames"].items()
+                },
+            }
+            if "frames" in record
+            else record
+            for path, record in benchmark["videos"].items()
+        }
+    return result

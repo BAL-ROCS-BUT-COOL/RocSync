@@ -25,61 +25,51 @@ import numpy as np
 from rocsync.benchmark.common import (
     MIN_REFERENCE_FRAMES,
     FrameSource,
+    annotated_starts,
     annotation_camera,
     collect_frames,
     corner_positions_in_image,
+    counter_bits_from_value,
+    counter_value_from_bits,
+    find_file_boundary,
     fit_reference_clock,
     frame_key,
+    ground_truth_path,
+    group_keys_by_path,
+    led_in_ring_arc,
+    load_ground_truth,
     orphaned_entries,
     parse_frame_key,
+    pts_by_index,
     reconstruct_timestamp,
     reference_outliers,
     reference_residual,
+    video_rel_paths,
+)
+from rocsync.benchmark.overlay import (
+    BOARD_MARGIN_PX,
+    COLOR_NOT_VIS,
+    COLOR_OFF,
+    COLOR_ON,
+    FONT,
+    FONT_SCALE,
+    LED_RADIUS_PX,
+    board_from_view,
+    corner_led_positions,
+    counter_bbox,
+    counter_led_positions,
+    draw_text,
+    fit_scale,
+    ring_led_positions,
+    warp_board_view,
 )
 from rocsync.board_profiles import BOARD_V1, PROFILES_BY_ARUCO, RectifiedBoard
 from rocsync.camera import CameraType
-from rocsync.timeline import frame_pts, measured_residual_threshold_ms, source_frame_period_ms
+from rocsync.timeline import measured_residual_threshold_ms, source_frame_period_ms
 from rocsync.vision import ARUCO_DICTIONARY, process_frame, read_counter, read_ring
-
-# Every board rectifies to the same pixel grid, so one radius serves the whole GUI.
-LED_RADIUS_PX = BOARD_V1.rectify().led_sample_radius
-
-# Slack warped in around the board, so LEDs that a coarse fit pushes off the edge stay visible.
-BOARD_MARGIN_PX = 10
 
 # Length of the tick marks drawn along the board edge at each board corner
 BOARD_TICK_PX = 10
-
-
-# ── Board geometry helpers ──────────────────────────────────────────────────
-
-
-def ring_led_positions(board, camera):
-    """Return list of (x, y) tuples for ring LEDs in rectified board coords."""
-    return [(int(x), int(y)) for x, y in board.ring_led_coords(camera)]
-
-
-def counter_led_positions(board, camera):
-    """Return list of (x, y) tuples for counter LEDs in rectified board coords."""
-    coords = board.counter_led_coords[camera]
-    return [(int(p[0]), int(p[1])) for p in coords]
-
-
-def corner_led_positions(board, camera):
-    """Return list of (x, y) tuples for corner LEDs in rectified board coords."""
-    return [(int(p[0]), int(p[1])) for p in board.always_on_leds[camera]]
-
-
-def counter_bbox(counter_pos):
-    """Compute counter bounding box (x1, y1, x2, y2) with margin around LEDs."""
-    cx = [p[0] for p in counter_pos]
-    cy = [p[1] for p in counter_pos]
-    return (
-        min(cx) - LED_RADIUS_PX - 10,
-        min(cy) - LED_RADIUS_PX - 10,
-        max(cx) + LED_RADIUS_PX + 10,
-        max(cy) + LED_RADIUS_PX + 10,
-    )
 
 
 # A homography follows from four point pairs whose board coordinates are in general
@@ -153,19 +143,6 @@ def coarse_homography_from_aruco(stats, board):
     if H is None or not np.isfinite(H).all():
         return None
     return H
-
-
-def warp_board_view(image, H, board, margin=BOARD_MARGIN_PX):
-    """Rectify `image` into a board grid padded by `margin` px on every side."""
-    T = np.array([[1, 0, margin], [0, 1, margin], [0, 0, 1]], dtype=np.float64)
-    side = board.board_size + 2 * margin
-    return cv2.warpPerspective(image[:, :, 2], T @ np.asarray(H, dtype=np.float64), (side, side))
-
-
-def board_from_view(view, board, margin=BOARD_MARGIN_PX):
-    """The board itself, cropped back out of a padded view."""
-    bs = board.board_size
-    return view[margin : margin + bs, margin : margin + bs].copy()
 
 
 def decode_clock(rectified, board, camera):
@@ -262,8 +239,7 @@ class ImageAnnotation:
         if counter_leds is not None:
             ann.counter_visible = True
             ann.counter_leds = list(counter_leds)
-            n = board.counter_bits
-            ann.counter_value = sum(2 ** (n - 1 - i) for i in range(n) if counter_leds[i])
+            ann.counter_value = counter_value_from_bits(counter_leds)
 
         # Ring — the decoded arc is inclusive (first ON, last ON). Convert to half-open
         # [start, end) in ascending index order. An arc wrapping the period end is kept as
@@ -276,8 +252,7 @@ class ImageAnnotation:
         return ann
 
     def recompute_counter(self):
-        n = self.board.counter_bits
-        self.counter_value = sum(2 ** (n - 1 - i) for i in range(n) if self.counter_leds[i])
+        self.counter_value = counter_value_from_bits(self.counter_leds)
 
     def to_original(self, board_x, board_y):
         """Transform a point from rectified board coords to original image coords."""
@@ -351,8 +326,7 @@ class ImageAnnotation:
         counter = data.get("counter", {})
         ann.counter_visible = counter.get("visible", False)
         ann.counter_value = counter.get("value", 0)
-        n = board.counter_bits
-        ann.counter_leds = [bool(ann.counter_value & (2 ** (n - 1 - i))) for i in range(n)]
+        ann.counter_leds = counter_bits_from_value(ann.counter_value, board.counter_bits)
 
         ring = data.get("ring", {})
         ann.ring_start = ring.get("start", 0)
@@ -364,27 +338,6 @@ class ImageAnnotation:
 
 
 # ── Reference clock ─────────────────────────────────────────────────────────
-
-
-def annotated_starts(images, rel_path):
-    """Annotated board start time in ms per frame index, for one video."""
-    starts = {}
-    for key, entry in images.items():
-        path, index = parse_frame_key(key)
-        if index is None or path != rel_path:
-            continue
-        board = PROFILES_BY_ARUCO.get(entry.get("aruco", {}).get("id"))
-        if board is None:
-            continue
-        timestamp = reconstruct_timestamp(entry, board)
-        if timestamp is not None:
-            starts[index] = timestamp[0]
-    return starts
-
-
-def video_rel_paths(frames):
-    """Relative paths of the videos in a frame list, sorted."""
-    return sorted({parse_frame_key(ref.key)[0] for ref in frames if ref.index is not None})
 
 
 def derive_reference_clock(starts, pts, threshold_ms):
@@ -406,14 +359,6 @@ def describe_outliers(rel_path, outliers, threshold_ms):
     return "\n".join(lines)
 
 
-def _group_by_path(keys):
-    """{relative path: [key]} for a list of frame keys, in path order."""
-    grouped = {}
-    for key in keys:
-        grouped.setdefault(parse_frame_key(key)[0], []).append(key)
-    return dict(sorted(grouped.items()))
-
-
 def describe_orphans(orphans, ground_truth):
     """One line per file the ground truth still describes and the dataset no longer backs.
 
@@ -423,10 +368,10 @@ def describe_orphans(orphans, ground_truth):
     images = ground_truth.get("images") or {}
     videos = ground_truth.get("videos") or {}
     lines = []
-    for rel_path, keys in _group_by_path(orphans.missing_images).items():
+    for rel_path, keys in group_keys_by_path(orphans.missing_images).items():
         detail = "reference clock and " if rel_path in orphans.missing_videos else ""
         lines.append(f"  {rel_path}: no such file ({detail}{len(keys)} annotation(s))")
-    described = set(_group_by_path(orphans.missing_images))
+    described = set(group_keys_by_path(orphans.missing_images))
     for rel_path in orphans.missing_videos:
         if rel_path in described:
             continue
@@ -434,7 +379,7 @@ def describe_orphans(orphans, ground_truth):
         source = (videos.get(rel_path) or {}).get("source")
         gone = f"its source {source} is gone" if source else "no such file"
         lines.append(f"  {rel_path}: {gone} (reference clock)")
-    for rel_path, keys in _group_by_path(orphans.out_of_range_images).items():
+    for rel_path, keys in group_keys_by_path(orphans.out_of_range_images).items():
         lines.append(f"  {rel_path}: {len(keys)} annotation(s) past the last frame")
     for rel_path in orphans.unreadable_videos:
         n = sum(1 for key in images if parse_frame_key(key)[0] == rel_path)
@@ -457,15 +402,14 @@ def prune(data_dir, output_path, dry_run=False):
     as a finished one.
     """
     data_dir = Path(data_dir)
-    output_path = Path(output_path) if output_path else data_dir / "ground_truth.json"
+    output_path = ground_truth_path(data_dir, output_path)
     if not output_path.exists():
         print(f"No ground truth at {output_path}", file=sys.stderr)
         return 1
 
-    with open(output_path) as f:
-        ground_truth = json.load(f)
-    images = ground_truth.setdefault("images", {})
-    videos = ground_truth.setdefault("videos", {})
+    ground_truth = load_ground_truth(output_path)
+    images = ground_truth["images"]
+    videos = ground_truth["videos"]
 
     frames = collect_frames(data_dir, sources_only=True)
     orphans = orphaned_entries(ground_truth, data_dir, frames)
@@ -521,9 +465,6 @@ class Mode(Enum):
 
 # ── Display and interaction ─────────────────────────────────────────────────
 
-COLOR_ON = (0, 0, 255)  # red  — LED is ON
-COLOR_OFF = (255, 0, 0)  # blue — LED is OFF
-COLOR_NOT_VIS = (128, 128, 128)  # gray — component hidden/undecodable
 COLOR_RING_SEL = (0, 255, 0)  # green — ring selection highlight
 COLOR_TEXT = (0, 0, 0)  # black text on bright bg
 COLOR_STATUS_BG = (220, 220, 220)  # light gray
@@ -533,10 +474,6 @@ COLOR_MARGIN = (180, 180, 180)  # light gray — board corner ticks inside the m
 WINDOW_NAME = "RocSync Annotation"
 TARGET_HEIGHT = 800
 
-# Every label uses one size, and is drawn at display resolution so it never gets
-# magnified along with the panel it sits on.
-FONT = cv2.FONT_HERSHEY_SIMPLEX
-FONT_SCALE = 0.75
 LINE_H = 32  # baseline spacing for stacked text rows
 
 
@@ -572,17 +509,6 @@ HELP_TEXT = [
 ]
 
 
-def draw_text(img, text, org, color, scale=FONT_SCALE, thickness=1):
-    """Draw a label in the one global font. Hershey strokes look ragged without LINE_AA."""
-    cv2.putText(img, text, org, FONT, scale, color, thickness, cv2.LINE_AA)
-
-
-def fit_scale(text, max_w, scale=FONT_SCALE):
-    """Largest font scale up to `scale` at which `text` still fits `max_w` pixels."""
-    w = cv2.getTextSize(text, FONT, scale, 1)[0][0]
-    return scale if w <= max_w else scale * max_w / w
-
-
 class AnnotationTool:
     # Per-image state. Set by run() before any handler can fire, so it is never None.
     annotation: ImageAnnotation
@@ -591,7 +517,7 @@ class AnnotationTool:
 
     def __init__(self, data_dir, output_path=None):
         self.data_dir = Path(data_dir)
-        self.output_path = Path(output_path) if output_path else self.data_dir / "ground_truth.json"
+        self.output_path = ground_truth_path(self.data_dir, output_path)
         self.ground_truth = {"images": {}, "videos": {}}
         self.frames = []
         self.source = FrameSource()
@@ -1441,7 +1367,7 @@ class AnnotationTool:
             if ann.ring_start == ann.ring_end:
                 color = COLOR_NOT_VIS
             else:
-                in_arc = self._led_in_ring_arc(i, ann.ring_start, ann.ring_end)
+                in_arc = led_in_ring_arc(i, ann.ring_start, ann.ring_end)
                 color = COLOR_ON if in_arc else COLOR_OFF
             if self.mode == Mode.RING_AWAITING_END and i == self._ring_start_candidate:
                 color = COLOR_RING_SEL
@@ -1589,22 +1515,6 @@ class AnnotationTool:
         panel[y0 : y0 + LOUPE_SIZE, x0 : x0 + LOUPE_SIZE] = loupe
 
     @staticmethod
-    def _led_in_ring_arc(idx, start, end):
-        """Check if LED idx is ON in the half-open arc [start, end).
-
-        Ascending index order: start, start+1, ..., end-1.
-        LED at index `end` is the first OFF and is excluded.
-        """
-        if start == end:
-            return False  # undecodable
-        if start < end:
-            # Non-wrapping: ON indices are start, start+1, ..., end-1
-            return start <= idx < end
-        else:
-            # Wrapping past 99→0: ON indices are start, ..., 99, 0, ..., end-1
-            return idx >= start or idx < end
-
-    @staticmethod
     def _draw_help(img):
         """Draw semi-transparent help overlay."""
         overlay = img.copy()
@@ -1665,7 +1575,7 @@ class AnnotationTool:
         the render path.
         """
         if rel_path not in self._video_pts:
-            self._video_pts[rel_path] = dict(enumerate(frame_pts(self.data_dir / rel_path)))
+            self._video_pts[rel_path] = pts_by_index(self.data_dir / rel_path)
         return self._video_pts[rel_path]
 
     def _load_threshold(self, rel_path):
@@ -1769,21 +1679,7 @@ class AnnotationTool:
         keypress per frame, and jump-to-unannotated only helps while frames are still
         unannotated.
         """
-        n = len(self.frames)
-        current = self.frames[from_idx].path
-        step = 1 if forward else -1
-        for k in range(1, n + 1):
-            idx = (from_idx + k * step) % n
-            if self.frames[idx].path == current:
-                continue
-            if forward:
-                return idx
-            # Going back lands on that file's last frame; rewind to its first
-            found = self.frames[idx].path
-            while self.frames[(idx - 1) % n].path == found:
-                idx = (idx - 1) % n
-            return idx
-        return from_idx
+        return find_file_boundary([ref.path for ref in self.frames], from_idx, forward=forward)
 
 
 def fit_clocks(data_dir, output_path):
@@ -1794,15 +1690,13 @@ def fit_clocks(data_dir, output_path):
     Returns a process exit code.
     """
     data_dir = Path(data_dir)
-    output_path = Path(output_path) if output_path else data_dir / "ground_truth.json"
+    output_path = ground_truth_path(data_dir, output_path)
     if not output_path.exists():
         print(f"No ground truth at {output_path}", file=sys.stderr)
         return 1
 
-    with open(output_path) as f:
-        ground_truth = json.load(f)
-    ground_truth.setdefault("images", {})
-    videos = ground_truth.setdefault("videos", {})
+    ground_truth = load_ground_truth(output_path)
+    videos = ground_truth["videos"]
 
     frames = collect_frames(data_dir, sources_only=True)
     failed = False
@@ -1811,7 +1705,7 @@ def fit_clocks(data_dir, output_path):
             continue
         period = source_frame_period_ms(data_dir / rel_path)
         threshold = measured_residual_threshold_ms(period)
-        pts = dict(enumerate(frame_pts(data_dir / rel_path)))
+        pts = pts_by_index(data_dir / rel_path)
         starts = annotated_starts(ground_truth["images"], rel_path)
         clock, outliers = derive_reference_clock(starts, pts, threshold)
         if clock is None:

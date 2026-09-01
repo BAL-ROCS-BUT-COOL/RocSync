@@ -12,13 +12,10 @@ from rocsync.benchmark.common import (
     descriptive_stats,
     fit_reference_clock,
     frame_key,
+    resolve_retimed_keys,
     retimed_videos,
 )
-from rocsync.benchmark.evaluate import (
-    aggregate_clock_metrics,
-    compute_clock_metrics,
-    resolve_retimed_keys,
-)
+from rocsync.benchmark.evaluate import aggregate_clock_metrics, compute_clock_metrics
 from rocsync.timeline import summarize_timeline
 
 VIDEO = "clips/take.mp4"

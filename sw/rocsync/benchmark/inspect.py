@@ -101,6 +101,63 @@ def frame_keys(columns):
     return sorted(keys)
 
 
+def _frame_signature(entry):
+    """The decoded fields that matter for spotting a cross-column disagreement, or None."""
+    if entry is None:
+        return None
+    aruco = entry.get("aruco") or {}
+    counter = entry.get("counter") or {}
+    ring = entry.get("ring") or {}
+    return (
+        aruco.get("visible", False),
+        aruco.get("id"),
+        counter.get("visible", False),
+        counter.get("value"),
+        ring.get("start", 0),
+        ring.get("end", 0),
+    )
+
+
+def has_disagreement(key, columns):
+    """Whether any two columns decode this frame differently (including one missing it)."""
+    sigs = {_frame_signature((data.get("images") or {}).get(key)) for data in columns.values()}
+    return len(sigs) > 1
+
+
+def _find_source_boundary(keys, from_idx, forward=True):
+    """Index of the first frame of the next/previous video, wrapping around the list.
+
+    Mirrors `AnnotationTool._find_source_boundary`: a video contributes one frame per
+    key, so stepping past one otherwise costs a keypress per frame.
+    """
+    n = len(keys)
+    current = parse_frame_key(keys[from_idx])[0]
+    step = 1 if forward else -1
+    for k in range(1, n + 1):
+        idx = (from_idx + k * step) % n
+        path = parse_frame_key(keys[idx])[0]
+        if path == current:
+            continue
+        if not forward:
+            # Going back lands on that file's last frame; rewind to its first
+            found = path
+            while parse_frame_key(keys[(idx - 1) % n])[0] == found:
+                idx = (idx - 1) % n
+        return idx
+    return from_idx
+
+
+def _find_disagreement(keys, columns, from_idx, forward=True):
+    """Index of the next/previous frame where columns disagree, wrapping around."""
+    n = len(keys)
+    step = 1 if forward else -1
+    for k in range(1, n + 1):
+        idx = (from_idx + k * step) % n
+        if has_disagreement(keys[idx], columns):
+            return idx
+    return from_idx
+
+
 def resolve_board(entry):
     """The `RectifiedBoard` an entry's ArUco reading identifies, or None."""
     aruco = (entry or {}).get("aruco") or {}
@@ -336,7 +393,8 @@ def render_frame(image, key, columns, idx, total):
     title = np.full((TITLE_H, grid.shape[1], 3), COLOR_TITLE_BG, dtype=np.uint8)
     draw_text(
         title,
-        f"[{idx + 1}/{total}] {key}    a/d: prev/next   q: quit",
+        f"[{idx + 1}/{total}] {key}    "
+        "a/d: prev/next frame   ,/.: prev/next video   b/n: prev/next disagreement   q: quit",
         (6, 21),
         COLOR_TEXT,
         FONT_SCALE,
@@ -369,14 +427,28 @@ def run_viewer(data_dir, keys, columns):
                 break
             if key_code == 255:
                 continue
-            if key_code in (ord("q"), ord("Q"), 27):
-                break
-            elif key_code in (ord("d"), ord("D"), 83):  # right arrow
+            # Arrow codes are checked before q/Q: on Linux, left arrow truncates to the
+            # same byte (81) as ord("Q"), same collision `annotate.py` resolves this way.
+            if key_code in (ord("d"), ord("D"), 83):  # right arrow: next frame
                 idx = (idx + 1) % len(keys)
                 composite = None
-            elif key_code in (ord("a"), ord("A"), 81):  # left arrow
+            elif key_code in (ord("a"), ord("A"), 81):  # left arrow: previous frame
                 idx = (idx - 1) % len(keys)
                 composite = None
+            elif key_code in (ord("n"), ord("N")):  # next disagreement
+                idx = _find_disagreement(keys, columns, idx, forward=True)
+                composite = None
+            elif key_code in (ord("b"), ord("B")):  # previous disagreement
+                idx = _find_disagreement(keys, columns, idx, forward=False)
+                composite = None
+            elif key_code == ord("."):  # next video
+                idx = _find_source_boundary(keys, idx, forward=True)
+                composite = None
+            elif key_code == ord(","):  # previous video
+                idx = _find_source_boundary(keys, idx, forward=False)
+                composite = None
+            elif key_code in (ord("q"), ord("Q"), 27):
+                break
 
     cv2.destroyAllWindows()
 

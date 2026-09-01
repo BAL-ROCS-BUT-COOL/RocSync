@@ -3,6 +3,7 @@ import time
 import cv2
 import numpy as np
 
+from rocsync.board_detection import find_corners_layout
 from rocsync.board_profiles import (
     DEFAULT_BOARD_SIZE,
     PROFILES_BY_ARUCO,
@@ -18,6 +19,17 @@ ARUCO_DICTIONARY = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 CLAHE_CLIP_LIMIT = 2.0
 CLAHE_TILE_GRID_SIZE = (8, 8)
 
+# Why process_frame produced no board_time, distinct from succeeding. These are worth
+# telling apart because they call for different responses: NO_CORNERS means the board
+# (or its camera) is not in view at all; COUNTER_ZERO means it is in view but has not
+# started counting (or, for a v1 board, its 4-fold-symmetric orientation could not be
+# resolved -- see the IR branch below); RING means an arc was found but was unusable,
+# either split or sitting across the counter's wrap, both of which are refused rather
+# than guessed at. Without this, all three collapse onto the same `(True, None)`.
+NO_CORNERS = "no_corners"
+COUNTER_ZERO = "counter_zero"
+RING = "ring"
+
 # Keys `rocsync.benchmark` expects to find in a stats dict, whether or not the frame decoded.
 _STATS_KEYS = (
     "aruco_id",
@@ -30,6 +42,7 @@ _STATS_KEYS = (
     "ring_leds",
     "ring_window",
     "timestamp",
+    "reject",
 )
 
 
@@ -81,17 +94,6 @@ def _make_aruco_detector():
 blob_detector = _make_blob_detector()
 aruco_detector = _make_aruco_detector()
 clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_GRID_SIZE)
-
-
-def draw_polygon(points, image, color):
-    for i in range(len(points)):
-        cv2.line(
-            image,
-            tuple(map(int, points[i])),
-            tuple(map(int, points[(i + 1) % len(points)])),
-            color,
-            2,
-        )
 
 
 def read_led(img, x, y, radius):
@@ -170,54 +172,6 @@ def read_counter(extracted_board, camera_type, board, draw_on=None, stats=None):
         stats["counter_leds"] = leds
     _record_step(stats, "counter_reading", t_start, value=counter)
     return counter
-
-
-def find_corners_convexhull(mask, frame_number, debug_dir=None):
-    points = blob_detector.detect(mask)
-
-    # Draw detected blobs as red circles
-    debug_image = (
-        cv2.drawKeypoints(
-            mask,
-            points,
-            np.array([]),
-            (0, 0, 255),
-            cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS,
-        )
-        if debug_dir
-        else None
-    )
-
-    points = [kp.pt for kp in points]
-
-    # Find the convex hull and identify the corners
-    corners = None
-    if len(points) >= 4:
-        hull = cv2.convexHull(np.array(points, dtype=np.float32))
-        corners = hull.reshape(-1, 2)
-        if debug_image is not None:
-            draw_polygon(corners, debug_image, (0, 255, 0))
-
-        if len(hull) > 4:
-            # Approximate to 4 points
-            epsilon_factor = 0.02
-            n_points = len(hull)
-            approx_hull = hull
-            while n_points > 4:
-                epsilon = epsilon_factor * cv2.arcLength(hull, True)
-                approx_hull = cv2.approxPolyDP(hull, epsilon, True)
-                n_points = len(approx_hull)
-                epsilon_factor += 0.02
-
-            # Draw the approximated convex hull
-            corners = approx_hull.reshape(-1, 2)
-            if debug_image is not None:
-                draw_polygon(corners, debug_image, (255, 0, 0))
-
-    if debug_image is not None:
-        cv2.imwrite(f"{debug_dir}/convexhull_{frame_number}.png", debug_image)
-    if corners is not None and len(corners) == 4:
-        return corners
 
 
 def find_corners_dots(mask, frame_number, board, debug_dir=None):
@@ -425,32 +379,24 @@ def rectify_board(
             _, mask = cv2.threshold(gray_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
             t0 = time.perf_counter()
-            corners = find_corners_convexhull(mask, frame_number, debug_dir)
+            corners = find_corners_layout(mask, board, frame_number, debug_dir)
             _record_step(stats, "corner_detection", t0, success=corners is not None)
             if corners is not None and stats is not None:
                 stats["corner_positions"] = corners.tolist()
             if corners is None:
+                if stats is not None:
+                    stats["reject"] = NO_CORNERS
                 return False, None, board
+            # find_corners_layout has already settled the orientation -- for v2 the 5th
+            # always-on LED decides it outright, for v1 the counter row does whenever any
+            # bit is lit -- so, unlike the convex hull it replaces, no rotation search is
+            # needed here: the warp this homography produces is upright already.
             transformation_matrix = cv2.getPerspectiveTransform(
                 corners, board.transform_corners(CameraType.INFRARED)
             )
             t0 = time.perf_counter()
             pcb = cv2.warpPerspective(mask, transformation_matrix, (board_size, board_size))
             _record_step(stats, "fine_rectification", t0)
-
-            # Board orientation is ambiguous from the convex hull alone; find the rotation
-            # that reads a nonzero counter. Rotating pcb without rotating the transform that
-            # produced it would leave `homography` describing the wrong orientation, so fold
-            # each 90° step into the matrix too: it is the same rotation applied to the
-            # *board*-space side of the fit.
-            n = board_size
-            rotate_90 = np.array([[0, -1, n - 1], [1, 0, 0], [0, 0, 1]], dtype=np.float64)
-            for _ in range(4):
-                if read_counter(pcb, CameraType.INFRARED, board) == 0:
-                    pcb = cv2.rotate(pcb, cv2.ROTATE_90_CLOCKWISE)
-                    transformation_matrix = rotate_90 @ transformation_matrix
-            if read_counter(pcb, CameraType.INFRARED, board) == 0:
-                return True, None, board  # Counter was 0, orientation undeterminable
             if stats is not None:
                 stats["homography"] = transformation_matrix
 
@@ -495,11 +441,25 @@ def process_frame(
     debug_canvas = cv2.cvtColor(pcb, cv2.COLOR_GRAY2BGR) if debug_dir else None
 
     counter = read_counter(pcb, camera_type, board, draw_on=debug_canvas, stats=stats)
+    if counter == 0:
+        # Either the counter has not started, or -- for a 4-fold-symmetric v1 board
+        # with no counter bit lit -- the orientation was never actually confirmed even
+        # though a quad was accepted. Either way the ring index would be meaningless,
+        # so no timestamp may be produced; the point-based routes apply this same rule.
+        if debug_canvas is not None:
+            cv2.imwrite(f"{debug_dir}/leds_{frame_number}.png", debug_canvas)
+        if stats is not None:
+            stats["reject"] = COUNTER_ZERO
+        _finalize_stats(stats, t_start, True, None)
+        return True, None
+
     ring = read_ring(pcb, camera_type, board, draw_on=debug_canvas, stats=stats)
 
     if debug_canvas is not None:
         cv2.imwrite(f"{debug_dir}/leds_{frame_number}.png", debug_canvas)
 
     board_time = board.board_time_from_ring(counter, ring) if ring is not None else None
+    if board_time is None and stats is not None:
+        stats["reject"] = RING
     _finalize_stats(stats, t_start, True, board_time)
     return True, board_time

@@ -3,19 +3,22 @@
 ``read_leds`` marks an LED lit when a point lies within ``fiducial_tol_mm`` of it, since
 tracker centroids carry no intensity to threshold. ``process_frame`` decodes 3D fiducials
 from a registered rigid body's position and rotation, rotating in 90-degree steps until
-the counter reads non-zero.
+the counter reads non-zero. ``decode_board_points`` decodes points whose orientation the
+caller has already resolved, e.g. via ``board_detection.find_board``.
 
 matplotlib is imported only when a caller passes an ``ax``.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from rocsync.board_profiles import BoardProfile
 from rocsync.camera import CameraType
+from rocsync.decode import Decode, decode_reading
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
@@ -23,8 +26,16 @@ if TYPE_CHECKING:
 FTK_PLANE_TOL_MM = 5.0  # out-of-plane slack for a fiducial to count as on the board
 
 
+def decode_board_points(points_mm, board: BoardProfile, ax: Axes | None = None) -> Decode:
+    """Decode a board's counter and ring from points already in its millimetre frame."""
+    points = [np.asarray(p, dtype=float) for p in points_mm]
+    counter = read_counter(points, board, ax)
+    ring = read_ring(points, board, ax) if counter else None
+    return decode_reading(board, counter, ring)
+
+
 def read_leds(
-    fiducials: list[tuple[float, float]],
+    fiducials: Sequence[np.ndarray | tuple[float, float]],
     led_coords: np.ndarray,
     tol_mm: float,
     ax: Axes | None = None,
@@ -44,7 +55,7 @@ def read_leds(
 
 
 def read_ring(
-    fiducials: list[tuple[float, float]],
+    fiducials: Sequence[np.ndarray | tuple[float, float]],
     board: BoardProfile,
     ax: Axes | None = None,
 ) -> tuple[int, int] | None:
@@ -55,7 +66,7 @@ def read_ring(
 
 
 def read_counter(
-    fiducials: list[tuple[float, float]],
+    fiducials: Sequence[np.ndarray | tuple[float, float]],
     board: BoardProfile,
     ax: Axes | None = None,
 ) -> int:

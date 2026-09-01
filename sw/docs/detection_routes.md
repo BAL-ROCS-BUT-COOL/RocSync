@@ -1,5 +1,19 @@
 # Board detection
 
+## Routes
+
+Every route maps one frame to a `rocsync.decode.Decode`. Its `reject` is `None` when the
+board time was read; otherwise it names the reason.
+
+| Route | Entry point | Input |
+|---|---|---|
+| Image | `vision.process_frame` | RGB or IR image |
+
+The RGB and IR image routes differ only in how the board corners are found: via the ArUco
+marker and corner LEDs in RGB, and via `board_detection.find_corners_layout` in IR, where
+the marker is not visible. Both then warp the board upright and read each LED from the
+image intensity at its expected position.
+
 ## Locating the board among 2D points
 
 `board_detection.find_board` locates the four IR corner LEDs among arbitrary 2D points:

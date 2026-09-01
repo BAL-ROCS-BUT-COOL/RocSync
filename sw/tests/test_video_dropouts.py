@@ -14,6 +14,7 @@ import pytest
 
 from rocsync import video
 from rocsync.camera import CameraType
+from rocsync.decode import Decode
 from rocsync.timeline import frame_pts
 
 FPS = 30.0
@@ -90,7 +91,7 @@ def board_at_pts(gap_video, monkeypatch):
         pts = pts_by_index[frame_number]
         seen.append((frame_number, pts))
         start = pts + OFFSET
-        return True, (start, start + EXPOSURE)
+        return Decode(counter=1, ring_start=start, ring_end=start + EXPOSURE)
 
     monkeypatch.setattr(video, "process_frame", fake_process_frame)
     return seen

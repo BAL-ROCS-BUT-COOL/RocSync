@@ -11,6 +11,10 @@ positions (the same fit `rocsync-annotate` uses), not by re-running the pipeline
 a results file is a record of what a checkout saw, and this tool shows exactly
 that record back.
 
+Ground truth is read from `<data_dir>/ground_truth.json` (or `-g`) so a retimed clip's
+frames -- keyed to the recording it was cut from in every results file -- line up with the
+column they belong under, whether or not the ground truth itself is shown as a column.
+
 Usage:
     python -m rocsync.benchmark.inspect results.json [other.json ...] \
         [--data-dir DIR] [-g ground_truth.json]
@@ -31,15 +35,20 @@ from rocsync.benchmark.annotate import (
     COLOR_OFF,
     COLOR_ON,
     LED_RADIUS_PX,
-    coarse_homography_from_aruco,
     counter_bbox,
     counter_led_positions,
     draw_text,
-    fit_corner_homography,
     fit_scale,
     ring_led_positions,
 )
-from rocsync.benchmark.common import FrameRef, FrameSource, annotation_camera, parse_frame_key
+from rocsync.benchmark.common import (
+    FrameRef,
+    FrameSource,
+    annotation_camera,
+    parse_frame_key,
+    retimed_videos,
+)
+from rocsync.benchmark.evaluate import resolve_retimed_keys
 from rocsync.board_profiles import DEFAULT_BOARD_SIZE, PROFILES_BY_ARUCO
 from rocsync.vision import ARUCO_DICTIONARY
 
@@ -159,11 +168,13 @@ def _find_disagreement(keys, columns, from_idx, forward=True):
 
 
 def resolve_board(entry):
-    """The `RectifiedBoard` an entry's ArUco reading identifies, or None."""
-    aruco = (entry or {}).get("aruco") or {}
-    board_id = aruco.get("id")
-    if not aruco.get("visible") or board_id is None:
-        return None
+    """The `RectifiedBoard` an entry's ArUco reading identifies, or None.
+
+    `aruco.id` is the board identifier even when the marker itself is not visible -- IR
+    footage never sees it -- so this looks the id up regardless of `visible`, matching
+    every other resolver (`annotate.py`, `evaluate.py`, `common.annotated_board_time`).
+    """
+    board_id = ((entry or {}).get("aruco") or {}).get("id")
     profile = PROFILES_BY_ARUCO.get(board_id)
     return None if profile is None else profile.rectify(DEFAULT_BOARD_SIZE)
 
@@ -171,18 +182,18 @@ def resolve_board(entry):
 def reconstruct_view(entry, image, margin=BOARD_MARGIN_PX):
     """Rectified color view for one column's entry: (view, board, failure reason).
 
-    Prefers the fit from corner LEDs -- the same one `rocsync-annotate` shows --
-    and falls back to the ArUco marker alone, exactly as `rectify_board` does when
-    corner detection comes up empty. `view` and `reason` are mutually exclusive.
+    Uses the entry's own stored `homography` as-is, never re-fit from its corner or
+    ArUco positions: those are a record of what was seen, not a recipe for reproducing
+    the fit, and re-deriving it here would show a homography the annotation or pipeline
+    run never actually used (and, for a corner re-fit, requires 4 visible corners this
+    file may not have even when its own stored fit is a good one). `view` and `reason`
+    are mutually exclusive.
     """
     board = resolve_board(entry)
     if board is None:
         return None, None, "no aruco"
 
-    camera = annotation_camera(entry)
-    H = fit_corner_homography(entry.get("corners") or [], board, camera)
-    if H is None:
-        H = coarse_homography_from_aruco({"aruco_corners": entry["aruco"].get("corners")}, board)
+    H = entry.get("homography")
     if H is None:
         return None, board, "no fit"
 
@@ -466,14 +477,15 @@ def main():
         help="Validation data directory (default: read from a result file's config.data_dir)",
     )
     parser.add_argument(
-        "-g", "--ground-truth", default=None, help="Ground truth JSON to show as an extra column"
+        "-g",
+        "--ground-truth",
+        default=None,
+        help="Ground truth JSON to show as an extra column "
+        "(default: <data_dir>/ground_truth.json, read either way to resolve retimed clips)",
     )
     args = parser.parse_args()
 
     columns = load_columns(args.results)
-    if args.ground_truth:
-        with open(args.ground_truth) as f:
-            columns["ground_truth"] = json.load(f)
 
     data_dir = resolve_data_dir(columns, args.data_dir)
     if data_dir is None:
@@ -482,6 +494,21 @@ def main():
     if not data_dir.is_dir():
         print(f"data_dir not found: {data_dir}", file=sys.stderr)
         sys.exit(1)
+
+    gt_path = Path(args.ground_truth) if args.ground_truth else data_dir / "ground_truth.json"
+    ground_truth = {}
+    if gt_path.is_file():
+        with open(gt_path) as f:
+            ground_truth = json.load(f)
+    elif args.ground_truth:
+        print(f"No ground truth at {gt_path}", file=sys.stderr)
+        sys.exit(1)
+
+    # Results are keyed to the retimed clip the validator walked; annotations to the recording
+    retimed = retimed_videos(ground_truth)
+    columns = {label: resolve_retimed_keys(data, retimed) for label, data in columns.items()}
+    if args.ground_truth:
+        columns["ground_truth"] = ground_truth
 
     keys = frame_keys(columns)
     if not keys:

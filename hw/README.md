@@ -10,10 +10,6 @@ For even better accuracy, consider dedicating an unused GPIO pin (e.g., OLED SDA
 - **Rev1**: Initial design with 16-bit counter and crystal oscillator. Single-sided JLCPCB assembly with manual back-side soldering.
 - **Rev2**: Improved design featuring a 20-bit counter, high-precision TCXO, 5-way button interface, and fifth corner LED for unambiguous orientation detection. Optimized for dual-sided assembly.
 
-## Potential Improvements
-- [ ] Decouple IR and visible LED brightness
-- [ ] Address LED brightness degradation at low battery voltage (consider implementing a buck-boost converter)
-
 ## JLCPCB Ordering
 1. Upload the **Gerber files** and let JLCPCB auto-populate all options.
 2. Enable **PCB Assembly**, selecting **Standard PCBA** and **top side assembly**.

@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 from rocsync.clips import MAX_FRAMES_IN_FLIGHT
 from rocsync.printer import errprint, print, printresult, warnprint
-from rocsync.timeline import detect_dropouts, fit_timeline, median_frame_period
+from rocsync.timeline import summarize_timeline
 from rocsync.video_statistics import VideoStatistics
 from rocsync.vision import CameraType, process_frame
 
@@ -270,9 +270,6 @@ def process_video(
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
 
-    # Last-resort frame period only; the span is measured off the frames themselves
-    nominal_period = 1000 / fps if fps > 0 else None
-
     # Whether the reported span and dropouts describe the file or just the windows
     timeline_windowed = bool(windows)
 
@@ -300,22 +297,18 @@ def process_video(
         frame_times.update(window_times)
         window_frame_times.append(window_times)
 
-    if len(timestamps) < 2:
-        errprint("Error: Insufficient number of timestamped frames.")
-        return
-    if not frame_times:
-        errprint("Error: No frames could be read.")
-        return
-
     # Fit board time against the frames' own presentation timestamps, both in ms
-    period = median_frame_period(frame_times.values(), fallback=nominal_period)
-    if not period:
-        errprint("Error: Unable to determine the frame period.")
-        return
     try:
-        fit = fit_timeline(frame_times, timestamps, fallback_period=nominal_period)
+        statistics, fit, filtered_timestamps, rejected_timestamps, gaps = summarize_timeline(
+            timestamps,
+            frame_times,
+            n_frames,
+            fps,
+            window_frame_times=window_frame_times,
+            timeline_windowed=timeline_windowed,
+        )
     except ValueError as e:
-        errprint(f"Error: Unable to fit the frame timeline: {e}")
+        errprint(f"Error: {e}")
         return
 
     if len(fit.order) < len(timestamps):
@@ -335,72 +328,16 @@ def process_video(
             f"expected approximately 1x."
         )
 
-    # Counted per window, so the span between disjoint windows is not a dropout
-    n_gaps = n_dropped_frames = 0
-    largest_gap_ms = 0.0
-    gaps = []
-    for window_times in window_frame_times:
-        window_gaps, window_dropped, window_largest, found = detect_dropouts(
-            window_times.values(), period
-        )
-        n_gaps += window_gaps
-        n_dropped_frames += window_dropped
-        largest_gap_ms = max(largest_gap_ms, window_largest)
-        gaps.extend(found)
-    if n_dropped_frames:
+    if statistics.n_dropped_frames:
         warnprint(
-            f"WARNING: {n_dropped_frames} frames missing from the container in "
-            f"{n_gaps} gap(s), largest {largest_gap_ms / 1000:.3f} s."
+            f"WARNING: {statistics.n_dropped_frames} frames missing from the container in "
+            f"{statistics.n_gaps} gap(s), largest {statistics.largest_gap_ms / 1000:.3f} s."
         )
-
-    # Add error to timestamps, following the order the fit used
-    x = np.array([frame_times[k] for k in fit.order])
-    y = np.array([timestamps[k][0] for k in fit.order])
-    errors = fit.predict(x) - y
-    annotated_timestamps = {
-        frame_number: (*timestamps[frame_number], error)
-        for frame_number, error in zip(fit.order, errors, strict=True)
-    }
-
-    # Remove outliers
-    filtered_timestamps = {
-        k: annotated_timestamps[k]
-        for k, is_inlier in zip(fit.order, fit.inlier_mask, strict=True)
-        if is_inlier
-    }
-    rejected_timestamps = {
-        k: annotated_timestamps[k]
-        for k, is_inlier in zip(fit.order, fit.inlier_mask, strict=True)
-        if not is_inlier
-    }
-
-    # Span anchored on frames actually present, so nothing is extrapolated
-    fit_stats = fit.to_dict()
-    pts_min, pts_max = min(frame_times.values()), max(frame_times.values())
-    exposure_times = [end - start for start, end, _ in filtered_timestamps.values()]
-    statistics = VideoStatistics(
-        n_frames=n_frames,
-        container_duration=pts_max - pts_min,
-        board_duration=fit_stats["last_frame"] - fit_stats["first_frame"],
-        nominal_fps=fps,
-        measured_fps=1000 / period,
-        median_frame_period=period,
-        n_gaps=n_gaps,
-        n_dropped_frames=n_dropped_frames,
-        largest_gap_ms=largest_gap_ms,
-        timeline_windowed=timeline_windowed,
-        mean_exposure_time=np.mean(exposure_times),
-        min_exposure_time=np.min(exposure_times),
-        max_exposure_time=np.max(exposure_times),
-        std_exposure_time=np.std(exposure_times),
-        considered_timestamps=filtered_timestamps,
-        rejected_timestamps=rejected_timestamps,
-        **fit_stats,
-    )
 
     print_statistics(statistics)
 
     if debug_dir:
+        exposure_times = [end - start for start, end, _ in filtered_timestamps.values()]
         plot_timechart(
             fit,
             filtered_timestamps,

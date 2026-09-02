@@ -27,9 +27,14 @@ dependencies = [
 [project.scripts]
 rocsync = "rocsync.main:main"
 rocsync-align = "rocsync.helpers.align:main"
+rocsync-annotate = "rocsync.benchmark.annotate:main"
+rocsync-retime = "rocsync.benchmark.retime:main"
+rocsync-validate = "rocsync.benchmark.validate:main"
+rocsync-evaluate = "rocsync.benchmark.evaluate:main"
 
 [dependency-groups]
-dev = ["basedpyright>=1.39", "pytest>=9.1.1", "ruff>=0.16.3"]
+# av only powers rocsync-retime, which authors benchmark datasets from a checkout
+dev = ["av>=12", "basedpyright>=1.39", "pytest>=9.1.1", "ruff>=0.16.3"]
 
 [tool.setuptools]
 # Only the library ships; tests/ and evaluation/ stay out of site-packages

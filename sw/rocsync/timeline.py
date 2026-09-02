@@ -11,6 +11,7 @@ The result is a plain affine map, board_ms = clock_rate * pts_ms + clock_offset_
 is all any consumer needs in order to time a frame it has just decoded.
 """
 
+import subprocess
 from dataclasses import dataclass, field
 from itertools import pairwise
 from typing import cast
@@ -19,6 +20,8 @@ import cv2
 import numpy as np
 from sklearn.linear_model import LinearRegression, RANSACRegressor
 from sklearn.metrics import root_mean_squared_error
+
+from rocsync.video_statistics import VideoStatistics
 
 
 @dataclass
@@ -172,12 +175,195 @@ def fit_timeline(
     )
 
 
+def summarize_timeline(
+    timestamps,
+    frame_times,
+    n_frames,
+    fps,
+    window_frame_times=None,
+    timeline_windowed=False,
+):
+    """Fit board time against the container clock and describe the result.
+
+    Everything between a set of decoded timestamps and a finished `VideoStatistics`:
+    the frame period, the fit, the dropouts, each frame's residual and the split into
+    inliers and outliers. Shared with the benchmark, so what it measures is the
+    summary a real run produces rather than a copy of it.
+
+    `window_frame_times` lists the frames of each search window separately, because a
+    gap between two disjoint windows is not a dropout. Callers that scanned the whole
+    file can leave it out.
+
+    Returns (statistics, fit, considered, rejected, gaps). Raises ValueError when the
+    timeline cannot be fitted.
+    """
+    if len(timestamps) < 2:
+        raise ValueError("Insufficient number of timestamped frames.")
+    if not frame_times:
+        raise ValueError("No frames could be read.")
+
+    # Last-resort frame period only; the span is measured off the frames themselves
+    nominal_period = 1000 / fps if fps > 0 else None
+    period = median_frame_period(frame_times.values(), fallback=nominal_period)
+    if not period:
+        raise ValueError("Unable to determine the frame period.")
+
+    try:
+        fit = fit_timeline(frame_times, timestamps, fallback_period=nominal_period)
+    except ValueError as e:
+        raise ValueError(f"Unable to fit the frame timeline: {e}") from e
+
+    # Counted per window, so the span between disjoint windows is not a dropout
+    n_gaps = n_dropped_frames = 0
+    largest_gap_ms = 0.0
+    gaps = []
+    for window_times in window_frame_times or [frame_times]:
+        window_gaps, window_dropped, window_largest, found = detect_dropouts(
+            window_times.values(), period
+        )
+        n_gaps += window_gaps
+        n_dropped_frames += window_dropped
+        largest_gap_ms = max(largest_gap_ms, window_largest)
+        gaps.extend(found)
+
+    # Add error to timestamps, following the order the fit used
+    x = np.array([frame_times[k] for k in fit.order])
+    y = np.array([timestamps[k][0] for k in fit.order])
+    errors = fit.predict(x) - y
+    annotated_timestamps = {
+        frame_number: (*timestamps[frame_number], error)
+        for frame_number, error in zip(fit.order, errors, strict=True)
+    }
+
+    # Remove outliers
+    considered = {
+        k: annotated_timestamps[k]
+        for k, is_inlier in zip(fit.order, fit.inlier_mask, strict=True)
+        if is_inlier
+    }
+    rejected = {
+        k: annotated_timestamps[k]
+        for k, is_inlier in zip(fit.order, fit.inlier_mask, strict=True)
+        if not is_inlier
+    }
+
+    # Span anchored on frames actually present, so nothing is extrapolated
+    fit_stats = fit.to_dict()
+    pts_min, pts_max = min(frame_times.values()), max(frame_times.values())
+    exposure_times = [end - start for start, end, _ in considered.values()]
+    statistics = VideoStatistics(
+        n_frames=n_frames,
+        container_duration=pts_max - pts_min,
+        board_duration=fit_stats["last_frame"] - fit_stats["first_frame"],
+        nominal_fps=fps,
+        measured_fps=1000 / period,
+        median_frame_period=period,
+        n_gaps=n_gaps,
+        n_dropped_frames=n_dropped_frames,
+        largest_gap_ms=largest_gap_ms,
+        timeline_windowed=timeline_windowed,
+        mean_exposure_time=float(np.mean(exposure_times)),
+        min_exposure_time=float(np.min(exposure_times)),
+        max_exposure_time=float(np.max(exposure_times)),
+        std_exposure_time=float(np.std(exposure_times)),
+        considered_timestamps=considered,
+        rejected_timestamps=rejected,
+        **fit_stats,
+    )
+    return statistics, fit, considered, rejected, gaps
+
+
+def run_ffprobe(video_path, *args):
+    """stdout of an ffprobe query about a video's first video stream, or None.
+
+    None means ffprobe is missing or refused the file, which is what makes every caller
+    keep a way of its own to answer the question it asked.
+    """
+    try:
+        return subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", *args, str(video_path)],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def probe_packet_field(video_path, field):
+    """Values of one ffprobe packet field, in packet order, as floats.
+
+    A packet carries the numbers the container already stores, so reading it needs no
+    decoder: ffprobe's `frame=` entries decode the file and cost seconds per video,
+    `packet=` does not.
+    """
+    output = run_ffprobe(video_path, "-show_entries", f"packet={field}", "-of", "csv=p=0")
+    # A packet the container left blank prints as 'N/A', which is not a number
+    fields = (line.strip().rstrip(",") for line in (output or "").splitlines())
+    return [float(f) for f in fields if _is_float(f)]
+
+
+def _is_float(text):
+    try:
+        float(text)
+    except ValueError:
+        return False
+    return True
+
+
+def _parse_ratio(text):
+    """A 'num/den' ffprobe ratio as a float, or None if it is not one."""
+    num, _, den = (text or "").partition("/")
+    try:
+        num, den = float(num), float(den)
+    except ValueError:
+        return None
+    return num / den if den else None
+
+
 def frame_pts(video_path):
     """Presentation timestamp in ms of every frame, indexed by frame number.
 
-    Uses grab() so frames are demuxed without decoding pixels, which makes this
-    cheap enough to run before picking frames out of a video.
+    Read off the container's packets, so no frame is decoded -- which is what makes this
+    cheap enough to run before picking frames out of a video. Decoding the whole file,
+    the fallback for a container ffprobe cannot read the packet timestamps of, costs
+    seconds per video.
+
+    The timestamps are stored as integer ticks of the stream's time base, and are turned
+    into ms here exactly the way the decoder does it, so the two agree bit for bit rather
+    than to within the microsecond that ffprobe prints seconds to.
+
+    Timestamps are relative to the stream's start time, so a clip whose container starts
+    at 47 s still begins at 0.0 here. `clock_offset_ms` is defined against this view,
+    which is also the one `read_frames_async` feeds the pipeline; an absolute container
+    timestamp has to have the start time subtracted first.
     """
+    output = run_ffprobe(
+        video_path,
+        "-show_entries",
+        "stream=time_base,start_pts:packet=pts",
+        "-of",
+        "default=noprint_wrappers=1",
+    )
+    ticks, stream = [], {}
+    for line in (output or "").splitlines():
+        name, _, value = line.partition("=")
+        if name == "pts" and _is_float(value):
+            ticks.append(float(value))
+        elif value and value != "N/A":
+            stream[name] = value
+
+    time_base = _parse_ratio(stream.get("time_base"))
+    if ticks and time_base is not None:
+        # Packets arrive in decode order, which B-frames make differ from display order
+        ticks.sort()
+        start = float(stream.get("start_pts", ticks[0]))
+        return [(t - start) * time_base * 1000 for t in ticks]
+    return _decoded_frame_pts(video_path)
+
+
+def _decoded_frame_pts(video_path):
+    """`frame_pts` the slow way, for a file ffprobe could not read the packets of."""
     cap = cv2.VideoCapture(str(video_path), cv2.CAP_FFMPEG)
     if not cap.isOpened():
         raise OSError(f"Could not open video: {video_path}")

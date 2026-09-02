@@ -86,7 +86,7 @@ def board_at_pts(gap_video, monkeypatch):
     pts_by_index = frame_pts(gap_video)
     seen = []
 
-    def fake_process_frame(frame, camera_type, frame_number, board, debug_dir=None):
+    def fake_process_frame(frame, camera_type, frame_number, board, debug_dir=None, try_hard=False):
         pts = pts_by_index[frame_number]
         seen.append((frame_number, pts))
         start = pts + OFFSET

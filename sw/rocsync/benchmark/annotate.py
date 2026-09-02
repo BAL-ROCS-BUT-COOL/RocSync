@@ -729,6 +729,7 @@ class AnnotationTool:
                     board=board_hint,
                     stats=self.stats,
                     min_aruco_area_fraction=0.0,
+                    try_hard=True,
                 )
             except Exception as e:  # noqa: BLE001 — a bad frame must not kill the session
                 print(f"Pipeline error on {frame_key}: {e}", file=sys.stderr)
@@ -821,7 +822,9 @@ class AnnotationTool:
                 self._save_ground_truth()
                 # Show next unannotated frame, or next frame if no unannoted exists
                 nxt = self._find_unannotated(self.current_idx, forward=True)
-                self.current_idx = nxt if nxt != self.current_idx else (self.current_idx + 1) % n_frames
+                self.current_idx = (
+                    nxt if nxt != self.current_idx else (self.current_idx + 1) % n_frames
+                )
             elif action == "skip":
                 self.current_idx = (self.current_idx + 1) % n_frames
             elif action == "back":

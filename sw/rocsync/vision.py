@@ -220,7 +220,6 @@ def find_corners_convexhull(mask, frame_number, debug_dir=None):
         return corners
 
 
-
 def find_corners_dots(mask, frame_number, board, debug_dir=None):
     """Match always-on LEDs to their expected spots.
 
@@ -260,7 +259,8 @@ def find_corners_dots(mask, frame_number, board, debug_dir=None):
 
     return np.array(
         [
-            assigned[i][0] if i in assigned and assigned[i][1] <= board.rough_corner_tol
+            assigned[i][0]
+            if i in assigned and assigned[i][1] <= board.rough_corner_tol
             else (np.nan, np.nan)
             for i in range(len(corner_dots))
         ],
@@ -293,6 +293,7 @@ def rectify_board(
     board_size=DEFAULT_BOARD_SIZE,
     stats=None,
     min_aruco_area_fraction=MIN_ARUCO_AREA_FRACTION,
+    try_hard=False,
 ):
     """Locate the board in a frame and warp it onto a square pixel grid.
 
@@ -301,9 +302,11 @@ def rectify_board(
     RectifiedBoard the reading should be decoded against.
 
     `min_aruco_area_fraction` rejects frames where the board was held too far away; pass 0
-    to read whatever the marker detector found, however small.
+    to read whatever the marker detector found, however small. `try_hard` forces it to 0.
     """
     _init_stats(stats)
+    if try_hard:
+        min_aruco_area_fraction = 0.0
     match camera_type:
         case CameraType.RGB:
             # Detect ArUco markers
@@ -386,13 +389,27 @@ def rectify_board(
                 stats["corner_positions"] = image_corners.tolist()
 
             # The first four always-on LEDs are the perspective-transform anchors; without
-            # all four there's nothing to fit the fine homography from. Any extra always-on
-            # dots beyond those four were matched purely as a sanity check.
-            if not found[:4].all():
+            # all four there's nothing to fit the fine homography from, unless try_hard falls
+            # back to whichever LEDs (plus the ArUco corners) were found.
+            if found[:4].all():
+                transformation_matrix = cv2.getPerspectiveTransform(
+                    image_corners[:4], board.transform_corners(CameraType.RGB)
+                )
+            elif not try_hard:
                 return True, None, board
-            transformation_matrix = cv2.getPerspectiveTransform(
-                image_corners[:4], board.transform_corners(CameraType.RGB)
-            )
+            elif not found.any():
+                # No always-on LED matched; fall back to the coarse ArUco homography
+                transformation_matrix = rough_transformation_matrix
+            else:
+                # Pool every matched LED with the ArUco corners
+                corner_dots = board.always_on_leds[CameraType.RGB]
+                src = np.vstack([aruco_corners.reshape(-1, 2), image_corners[found]]).astype(
+                    np.float64
+                )
+                dst = np.vstack([board.aruco_corners_coords, corner_dots[found]]).astype(np.float64)
+                transformation_matrix, _ = cv2.findHomography(src, dst)
+                if transformation_matrix is None:
+                    return True, None, board
             t0 = time.perf_counter()
             pcb = cv2.warpPerspective(mask, transformation_matrix, (board_size, board_size))
             _record_step(stats, "fine_rectification", t0)
@@ -454,6 +471,7 @@ def process_frame(
     board_size=DEFAULT_BOARD_SIZE,
     stats=None,
     min_aruco_area_fraction=MIN_ARUCO_AREA_FRACTION,
+    try_hard=False,
 ):
     """Board time (start_ms, end_ms) read off one frame, and whether a board was seen."""
     t_start = time.perf_counter()
@@ -467,6 +485,7 @@ def process_frame(
         board_size,
         stats,
         min_aruco_area_fraction,
+        try_hard,
     )
     if pcb is None or board is None:
         _finalize_stats(stats, t_start, detected, None)

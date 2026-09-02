@@ -117,7 +117,7 @@ def extract_pipeline_timing(stats):
     return timing
 
 
-def run_provenance(data_dir, n_images):
+def run_provenance(data_dir, n_images, try_hard):
     """Identify the checkout that produced a result file, so columns are self-describing."""
 
     def git(*args):
@@ -135,6 +135,7 @@ def run_provenance(data_dir, n_images):
     return {
         "data_dir": str(data_dir),
         "n_images": n_images,
+        "try_hard": try_hard,
         "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
         "commit": git("rev-parse", "--short", "HEAD"),
         "dirty": bool(git("status", "--porcelain")),
@@ -144,7 +145,7 @@ def run_provenance(data_dir, n_images):
     }
 
 
-def run_benchmark(frames, ground_truth=None, debug_dir=None):
+def run_benchmark(frames, ground_truth=None, debug_dir=None, try_hard=False):
     """Run pipeline on all frames, returning results dict keyed by frame key.
 
     `ground_truth`, when given, decides each frame's camera mode and board: IR has no
@@ -177,6 +178,7 @@ def run_benchmark(frames, ground_truth=None, debug_dir=None):
                 i,
                 board=profile,
                 debug_dir=debug_dir,
+                try_hard=try_hard,
                 stats=stats,
             )
 
@@ -327,6 +329,12 @@ def main():
         "(default: <data_dir>/ground_truth.json)",
     )
     parser.add_argument("--debug", default=None, help="Directory for debug images")
+    parser.add_argument(
+        "--try-hard",
+        action="store_true",
+        help="relaxed mode: refine the homography from partial corner LED detections "
+        "and accept the board at any distance",
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -353,7 +361,9 @@ def main():
         f"Found {len(frames)} frames: {n_stills} images and "
         f"{len(frames) - n_stills} frames from {n_videos} videos"
     )
-    results = run_benchmark(frames, ground_truth=ground_truth, debug_dir=args.debug)
+    results = run_benchmark(
+        frames, ground_truth=ground_truth, debug_dir=args.debug, try_hard=args.try_hard
+    )
 
     n_success = sum(1 for r in results.values() if r["success"])
     print(f"Detection rate: {n_success}/{len(results)} ({n_success / len(results):.1%})")
@@ -372,7 +382,7 @@ def main():
         )
 
     output = {
-        "config": run_provenance(data_dir, len(results)),
+        "config": run_provenance(data_dir, len(results), args.try_hard),
         "videos": videos,
         "images": results,
     }

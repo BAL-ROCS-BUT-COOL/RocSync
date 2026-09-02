@@ -194,10 +194,3 @@ not installed. Install `ffmpeg` to run the full suite.
 
 To add or change a dependency, edit `pyproject.toml` and run `uv sync`, then commit the updated
 `uv.lock` alongside it.
-
-## Ideas for future improvements
-- [ ] Write debug images in separate thread to not slow down the main processing
-- [ ] Implement additional filters for the IR pipeline (e.g., uniform corner distance)
-- [ ] Implement movement filter to reject frames with motion blur
-- [ ] Use partial ring LED intensity to determine sub-millisecond timestamps (e.g., compute distance to min and max detected intensity)
-- [ ] Use gray code and partial LED detection to decode the counter even when it changed during the exposure

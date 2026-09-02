@@ -772,18 +772,21 @@ def highlight(text):
     return f"{GREEN}{text}{RESET}" if _use_color else text
 
 
-def _best_index(values, better):
-    """The one method that beats every other on this row, or None if none stands alone.
+def _best_indices(values, better):
+    """Every method tied for the winning value on this row, or empty if none stands out.
 
-    A tie leaves the row unmarked rather than painting every column: the mark says
-    "pick this one", which a tie cannot. So does a row where only one method has a
-    value — there is nothing it won against.
+    All of them get marked on a tie, since the mark says "this is the best result", not
+    "pick this one arbitrarily". But if every method agrees, that agreement is not a win
+    for any of them, so a row where only one distinct value appears is left unmarked.
     """
     rank = abs if better == LOWER else (lambda v: -v)
-    candidates = sorted((rank(v), i) for i, v in enumerate(values) if v is not None)
-    if better is None or len(candidates) < 2 or candidates[0][0] == candidates[1][0]:
-        return None
-    return candidates[0][1]
+    candidates = [(rank(v), i) for i, v in enumerate(values) if v is not None]
+    if better is None or len(candidates) < 2:
+        return set()
+    best_rank = min(r for r, _ in candidates)
+    if all(r == best_rank for r, _ in candidates):
+        return set()
+    return {i for r, i in candidates if r == best_rank}
 
 
 def format_value(val, width=10):
@@ -809,12 +812,12 @@ def print_row(
     better=None,
     texts=None,
 ):
-    """Print one labelled row of per-method values, the leading method in green."""
-    best = _best_index(values, better)
+    """Print one labelled row of per-method values, every leading method in green."""
+    best = _best_indices(values, better)
     print(f"  {label:>{label_width}}", end="")
     for i, value in enumerate(values):
         text = texts[i].rjust(col_width) if texts else formatter(value, col_width)
-        print(f"  {highlight(text) if i == best else text}", end="")
+        print(f"  {highlight(text) if i in best else text}", end="")
     print()
 
 
@@ -910,11 +913,13 @@ def _print_rectification_block(
     def get(m):
         return all_metrics[m]["rectification"][fit]
 
-    print_header(methods, col_width, label_width, f"{label} — detection")
+    print_header(
+        methods, col_width, label_width, f"{label} — detection (≤{LED_DISC_THRESHOLD_PX} board px)"
+    )
     _print_detection(methods, lambda m: get(m)["detection"], col_width, label_width)
 
     print()
-    print_header(methods, col_width, label_width, f"{label} — LED error")
+    print_header(methods, col_width, label_width, f"{label} — LED error (board px)")
     _print_value_accuracy(
         methods,
         lambda m: get(m)["leds_compared"],
@@ -928,7 +933,6 @@ def _print_rectification_block(
         lambda m: get(m)["error_px"],
         col_width,
         label_width,
-        label_fmt="{stat} (board px)",
     )
 
 
@@ -1012,7 +1016,7 @@ def print_report(methods, all_metrics, col_width, label_width=LABEL_WIDTH_DEFAUL
     print("  ARUCO DETECTION")
     print(f"{'=' * 100}")
 
-    print_header(methods, col_width, label_width, "Detection")
+    print_header(methods, col_width, label_width, "Detection (visibility)")
     _print_detection(
         methods, lambda m: all_metrics[m]["aruco"]["detection"], col_width, label_width
     )
@@ -1035,7 +1039,7 @@ def print_report(methods, all_metrics, col_width, label_width=LABEL_WIDTH_DEFAUL
         methods,
         col_width,
         label_width,
-        f"Detection (thres: {CORNER_IMAGE_SPACE_THRESHOLD_PX}px in image space)",
+        f"Detection (≤{CORNER_IMAGE_SPACE_THRESHOLD_PX} img px)",
     )
     _print_detection(
         methods, lambda m: all_metrics[m]["corners"]["detection_image"], col_width, label_width
@@ -1046,14 +1050,14 @@ def print_report(methods, all_metrics, col_width, label_width=LABEL_WIDTH_DEFAUL
         methods,
         col_width,
         label_width,
-        f"Detection (thres: {LED_DISC_THRESHOLD_PX}px in board space)",
+        f"Detection (≤{LED_DISC_THRESHOLD_PX} board px)",
     )
     _print_detection(
         methods, lambda m: all_metrics[m]["corners"]["detection_board"], col_width, label_width
     )
 
     print()
-    print_header(methods, col_width, label_width, "Pixel error — image space")
+    print_header(methods, col_width, label_width, "Pixel error — img space")
     _print_error_stats(
         methods,
         lambda m: all_metrics[m]["corners"]["error_image_px"],
@@ -1072,21 +1076,21 @@ def print_report(methods, all_metrics, col_width, label_width=LABEL_WIDTH_DEFAUL
 
     # ── Rectification (final homography) ─────────────────────────────────
     print(f"{'=' * 100}")
-    print("  RECTIFICATION (image → board homography)")
+    print("  RECTIFICATION")
     print(f"{'=' * 100}")
 
-    _print_rectification_block(methods, all_metrics, "fine", "Final fit", col_width, label_width)
-    print()
     _print_rectification_block(
-        methods, all_metrics, "rough", "Coarse (ArUco-only) fit", col_width, label_width
+        methods, all_metrics, "rough", "Coarse fit", col_width, label_width
     )
+    print()
+    _print_rectification_block(methods, all_metrics, "fine", "Final fit", col_width, label_width)
 
     # ── Counter reading ──────────────────────────────────────────────────
     print(f"{'=' * 100}")
     print("  COUNTER READING")
     print(f"{'=' * 100}")
 
-    print_header(methods, col_width, label_width, "Detection")
+    print_header(methods, col_width, label_width, "Detection (visibility)")
     _print_detection(
         methods, lambda m: all_metrics[m]["counter"]["detection"], col_width, label_width
     )
@@ -1107,7 +1111,7 @@ def print_report(methods, all_metrics, col_width, label_width=LABEL_WIDTH_DEFAUL
     print("  RING READING")
     print(f"{'=' * 100}")
 
-    print_header(methods, col_width, label_width, "Detection")
+    print_header(methods, col_width, label_width, "Detection (visibility)")
     _print_detection(methods, lambda m: all_metrics[m]["ring"]["detection"], col_width, label_width)
 
     print()
@@ -1128,7 +1132,7 @@ def print_report(methods, all_metrics, col_width, label_width=LABEL_WIDTH_DEFAUL
     print("  OVERALL (timestamp)")
     print(f"{'=' * 100}")
 
-    print_header(methods, col_width, label_width, "Detection")
+    print_header(methods, col_width, label_width, "Detection (visibility)")
     _print_detection(
         methods, lambda m: all_metrics[m]["overall"]["detection"], col_width, label_width
     )
@@ -1193,7 +1197,7 @@ def print_timing(methods, timing, col_width, label_width=LABEL_WIDTH_DEFAULT):
 
         for i, step in enumerate([*STEP_ORDER, "total"]):
             if i > 0:
-                print(f"  {step.upper():-^{label_width}}")
+                print(f"    {step.upper():-^{label_width - 2}}")
             for stat in stat_keys:
                 print_row(
                     "  " + stat,

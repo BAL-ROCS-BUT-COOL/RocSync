@@ -10,7 +10,12 @@ import numpy as np
 
 from rocsync.board_profiles import PROFILES_BY_ARUCO
 from rocsync.dataset import VIDEO_SUFFIXES
-from rocsync.timeline import frame_pts, median_frame_period, probe_packet_field, run_ffprobe
+from rocsync.timeline import (
+    frame_pts,
+    measured_residual_threshold_ms,
+    run_ffprobe,
+    source_frame_period_ms,
+)
 
 STEP_ORDER = [
     "aruco_detection",
@@ -31,13 +36,11 @@ SEEK_BACKOFF_FRAMES = 32  # retry margin for a seek that landed past the frame w
 MIN_REFERENCE_FRAMES = 5  # a two-point fit is exact by construction and proves nothing
 
 # A synthesized timeline is built from the annotations themselves, so the only slack it
-# needs covers reading the ring arc one LED out at either end. A measured one has to
-# absorb the camera: the container stores a nominal frame rate while the sensor exposes
-# when it pleases, which on the dataset's 30 fps clips scatters by up to 9 ms.
+# needs covers reading the ring arc one LED out at either end. A measured one uses
+# `measured_residual_threshold_ms` from `rocsync.timeline` instead, which absorbs the
+# camera: the container stores a nominal frame rate while the sensor exposes when it
+# pleases, which on the dataset's 30 fps clips scatters by up to 9 ms.
 SYNTHESIZED_RESIDUAL_THRESHOLD_MS = 2.0
-MEASURED_RESIDUAL_FRACTION = 1 / 2  # of a source frame
-MEASURED_RESIDUAL_MIN_MS = 2.0  # never tighter than the board itself resolves
-MEASURED_RESIDUAL_MAX_MS = 50.0  # below the ring period, so a counter step still shows
 
 RETIMED_MARKER = ".retimed"  # `clip.retimed.mp4` is `clip.mp4` on a synthesized timeline
 
@@ -113,34 +116,6 @@ def _probe_packet_count(path):
     )
     counted = (output or "").strip().rstrip(",")
     return int(counted) if counted.isdigit() else None
-
-
-def source_frame_period_ms(video_path):
-    """Frame period of the recording this file was cut from, in ms, or None.
-
-    Read from the packet duration, which survives decimation: a clip holding every 16th
-    frame of a 30 fps recording still says 33.3 ms per packet while its timestamps sit
-    533 ms apart. The timestamp spacing would describe the subsampling instead, and a
-    tolerance scaled from that would be far too loose to catch anything.
-    """
-    durations = [d for d in probe_packet_field(video_path, "duration_time") if d > 0]
-    if durations:
-        # The mode, so one odd packet at a cut cannot stand for the whole recording
-        return float(max(set(durations), key=durations.count)) * 1000
-
-    # Without a packet duration the spacing is all there is, subsampled or not
-    try:
-        return median_frame_period(frame_pts(video_path))
-    except OSError:
-        return None  # a file that will not open has no period to report
-
-
-def measured_residual_threshold_ms(source_period_ms):
-    """How far an annotated frame may sit from a clock fitted to a recorded timeline."""
-    if not source_period_ms:
-        return MEASURED_RESIDUAL_MAX_MS
-    scaled = source_period_ms * MEASURED_RESIDUAL_FRACTION
-    return min(max(scaled, MEASURED_RESIDUAL_MIN_MS), MEASURED_RESIDUAL_MAX_MS)
 
 
 def residual_threshold_ms(video_entry):
@@ -415,21 +390,55 @@ class FrameSource:
         self.close()
 
 
-def corner_positions_in_image(stats):
-    """Detected corner LED positions in original image coordinates.
+def corner_positions_in_image(stats, n_leds=4):
+    """Detected corner LED positions in original image coordinates, one slot per LED.
 
     The pipeline detects corners in the rough-rectified grid, whose scale is a
     property of the branch under test. Un-warping through that grid's own
     homography yields the annotated quantity, comparable across branches.
+
+    The pipeline reports one row per always-on LED, NaN where it found none; this is
+    where that becomes the None the annotation format uses, so position i always names
+    LED i. `n_leds` only sizes the all-None result for a frame that reported nothing.
     """
     positions = stats.get("corner_positions")
     rough_H = stats.get("rough_homography")
     if positions is None or rough_H is None:
-        return [None] * 4
+        return [None] * n_leds
 
-    inv_rough = np.linalg.inv(np.array(rough_H, dtype=np.float64))
-    pts = np.array([positions], dtype=np.float64)
-    return cv2.perspectiveTransform(pts, inv_rough).reshape(-1, 2).tolist()
+    positions = np.array(positions, dtype=np.float64).reshape(-1, 2)
+    found = np.isfinite(positions).all(axis=1)
+    slots = [None] * len(positions)
+    if found.any():
+        inv_rough = np.linalg.inv(np.array(rough_H, dtype=np.float64))
+        pts = positions[found].reshape(1, -1, 2)
+        mapped = cv2.perspectiveTransform(pts, inv_rough).reshape(-1, 2).tolist()
+        for i, point in zip(np.flatnonzero(found), mapped, strict=True):
+            slots[i] = point
+    return slots
+
+
+def rectification_errors(pred_H, gt_H, points):
+    """Board-space distance between where each modelled point lands under the two fits.
+
+    Sends every `points` (board px) back to image space through the predicted
+    homography and forward again through the ground-truth one; the round trip
+    is the identity only where the two fits agree, so the residual isolates the
+    rectification's own accuracy from whatever fed it. None when either matrix
+    is missing or the predicted one cannot be inverted.
+    """
+    if pred_H is None or gt_H is None:
+        return None
+    pred_H = np.array(pred_H, dtype=np.float64)
+    gt_H = np.array(gt_H, dtype=np.float64)
+    try:
+        inv_pred = np.linalg.inv(pred_H)
+    except np.linalg.LinAlgError:
+        return None
+    pts = np.array([points], dtype=np.float64)
+    image_pts = cv2.perspectiveTransform(pts, inv_pred)
+    board_pts = cv2.perspectiveTransform(image_pts, gt_H).reshape(-1, 2)
+    return np.linalg.norm(board_pts - np.asarray(points, dtype=np.float64), axis=1)
 
 
 def ring_visible(image_data):

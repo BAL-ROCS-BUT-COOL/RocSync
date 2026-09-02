@@ -30,15 +30,21 @@ from rocsync.benchmark.common import (
 )
 from rocsync.board_profiles import PROFILES_BY_ARUCO
 from rocsync.camera import CameraType
-from rocsync.timeline import frame_pts, summarize_timeline
+from rocsync.timeline import frame_pts, source_frame_period_ms, summarize_timeline
 from rocsync.vision import process_frame
+
+
+def _matrix(H):
+    """A homography as a JSON-safe nested list, or None."""
+    return np.asarray(H, dtype=np.float64).tolist() if H is not None else None
 
 
 def extract_pipeline_result(stats):
     """Extract a ground-truth-compatible result dict from pipeline stats.
 
-    Returns a dict with keys: aruco, corners, counter, ring, timestamp.
-    Structure mirrors ground_truth.json to simplify comparison.
+    Returns a dict with keys: aruco, corners, counter, ring, timestamp,
+    homography, rough_homography. Structure mirrors ground_truth.json to
+    simplify comparison.
     """
     steps = stats.get("steps", {})
 
@@ -54,8 +60,10 @@ def extract_pipeline_result(stats):
     board = PROFILES_BY_ARUCO[aruco_id] if aruco_id is not None else None
 
     # -- Corners (original image coordinates, as annotated) --
+    n_leds = len(board.always_on_leds[CameraType.RGB]) if board is not None else 4
     corners = [
-        {"visible": pos is not None, "position": pos} for pos in corner_positions_in_image(stats)
+        {"visible": pos is not None, "position": pos}
+        for pos in corner_positions_in_image(stats, n_leds)
     ]
 
     # -- Counter --
@@ -87,6 +95,8 @@ def extract_pipeline_result(stats):
         "counter": counter,
         "ring": ring,
         "timestamp": timestamp,
+        "homography": _matrix(stats.get("homography")),
+        "rough_homography": _matrix(stats.get("rough_homography")),
     }
 
 
@@ -194,7 +204,11 @@ def fit_videos(frames, results):
 
         try:
             statistics, _, considered, rejected, _ = summarize_timeline(
-                timestamps, frame_times, len(frame_times), fps
+                timestamps,
+                frame_times,
+                len(frame_times),
+                fps,
+                frame_period_ms=source_frame_period_ms(path),
             )
         except ValueError as e:
             videos[rel_path] = {

@@ -29,17 +29,15 @@ from rocsync.benchmark.common import (
     corner_positions_in_image,
     fit_reference_clock,
     frame_key,
-    measured_residual_threshold_ms,
     orphaned_entries,
     parse_frame_key,
     reconstruct_timestamp,
     reference_outliers,
     reference_residual,
-    source_frame_period_ms,
 )
 from rocsync.board_profiles import BOARD_V1, PROFILES_BY_ARUCO, RectifiedBoard
 from rocsync.camera import CameraType
-from rocsync.timeline import frame_pts
+from rocsync.timeline import frame_pts, measured_residual_threshold_ms, source_frame_period_ms
 from rocsync.vision import ARUCO_DICTIONARY, process_frame, read_counter, read_ring
 
 # Every board rectifies to the same pixel grid, so one radius serves the whole GUI.

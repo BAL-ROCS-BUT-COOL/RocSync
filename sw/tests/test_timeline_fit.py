@@ -123,7 +123,7 @@ def test_fit_needs_two_usable_frames():
         fit_timeline({0: 0.0}, {0: (1.0, 2.0)})
     # A timestamped frame whose presentation timestamp is unknown is unusable
     with pytest.raises(ValueError):
-        fit_timeline({0: 0.0}, {0: (1.0, 2.0), 5: (3.0, 4.0)}, fallback_period=33.0)
+        fit_timeline({0: 0.0}, {0: (1.0, 2.0), 5: (3.0, 4.0)}, frame_period_ms=33.0)
 
 
 def test_fit_ignores_timestamps_without_a_presentation_time():

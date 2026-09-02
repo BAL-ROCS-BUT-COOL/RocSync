@@ -190,10 +190,10 @@ Fields:
   approaching the 100 ms ring period would stop flagging a whole counter step. The stored number is what the reference was checked
   against and what scoring reports, so a frozen reference stays valid under the rule it was
   frozen by.
-- `videos[path].source_frame_period_ms`: Frame period of the recording, read from the packet
-  duration rather than the timestamp spacing. A clip holding every 16th frame of a 30 fps
-  recording still says 33.3 ms per packet while its timestamps sit 533 ms apart, and it is the
-  camera's own rate that the tolerance has to scale from.
+- `videos[path].source_frame_period_ms`: Frame period of the recording, read from the
+  `source_frame_rate` tag [`prepare_clip.sh`](#adding-videos-to-the-benchmark) writes. A clip
+  holding every 16th frame of a 30 fps recording has timestamps 533 ms apart and a frame rate of
+  its own of 1.9 fps, and it is the camera's 33.3 ms that the tolerance has to scale from.
 - `videos[path].source` / `source_frame_offset` / `anchors_digest` / `n_frames`: Present on a
   retimed clip only. Frame *j* of the clip is frame *j + source_frame_offset* of `source`, which
   is where its annotations live. The digest covers the annotations it was built from and
@@ -298,7 +298,7 @@ uv run rocsync-validate [data_dir] [-o results.json] [--debug DIR]
 - `-o`: Output JSON file (default: `benchmark_results.json`).
 - `--debug`: Directory for debug images.
 
-Results JSON contains a `config` section and an `images` section with per-frame aruco, corners, counter, ring, timestamp, success flag, and timing breakdown. Keys match the ground truth's, so `n_images` in `config` counts benchmark frames rather than files. Corner positions are in original image coordinates, matching the ground truth: the pipeline detects them in the rough-rectified grid, whose scale is a property of the checkout being measured, so they are un-warped through that grid's own homography before being stored.
+Results JSON contains a `config` section and an `images` section with per-frame aruco, corners, counter, ring, timestamp, success flag, homography, rough_homography, and timing breakdown. Keys match the ground truth's, so `n_images` in `config` counts benchmark frames rather than files. Corner positions are in original image coordinates, matching the ground truth: the pipeline detects them in the rough-rectified grid, whose scale is a property of the checkout being measured, so they are un-warped through that grid's own homography before being stored. `homography` and `rough_homography` are the pipeline's own image → rectified-board matrices — the fine one fitted from the corner LEDs, the coarse one from the ArUco marker alone — saved as-is so `rocsync-evaluate` can score the rectification itself rather than only the LEDs it was fitted from.
 
 Every video additionally gets its clock fitted, by the same code a `rocsync` run uses, and a
 `videos` section records the resulting `VideoStatistics` — clock rate and offset, R²/RMSE
@@ -331,7 +331,10 @@ uv run rocsync-evaluate [paths...] [-g ground_truth.json] [-t] [--allow-partial]
 
 Metrics are computed per pipeline step:
 - **ArUco**: detection rates + corner pixel error in image space
-- **Corners**: detection rates in image space and board space + pixel errors in both spaces
+- **Corners**: per-corner detection rates in image space and board space + pixel errors in both spaces
+- **Rectification**: the final and the coarse (ArUco-only) homography, each scored at every
+  modelled LED position (always-on, ring, and counter) in board px against the LED sampling
+  radius — see below
 - **Counter**: detection rates + value accuracy
 - **Ring**: detection rates + start/end value accuracy, wrapping arcs included
 - **Overall**: timestamp detection + exact match accuracy + start/end/exposure error statistics,
@@ -347,14 +350,27 @@ Metrics are computed per pipeline step:
 Corner positions are compared against the annotated coordinates. Board space is derived by mapping
 both sides through the annotated homography, which normalises the threshold to LED sample radii —
 a fixed pixel threshold in image space means different things depending on how large the board
-appears in the frame.
+appears in the frame. Each frame is scored against its own board's sample radius, so a mix of
+board profiles is never scored against the wrong one's threshold.
 
-Reading position errors: the annotator pre-fills each image from a pipeline run, so on every frame
-accepted without correction the annotation *is* that pipeline's output. Position error therefore
-reads as zero for whichever checkout produced the annotations, and a non-zero error for another
-checkout measures divergence from it rather than distance from truth. Detection rates do not suffer
-this — the ground truth's positives include everything annotated by hand on frames where the
-pipeline failed.
+Rectification scores the homography itself rather than the corners it was fitted from: every LED
+the board model knows about (`board.layout_coords`) is mapped through the predicted homography and
+back through the annotated one, and the round trip's residual is the rectification's own error in
+board px, at every LED position including the ring and counter — regions the four fitted anchors
+only extrapolate into. The reported error statistics pool every LED's residual over every scored
+frame, the same board-px population the corner detection section reports, so the two are directly
+comparable. A frame is a detection when its worst LED still lands inside the sample radius. The
+coarse ArUco-only row is not a competing method; it is the floor the fit degrades to when corner
+refinement fails, so the gap between the two rows is what refinement is worth.
+
+Reading position and rectification errors: the annotator pre-fills each image from a pipeline run,
+so on every frame accepted without correction the annotation *is* that pipeline's output — its
+`homography` field is copied straight from the pipeline's own `stats["homography"]`, and only a
+corner edit ever refits it. Position and rectification error therefore read as zero for whichever
+checkout produced the annotations, and a non-zero error for another checkout measures divergence
+from it rather than distance from truth; only hand-corrected frames carry independent signal.
+Detection rates do not suffer this — the ground truth's positives include everything annotated by
+hand on frames where the pipeline failed.
 
 A ring arc that wraps the end of the period was exposed across a counter increment, so the
 counter no longer says which period the arc belongs to and no timestamp follows from it. The
@@ -437,14 +453,22 @@ metadata itself, so a backend that did not would put every position in a transpo
 
 ## Adding videos to the benchmark
 
-I recommend to subsample videos to 1-2 fps to obtain 
+Every frame of a video is a benchmark frame and every one of them is annotated by hand, so a
+recording is cut down before it joins the dataset:
 
-The following command subsamples videos to approximately 0.9 fps, while preserving exact frame timestamps:
+```bash
+rocsync/benchmark/prepare_clip.sh input_video.mp4 0.9 <data_dir>/<subset>/clip.mp4
+```
 
-`ffmpeg -i input_video.mp4 -vf "select='isnan(prev_selected_t)+gte(t-prev_selected_t,1/0.9)'" -fps_mode passthrough -c:v libx264 -crf 18 -preset slow -an rocsync_benchmark/<subset>/output_video.mp4`
+0.9–1.9 fps keeps annotation affordable. Avoid rates that divide 100 ms evenly, or every frame
+catches the ring arc at the same phase.
 
-When selecting the output framerate, avoid multiples of 100ms to collect frames with different ring arcs.
-I recommend 0.9 - 1.9 fps to minimize annotation cost.
+The script keeps the frames' original timestamps — a clock is fitted to them, and left to itself
+the encoder rounds each one onto the grid of whichever frame rate it guesses, which on a 30 fps
+recording moves a frame by up to half a frame. It also writes the recording's frame rate to a
+`source_frame_rate` metadata tag, because a clip holding every 16th frame no longer says that
+anywhere in its own timing, and it is the camera's rate the residual tolerance scales from. It
+refuses to write a clip whose tag did not survive the muxer.
 
 ## Removing inputs from the benchmark
 

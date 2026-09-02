@@ -34,12 +34,12 @@ from rocsync.benchmark.annotate import (
 from rocsync.benchmark.common import (
     MIN_REFERENCE_FRAMES,
     ReferenceClock,
+    annotation_camera,
     collect_frames,
     reference_outliers,
     residual_threshold_ms,
 )
 from rocsync.board_profiles import PROFILES_BY_ARUCO
-from rocsync.camera import CameraType
 from rocsync.timeline import frame_pts
 
 GROUND_TRUTH = Path(
@@ -76,7 +76,7 @@ def _nominal_in_image(gt):
         return None
     board = PROFILES_BY_ARUCO[aruco_id].rectify()
     inv_H = np.linalg.inv(np.array(H, dtype=np.float64))
-    pts = np.array([board.always_on_leds[CameraType.RGB]], dtype=np.float64)
+    pts = np.array([board.always_on_leds[annotation_camera(gt)]], dtype=np.float64)
     return cv2.perspectiveTransform(pts, inv_H).reshape(-1, 2)
 
 
@@ -89,7 +89,8 @@ def _determines_its_homography(gt):
         {"visible": bool(c.get("visible")), "position": c.get("position")}
         for c in gt.get("corners", [])
     ]
-    return fit_corner_homography(corners, PROFILES_BY_ARUCO[aruco_id].rectify()) is not None
+    board = PROFILES_BY_ARUCO[aruco_id].rectify()
+    return fit_corner_homography(corners, board, annotation_camera(gt)) is not None
 
 
 def test_annotated_corners_match_the_warped_layout(annotations):

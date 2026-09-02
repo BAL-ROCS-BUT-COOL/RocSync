@@ -80,7 +80,8 @@ rather than the saved one, so a correction shows in the number before it is acce
 | Q | Quit |
 | H | Toggle help overlay |
 | 0-9 | Select which corner the next left-panel click places |
-| Esc | Cancel ring LED selection |
+| M | Toggle camera mode (RGB / IR) — switches the LED layout to match |
+| Esc | Cancel ring LED selection, or undo a pending board/marker/camera mode change |
 
 ### Mouse Interactions (left panel)
 
@@ -99,9 +100,22 @@ alone from then on; so does opening a frame that was already annotated.
 
 **Counter LEDs** — Click on a counter LED circle to toggle ON/OFF. Click the counter bounding box (outside individual LEDs) to toggle counter visibility.
 
-**ArUco area** — Click the ArUco region to cycle through marker IDs (0 → 21 → none).
+**ArUco area** — Click the ArUco region to cycle the board revision through four states: ID 0 marker visible, ID 0 hidden, ID 21 visible, ID 21 hidden. A board stays selectable with the marker hidden because the marker is never visible in IR at all.
 
 **Ring LEDs** — Two-click protocol: click a ring LED to set the first ON LED (arc start), then click another to set the first OFF LED (arc end). Clicking the same LED for both sets the ring as undecodable. Press `Esc` to cancel after the first click.
+
+### Camera Mode
+
+Press `M` to toggle between RGB and IR. The two camera types light different physical LEDs at
+different positions, so switching mode swaps the corner, ring, and counter overlay positions to
+match — it does not just relabel the same points. Corner LEDs placed for RGB are not reused for
+IR and vice versa; each mode's board profile keeps its own annotation for the current frame, exactly
+like the ArUco cycle: switching away and back with `M` restores what was annotated in the mode you
+return to, and `Esc` reverts every board, marker, and camera mode change made on the current frame
+back to how it was before you started cycling.
+
+The active camera mode and board revision are shown above the board panel, next to the ArUco
+marker's state.
 
 ### Ground Truth Format
 
@@ -116,6 +130,7 @@ the file rather than a presentation timestamp, which would shift with the decode
 {
   "images": {
     "subdir/image.png": {
+      "camera": "rgb",
       "aruco": {"visible": true, "id": 0},
       "corners": [
         {"visible": true, "position": [123.4, 567.8]},
@@ -129,6 +144,11 @@ the file rather than a presentation timestamp, which would shift with the decode
     },
     "subdir/clip.mp4#000042": {
       "...": "same fields; frame 42 of subdir/clip.mp4"
+    },
+    "subdir/ir_clip.mp4#000012": {
+      "camera": "ir",
+      "aruco": {"visible": false, "id": 21},
+      "...": "same fields, against the IR LED layout of board revision 21 (v2)"
     }
   }
 }
@@ -168,7 +188,13 @@ presentation time to board time that the video's annotations agree on:
 ```
 
 Fields:
-- `aruco.visible` / `aruco.id`: Whether the ArUco marker is visible and its detected ID (omitted when not visible).
+- `camera`: `"rgb"` or `"ir"`. Which camera type the frame was annotated for — the two light
+  physically different LEDs at different board positions, so this decides which layout every
+  other field in the entry is read against.
+- `aruco.id`: The board revision (0 = v1, 21 = v2), always present — it identifies the board
+  layout even on a frame where the marker itself was never seen, which in IR is every frame.
+- `aruco.visible`: Whether the ArUco marker was actually visible in the image. Always false in
+  IR.
 - `corners[i].visible` / `corners[i].position`: Per-corner-LED visibility and position in original image coordinates (position omitted when not visible). Benchmark results use the same space, so the two are directly comparable.
 - `homography`: 3×3 matrix mapping original image → rectified board coordinates.
 - `counter.visible` / `counter.value`: Whether the binary counter is readable and its decoded value (omitted when not visible).
@@ -291,14 +317,18 @@ overrides that.
 Runs the pipeline on every frame in a directory and saves per-frame results in a structure mirroring the ground truth format, plus per-step timing.
 
 ```bash
-uv run rocsync-validate [data_dir] [-o results.json] [--debug DIR]
+uv run rocsync-validate [data_dir] [-o results.json] [-g ground_truth.json] [--debug DIR]
 ```
 
 - `data_dir`: Directory containing validation images and videos (default: `validation_data/`).
 - `-o`: Output JSON file (default: `benchmark_results.json`).
+- `-g`: Ground truth JSON, read for each frame's camera mode and board revision (default:
+  `<data_dir>/ground_truth.json`). IR has no marker to auto-resolve a board from, so a frame runs
+  in IR only if its annotation says so; a frame with no annotation, or no ground truth file at
+  all, runs as RGB with the board left for the pipeline to detect from the marker, same as ever.
 - `--debug`: Directory for debug images.
 
-Results JSON contains a `config` section and an `images` section with per-frame aruco, corners, counter, ring, timestamp, success flag, homography, rough_homography, and timing breakdown. Keys match the ground truth's, so `n_images` in `config` counts benchmark frames rather than files. Corner positions are in original image coordinates, matching the ground truth: the pipeline detects them in the rough-rectified grid, whose scale is a property of the checkout being measured, so they are un-warped through that grid's own homography before being stored. `homography` and `rough_homography` are the pipeline's own image → rectified-board matrices — the fine one fitted from the corner LEDs, the coarse one from the ArUco marker alone — saved as-is so `rocsync-evaluate` can score the rectification itself rather than only the LEDs it was fitted from.
+Results JSON contains a `config` section and an `images` section with per-frame aruco, corners, counter, ring, timestamp, success flag, homography, rough_homography, and timing breakdown. Keys match the ground truth's, so `n_images` in `config` counts benchmark frames rather than files. Corner positions and `homography` are in original image coordinates and image → rectified-board respectively, matching the ground truth — the pipeline fits the homography directly from the detected corners rather than composing it with an intermediate rough fit, so what is stored needs no further transform to compare. `rough_homography` is the pipeline's own coarse image → rectified-board matrix, fitted from the ArUco marker alone (RGB only), saved as-is so `rocsync-evaluate` can score the rectification itself rather than only the LEDs it was fitted from.
 
 Every video additionally gets its clock fitted, by the same code a `rocsync` run uses, and a
 `videos` section records the resulting `VideoStatistics` — clock rate and offset, R²/RMSE
@@ -354,14 +384,13 @@ appears in the frame. Each frame is scored against its own board's sample radius
 board profiles is never scored against the wrong one's threshold.
 
 Rectification scores the homography itself rather than the corners it was fitted from: every LED
-the board model knows about (`board.layout_coords`) is mapped through the predicted homography and
-back through the annotated one, and the round trip's residual is the rectification's own error in
-board px, at every LED position including the ring and counter — regions the four fitted anchors
-only extrapolate into. The reported error statistics pool every LED's residual over every scored
-frame, the same board-px population the corner detection section reports, so the two are directly
-comparable. A frame is a detection when its worst LED still lands inside the sample radius. The
-coarse ArUco-only row is not a competing method; it is the floor the fit degrades to when corner
-refinement fails, so the gap between the two rows is what refinement is worth.
+the board model knows about (`board.layout_coords`, read against the frame's annotated `camera`)
+is mapped through the predicted homography and back through the annotated one, and the round
+trip's residual is the rectification's own error in board px, at every LED position including the
+ring and counter — regions the four fitted anchors only extrapolate into. A frame is a detection
+when its worst LED still lands inside the sample radius. The coarse ArUco-only row is not a
+competing method; it is the floor the fit degrades to when corner refinement fails, so the gap
+between the two rows is what refinement is worth.
 
 Reading position and rectification errors: the annotator pre-fills each image from a pipeline run,
 so on every frame accepted without correction the annotation *is* that pipeline's output — its

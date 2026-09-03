@@ -255,8 +255,13 @@ def _score(points, homography, layout):
     return np.bincount(hits, minlength=EXEMPT + 1)
 
 
-def _explained(score):
-    """(explained, unexplained) blob counts, ignoring the exempt footprint."""
+def explained_counts(score):
+    """(explained, unexplained) blob counts, ignoring the exempt footprint.
+
+    Public so a caller building its own diagnostics (a ``BoardDetection`` message's
+    ``n_matched``, say) can read the same tally ``_accept`` decides on, rather than
+    recompute it from ``BoardFit.score`` by hand.
+    """
     return int(score[ALWAYS_ON:EXEMPT].sum()), int(score[0])
 
 
@@ -266,7 +271,7 @@ def _rank(score, n_always_on):
     Showing every always-on LED outranks any amount of other agreement: those LEDs are
     lit in every frame, so a fit that cannot account for them is the wrong fit.
     """
-    explained, unexplained = _explained(score)
+    explained, unexplained = explained_counts(score)
     return (score[ALWAYS_ON] == n_always_on, explained - unexplained)
 
 
@@ -287,7 +292,7 @@ class BoardFit:
 
 
 def _accept(score, n_always_on, ambiguous):
-    explained, unexplained = _explained(score)
+    explained, unexplained = explained_counts(score)
     return bool(
         score[ALWAYS_ON] == n_always_on  # every always-on LED accounted for
         and score[RING] >= MIN_RING_LEDS  # exposure window is on the board
@@ -298,12 +303,15 @@ def _accept(score, n_always_on, ambiguous):
     )
 
 
-def _locate(points, board, min_diagonal):
+def locate_board(points, board, min_diagonal=0.0):
     """The best candidate quad among ``points``, scored against ``board``, or None.
 
     ``None`` only when no candidate quad existed at all (fewer than 4 points, or none
     of them paired into one); a quad that was scored but rejected still comes back as
-    a ``BoardFit`` with ``accepted=False``, which is what the debug renderer needs.
+    a ``BoardFit`` with ``accepted=False``. Public (not just ``find_board``'s
+    corners-or-None) for callers that want the fit itself -- the debug renderer, to
+    show why a candidate was rejected, and any caller reporting a match count, via
+    ``explained_counts(fit.score)``.
     """
     layout, n_always_on, rotations = _board_model(board)
     ir_corners = board.transform_corners(CameraType.INFRARED)
@@ -360,14 +368,35 @@ def find_board(points, board, min_diagonal=0.0):
     the resulting warp is upright whenever the frame shows an LED that breaks the
     board's 4-fold symmetry.
     """
-    fit = _locate(points, board, min_diagonal)
+    fit = locate_board(points, board, min_diagonal)
     return fit.corners if fit is not None and fit.accepted else None
+
+
+def board_mm_from_corners(points, corners, board):
+    """Rectify ``points`` into the board's own millimetre frame, given its ``corners``.
+
+    ``corners`` is whatever ``find_board``/``locate_board`` returned for these same
+    ``points`` (any coordinate system -- image pixels, a tracker's own 2D centroids, or
+    fiducials already projected into a plane). The perspective transform that takes
+    ``corners`` onto the model's IR anchors is reused for every point, then the result
+    is rescaled out of the rectified pixel grid into millimetres. This is the one mm
+    mapping every route needs after locating the board, so it lives here rather than
+    once per route.
+    """
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    homography = cv2.getPerspectiveTransform(
+        np.asarray(corners, dtype=np.float32), board.transform_corners(CameraType.INFRARED)
+    )
+    mapped_px = cv2.perspectiveTransform(
+        points.reshape(-1, 1, 2).astype(np.float32), homography
+    ).reshape(-1, 2)
+    return mapped_px / board.px_per_mm
 
 
 def find_corners_layout(mask, board, frame_number=None, debug_dir=None):
     """``find_board`` from a binary mask instead of pre-extracted points."""
     points = detect_blobs(mask)
-    fit = _locate(points, board, min_board_diagonal(board))
+    fit = locate_board(points, board, min_board_diagonal(board))
     if debug_dir:
         _write_debug(mask, points, fit, board, frame_number, debug_dir)
     return fit.corners if fit is not None and fit.accepted else None

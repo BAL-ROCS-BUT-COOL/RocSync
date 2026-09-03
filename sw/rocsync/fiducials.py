@@ -40,12 +40,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import cv2
 import numpy as np
 
-from rocsync.board_detection import find_board
+from rocsync.board_detection import board_mm_from_corners, find_board
 from rocsync.board_profiles import NO_CORNERS, BoardProfile
-from rocsync.camera import CameraType
 from rocsync.fiducial_decode import Decode, decode_board_points
 
 
@@ -170,17 +168,11 @@ def decode_fiducials(
     # are arbitrary -- find_board settles both from the corner LEDs, working in the
     # rectified board's pixel scale, so all three routes share one corner search.
     board = profile.rectify()
-    corners = find_board(flat * board.px_per_mm, board)
+    points_px = flat * board.px_per_mm
+    corners = find_board(points_px, board)
     if corners is None:
         return Decode(reject=NO_CORNERS)
 
-    homography = cv2.getPerspectiveTransform(
-        corners.astype(np.float32), board.transform_corners(CameraType.INFRARED)
-    )
-    mapped_px = cv2.perspectiveTransform(
-        (flat * board.px_per_mm).reshape(-1, 1, 2).astype(np.float32), homography
-    ).reshape(-1, 2)
-
-    result = decode_board_points(mapped_px / board.px_per_mm, profile)
+    result = decode_board_points(board_mm_from_corners(points_px, corners, board), profile)
     result.plane_source = plane.source
     return result

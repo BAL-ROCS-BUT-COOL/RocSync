@@ -28,12 +28,10 @@ with the caller. What crosses this boundary is a plain ``(N, 2)`` array.
 
 from __future__ import annotations
 
-import cv2
 import numpy as np
 
-from rocsync.board_detection import find_board
+from rocsync.board_detection import board_mm_from_corners, find_board
 from rocsync.board_profiles import NO_CORNERS, BoardProfile
-from rocsync.camera import CameraType
 from rocsync.fiducial_decode import Decode, decode_board_points
 
 
@@ -56,11 +54,4 @@ def decode_camera(points: np.ndarray, profile: BoardProfile) -> Decode:
     if corners is None:
         return Decode(reject=NO_CORNERS)
 
-    homography = cv2.getPerspectiveTransform(
-        corners.astype(np.float32), board.transform_corners(CameraType.INFRARED)
-    )
-    mapped_px = cv2.perspectiveTransform(
-        points.reshape(-1, 1, 2).astype(np.float32), homography
-    ).reshape(-1, 2)
-
-    return decode_board_points(mapped_px / board.px_per_mm, profile)
+    return decode_board_points(board_mm_from_corners(points, corners, board), profile)

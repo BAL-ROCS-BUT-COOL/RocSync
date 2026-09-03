@@ -63,7 +63,12 @@ def _finalize_stats(stats, t0, success, timestamp):
 
 def _make_blob_detector():
     """Blob detector tuned for the board's lit LEDs."""
-    params = cv2.SimpleBlobDetector.Params()
+    if hasattr(cv2.SimpleBlobDetector, "Params"):  # OpenCV >= 4.6
+        params = cv2.SimpleBlobDetector.Params()
+        create = cv2.SimpleBlobDetector.create
+    else:  # OpenCV 4.5
+        params = cv2.SimpleBlobDetector_Params()  # pyright: ignore[reportAttributeAccessIssue]
+        create = cv2.SimpleBlobDetector_create  # pyright: ignore[reportAttributeAccessIssue]
 
     # Detect white blobs
     params.filterByColor = True
@@ -73,7 +78,12 @@ def _make_blob_detector():
     params.filterByInertia = True
     params.minInertiaRatio = 0.5
 
-    return cv2.SimpleBlobDetector.create(params)
+    # OpenCV filters convexity at 0.95 by default. Under a moderate keystone that kept
+    # 2 of 9 LEDs and lost the corner LEDs that define the homography, so the filter is
+    # off rather than retuned.
+    params.filterByConvexity = False
+
+    return create(params)
 
 
 class _LegacyArucoDetector:
@@ -108,8 +118,29 @@ def _make_aruco_detector():
     return aruco_detector
 
 
-blob_detector = _make_blob_detector()
-aruco_detector = _make_aruco_detector()
+# Lazy and memoised: nothing here should be constructed merely by importing this module.
+# Neither detector is reachable from the infrared path most callers (including
+# rocsync_ros) use -- only find_corners_dots/find_corners_aruco's RGB path needs them --
+# so building either eagerly makes every caller pay for an RGB dependency it may never
+# exercise, and risks failing at import on an OpenCV build the RGB path never runs on.
+_blob_detector = None
+_aruco_detector = None
+
+
+def _get_blob_detector():
+    global _blob_detector
+    if _blob_detector is None:
+        _blob_detector = _make_blob_detector()
+    return _blob_detector
+
+
+def _get_aruco_detector():
+    global _aruco_detector
+    if _aruco_detector is None:
+        _aruco_detector = _make_aruco_detector()
+    return _aruco_detector
+
+
 clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_GRID_SIZE)
 
 
@@ -198,7 +229,7 @@ def find_corners_dots(mask, frame_number, board, debug_dir=None):
     matched position in `mask` coordinates or NaN where nothing landed close enough.
     """
     corner_dots = board.always_on_leds[CameraType.RGB]
-    points = blob_detector.detect(mask)
+    points = _get_blob_detector().detect(mask)
     if debug_dir:
         debug_image = cv2.drawKeypoints(
             mask,
@@ -244,7 +275,7 @@ def find_corners_aruco(mask, frame_number, debug_dir=None):
     under- and over-exposure."""
     gray = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY) if mask.ndim == 3 else mask
     normalized = clahe.apply(gray)
-    markers, marker_ids, _ = aruco_detector.detectMarkers(normalized)
+    markers, marker_ids, _ = _get_aruco_detector().detectMarkers(normalized)
     if debug_dir:
         debug_image = cv2.cvtColor(normalized, cv2.COLOR_GRAY2BGR)
         cv2.aruco.drawDetectedMarkers(debug_image, markers, marker_ids)

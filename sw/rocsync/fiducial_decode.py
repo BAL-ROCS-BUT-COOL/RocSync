@@ -26,11 +26,16 @@ if TYPE_CHECKING:
 FTK_PLANE_TOL_MM = 5.0  # out-of-plane slack for a fiducial to count as on the board
 
 
-def decode_board_points(points_mm, board: BoardProfile, ax: Axes | None = None) -> Decode:
+def decode_board_points(
+    points_mm,
+    board: BoardProfile,
+    ax: Axes | None = None,
+    camera_type: CameraType = CameraType.INFRARED,
+) -> Decode:
     """Decode a board's counter and ring from points already in its millimetre frame."""
     points = [np.asarray(p, dtype=float) for p in points_mm]
-    counter = read_counter(points, board, ax)
-    ring = read_ring(points, board, ax) if counter else None
+    counter = read_counter(points, board, ax, camera_type)
+    ring = read_ring(points, board, ax, camera_type) if counter else None
     return decode_reading(board, counter, ring)
 
 
@@ -58,10 +63,11 @@ def read_ring(
     fiducials: Sequence[np.ndarray | tuple[float, float]],
     board: BoardProfile,
     ax: Axes | None = None,
+    camera_type: CameraType = CameraType.INFRARED,
 ) -> tuple[int, int] | None:
     """Ring reading of a board seen by the tracker: first and last lit LED, or None."""
-    tol_mm = board.fiducial_tol_mm(CameraType.INFRARED)
-    leds = read_leds(fiducials, board.ring_led_coords(CameraType.INFRARED), tol_mm, ax)
+    tol_mm = board.fiducial_tol_mm(camera_type)
+    leds = read_leds(fiducials, board.ring_led_coords(camera_type), tol_mm, ax)
     return board.decode_ring(leds)
 
 
@@ -69,10 +75,11 @@ def read_counter(
     fiducials: Sequence[np.ndarray | tuple[float, float]],
     board: BoardProfile,
     ax: Axes | None = None,
+    camera_type: CameraType = CameraType.INFRARED,
 ) -> int:
     """Counter reading of a board seen by the tracker."""
-    tol_mm = board.fiducial_tol_mm(CameraType.INFRARED)
-    leds = read_leds(fiducials, board.counter_led_coords[CameraType.INFRARED], tol_mm, ax)
+    tol_mm = board.fiducial_tol_mm(camera_type)
+    leds = read_leds(fiducials, board.counter_led_coords[camera_type], tol_mm, ax)
     return board.decode_counter(leds)
 
 

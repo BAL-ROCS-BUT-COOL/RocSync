@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 from rocsync.board_profiles import PROFILES_BY_NAME
 from rocsync.dataset import VIDEO_SUFFIXES
+from rocsync.fiducials import MAX_FIDUCIALS
 from rocsync.ftk import process_ftk_recording
 from rocsync.printer import errprint, succprint, warnprint
 from rocsync.timecode import parse_hms
@@ -134,7 +135,25 @@ def main():
         "--board-version",
         choices=["auto", *PROFILES_BY_NAME],
         default="auto",
-        help="board hardware revision (default: auto-detect from ArUco marker ID)",
+        help="board hardware revision (default: auto-detect from ArUco marker ID; also "
+        "used for a FusionTrack CSV whose recording carries no registered geometry)",
+    )
+    parser.add_argument(
+        "--max-fiducials",
+        type=int,
+        default=MAX_FIDUCIALS,
+        metavar="N",
+        help="skip a FusionTrack frame with more than N raw fiducials as too cluttered "
+        f"to search (default: {MAX_FIDUCIALS}); the search cost is quadratic in this",
+    )
+    parser.add_argument(
+        "--ftk-marker-id",
+        type=int,
+        metavar="N",
+        help="FusionTrack geometry id of the board's registered marker; requires "
+        "--board-version (default: "
+        + ", ".join(f"{p.ftk_marker_id} for {p.name}" for p in PROFILES_BY_NAME.values())
+        + ")",
     )
 
     # Specify time windows to search for ROCsync
@@ -170,7 +189,11 @@ def main():
             "ArUco marker, which is not visible in IR"
         )
 
+    if args.ftk_marker_id is not None and args.board_version == "auto":
+        parser.error("--ftk-marker-id requires an explicit --board-version")
+
     board = PROFILES_BY_NAME.get(args.board_version) if args.board_version != "auto" else None
+    ftk_marker_ids = {args.ftk_marker_id: board} if args.ftk_marker_id is not None else None
 
     # Parse the search windows; they are resolved against the video and merged later
     windows = []
@@ -274,7 +297,13 @@ def main():
             )
         elif file in ftk_recordings:
             entry_type = "ftk"
-            ret = process_ftk_recording(file, debug_dir)
+            ret = process_ftk_recording(
+                file,
+                debug_dir,
+                board=board,
+                max_fiducials=args.max_fiducials,
+                marker_ids=ftk_marker_ids,
+            )
 
         if ret is not None:
             result[str(file)] = {"type": entry_type, **ret}

@@ -105,7 +105,7 @@ class BoardProfile:
     size_mm: float
     period: int
     aruco_marker_id: int
-    ftk_marker_id: int
+    ftk_marker_id: int  # default FusionTrack geometry id of the board's registered marker
     aruco_size_mm: float  # outer edge of the marker's black border
     counter_bits: int
     ring_radius_mm: dict  # {CameraType: float}
@@ -363,4 +363,3 @@ BOARD_V2 = _build_v2()
 ALL_PROFILES = [BOARD_V1, BOARD_V2]
 PROFILES_BY_NAME = {p.name: p for p in ALL_PROFILES}
 PROFILES_BY_ARUCO = {p.aruco_marker_id: p for p in ALL_PROFILES}
-PROFILES_BY_FTK = {p.ftk_marker_id: p for p in ALL_PROFILES}

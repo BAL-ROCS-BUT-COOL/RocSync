@@ -7,6 +7,7 @@ NO_BOARD = "no_board"  # the board is not in view
 NO_CORNERS = "no_corners"  # the board is in view but its corners could not be fitted
 COUNTER_ZERO = "counter_zero"  # the counter has not started, or the orientation is undetermined
 RING = "ring"  # no single usable arc, e.g. split or across the counter's wrap
+CLUTTERED = "cluttered"  # too many points to plausibly be only the board's
 
 
 @dataclass

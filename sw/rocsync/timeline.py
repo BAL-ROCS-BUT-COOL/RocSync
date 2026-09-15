@@ -1,14 +1,17 @@
-"""Mapping between a video's container clock and the RocSync board clock.
+"""Mapping between a source clock and the RocSync board clock.
 
-Every frame in an MP4 carries its own presentation timestamp, so the container
-clock is a direct measurement of when each frame was shown. Fitting board time
-against that timestamp -- rather than against the frame index -- keeps the fit
-correct when frames are missing: a dropped span is a gap in the timestamps, not
-a constant shift of every later index that the fit would have to absorb into
-its clock_rate and offset.
+Every frame in an MP4 carries its own presentation timestamp, and every FusionTrack
+frame its own tracker timestamp, so the source clock is a direct measurement of when
+each frame was captured. Fitting board time against that timestamp -- rather than
+against the frame index -- keeps the fit correct when frames are missing: a dropped
+span is a gap in the timestamps, not a constant shift of every later index that the
+fit would have to absorb into its clock_rate and offset.
 
-The result is a plain affine map, board_ms = clock_rate * pts_ms + clock_offset_ms, which
-is all any consumer needs in order to time a frame it has just decoded.
+The result is a plain affine map, board_ms = clock_rate * source_ticks + clock_offset_ms,
+which is all any consumer needs in order to time a frame it has just decoded. The fit
+runs on raw source ticks, never rescaled, so clock_rate itself carries both clock drift
+and whatever unit conversion the source's ticks need -- a consumer applies it to a raw
+timestamp exactly as read, with no separate conversion factor to get right.
 """
 
 import subprocess
@@ -21,7 +24,7 @@ import numpy as np
 from sklearn.linear_model import LinearRegression, RANSACRegressor
 from sklearn.metrics import root_mean_squared_error
 
-from rocsync.video_statistics import VideoStatistics
+from rocsync.recording_statistics import RecordingStatistics
 
 
 @dataclass
@@ -135,7 +138,7 @@ def fit_timeline(
 ):
     """Robustly fit board time against a source clock.
 
-    frame_times: {frame_index: source_ms} for every frame that was read.
+    frame_times: {frame_index: source_ticks} for every frame that was read.
     timestamps:  {frame_index: (start_ms, end_ms)} as measured off the board.
 
     For video, the source clock is the container's presentation timestamp and
@@ -210,13 +213,25 @@ def summarize_timeline(
     window_frame_times=None,
     timeline_windowed=False,
     frame_period_ms=None,
+    source_tick_ms=1.0,
+    residual_threshold=None,
+    max_trials=1000,
 ):
-    """Fit board time against the container clock and describe the result.
+    """Fit board time against a source clock and describe the result.
 
-    Everything between a set of decoded timestamps and a finished `VideoStatistics`:
-    the frame period, the fit, the dropouts, each frame's residual and the split into
-    inliers and outliers. Shared with the benchmark, so what it measures is the
-    summary a real run produces rather than a copy of it.
+    Everything between a set of decoded timestamps and a finished
+    `RecordingStatistics`: the frame period, the fit, the dropouts, each frame's
+    residual and the split into inliers and outliers. Shared with the benchmark and
+    with every source type (video, FTK), so what it measures is the summary a real
+    run produces rather than a copy of it.
+
+    `frame_times` holds raw source-clock ticks -- a container's presentation
+    timestamp, or a tracker's own counter -- never rescaled, so `clock_rate` (fitted
+    against them directly) keeps carrying both drift and unit conversion for anyone
+    who applies it to a raw timestamp later. `source_tick_ms` says how many
+    milliseconds one tick is worth, purely for reporting: it scales the frame period,
+    measured fps, dropout sizes and source duration into ms. Leave it at 1.0 for a
+    clock that already ticks in ms (e.g. a video container's pts).
 
     `window_frame_times` lists the frames of each search window separately, because a
     gap between two disjoint windows is not a dropout. Callers that scanned the whole
@@ -225,7 +240,9 @@ def summarize_timeline(
     `frame_period_ms` is the true sensor frame period, used to size the fit's inlier
     band (see `measured_residual_threshold_ms`); pass it whenever it's known, e.g. via
     `source_frame_period_ms`, since a subsampled/decimated input's own frame spacing is
-    not a safe stand-in. Without one, the container's nominal fps is used instead.
+    not a safe stand-in. Without one, the source's nominal fps is used instead.
+    `residual_threshold`/`max_trials` pass straight through to `fit_timeline`, for a
+    source (like a tracker) whose inlier band isn't sized off a frame period at all.
 
     Returns (statistics, fit, considered, rejected, gaps). Raises ValueError when the
     timeline cannot be fitted.
@@ -236,27 +253,35 @@ def summarize_timeline(
         raise ValueError("No frames could be read.")
 
     # Last-resort frame period only; the span is measured off the frames themselves
-    nominal_period = 1000 / fps if fps > 0 else None
-    period = median_frame_period(frame_times.values(), fallback=nominal_period)
-    if not period:
+    nominal_period_ms = 1000 / fps if fps else None
+    fallback_ticks = nominal_period_ms / source_tick_ms if nominal_period_ms else None
+    period_ticks = median_frame_period(frame_times.values(), fallback=fallback_ticks)
+    if not period_ticks:
         raise ValueError("Unable to determine the frame period.")
+    period_ms = period_ticks * source_tick_ms
 
     try:
-        fit = fit_timeline(frame_times, timestamps, frame_period_ms=frame_period_ms or nominal_period)
+        fit = fit_timeline(
+            frame_times,
+            timestamps,
+            residual_threshold=residual_threshold,
+            frame_period_ms=frame_period_ms or nominal_period_ms,
+            max_trials=max_trials,
+        )
     except ValueError as e:
         raise ValueError(f"Unable to fit the frame timeline: {e}") from e
 
     # Counted per window, so the span between disjoint windows is not a dropout
     n_gaps = n_dropped_frames = 0
-    largest_gap_ms = 0.0
+    largest_gap_ticks = 0.0
     gaps = []
     for window_times in window_frame_times or [frame_times]:
         window_gaps, window_dropped, window_largest, found = detect_dropouts(
-            window_times.values(), period
+            window_times.values(), period_ticks
         )
         n_gaps += window_gaps
         n_dropped_frames += window_dropped
-        largest_gap_ms = max(largest_gap_ms, window_largest)
+        largest_gap_ticks = max(largest_gap_ticks, window_largest)
         gaps.extend(found)
 
     # Add error to timestamps, following the order the fit used
@@ -284,17 +309,18 @@ def summarize_timeline(
     fit_stats = fit.to_dict()
     pts_min, pts_max = min(frame_times.values()), max(frame_times.values())
     exposure_times = [end - start for start, end, _ in considered.values()]
-    statistics = VideoStatistics(
+    statistics = RecordingStatistics(
         n_frames=n_frames,
-        container_duration=pts_max - pts_min,
+        source_duration=(pts_max - pts_min) * source_tick_ms,
         board_duration=fit_stats["last_frame"] - fit_stats["first_frame"],
-        nominal_fps=fps,
-        measured_fps=1000 / period,
-        median_frame_period=period,
+        nominal_fps=fps or None,
+        measured_fps=1000 / period_ms,
+        median_frame_period=period_ms,
         n_gaps=n_gaps,
         n_dropped_frames=n_dropped_frames,
-        largest_gap_ms=largest_gap_ms,
+        largest_gap_ms=largest_gap_ticks * source_tick_ms,
         timeline_windowed=timeline_windowed,
+        source_tick_ms=source_tick_ms,
         mean_exposure_time=float(np.mean(exposure_times)),
         min_exposure_time=float(np.min(exposure_times)),
         max_exposure_time=float(np.max(exposure_times)),

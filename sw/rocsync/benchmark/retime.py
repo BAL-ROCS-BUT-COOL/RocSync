@@ -32,10 +32,13 @@ import numpy as np
 from rocsync.benchmark.common import (
     MIN_REFERENCE_FRAMES,
     SYNTHESIZED_RESIDUAL_THRESHOLD_MS,
-    annotated_board_time,
+    annotated_starts,
     collect_frames,
+    ground_truth_path,
     is_retimed,
+    load_ground_truth,
     parse_frame_key,
+    pts_by_index,
     retimed_path,
 )
 from rocsync.timeline import frame_pts, source_frame_period_ms
@@ -133,15 +136,7 @@ def video_anchors(images, rel_path):
     Only annotations a board time follows from anchor anything: a ring arc that wraps the
     end of the period was exposed across a counter increment and names no single time.
     """
-    anchors = []
-    for key, entry in images.items():
-        path, index = parse_frame_key(key)
-        if index is None or path != rel_path:
-            continue
-        board_ms = annotated_board_time(entry)
-        if board_ms is not None:
-            anchors.append((index, board_ms))
-    return sorted(anchors)
+    return sorted(annotated_starts(images, rel_path).items())
 
 
 def is_current(entry, output_path, digest):
@@ -260,13 +255,13 @@ def retime_video(data_dir, rel_path, ground_truth, jitter_ms=0.0, force=False):
     if not force and is_current(entry, data_dir / out_rel, digest):
         return f"{rel_path}: up to date"
 
-    pts_by_index = dict(enumerate(frame_pts(data_dir / rel_path)))
-    missing = [i for i, _ in anchors if i not in pts_by_index]
+    pts = pts_by_index(data_dir / rel_path)
+    missing = [i for i, _ in anchors if i not in pts]
     if missing:
         raise RetimeError(f"annotated frames {missing[:5]} are not in the file")
 
     clock_rate = draw_clock(rel_path)
-    remap = build_timeline(anchors, pts_by_index, clock_rate)
+    remap = build_timeline(anchors, pts, clock_rate)
 
     first_index, last_index = anchors[0][0], anchors[-1][0]
     rng = random.Random(hashlib.sha256(f"jitter:{rel_path}".encode()).hexdigest())
@@ -330,7 +325,7 @@ def retime_video(data_dir, rel_path, ground_truth, jitter_ms=0.0, force=False):
     }
     return (
         f"{rel_path}: {len(anchors)} anchors, frames {start_index}-{start_index + n_frames - 1} "
-        f"of {len(pts_by_index)}, rate {clock_rate:.6f}, offset {clock_offset_ms:.1f} ms"
+        f"of {len(pts)}, rate {clock_rate:.6f}, offset {clock_offset_ms:.1f} ms"
     )
 
 
@@ -378,14 +373,11 @@ def main():
         return 1
 
     data_dir = Path(args.data_dir)
-    output_path = Path(args.output) if args.output else data_dir / "ground_truth.json"
+    output_path = ground_truth_path(data_dir, args.output)
     if not output_path.is_file():
         print(f"No ground truth at {output_path}", file=sys.stderr)
         return 1
-    with open(output_path) as f:
-        ground_truth = json.load(f)
-    ground_truth.setdefault("images", {})
-    ground_truth.setdefault("videos", {})
+    ground_truth = load_ground_truth(output_path)
 
     sources = sorted(
         {

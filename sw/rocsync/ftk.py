@@ -27,9 +27,11 @@ import numpy as np
 
 from rocsync.board_profiles import PROFILES_BY_FTK, BoardProfile
 from rocsync.fiducials import MAX_FIDUCIALS, decode_fiducials, plane_from_rotation
-from rocsync.printer import errprint, warnprint
+from rocsync.printer import errprint, print, warnprint
+from rocsync.recording_statistics import print_statistics, warn_about_statistics
 
 FIT_RESIDUAL_THRESHOLD_MS = 10  # RANSAC inlier band; the tracker is not frame-periodic
+FTK_TICK_MS = 0.001  # the FusionTrack reports its frame clock in microseconds
 
 
 marker_format = [
@@ -141,41 +143,25 @@ def fit_ftk_timestamps(
     timestamps: dict[int, tuple[int, int]],
     frame_times: dict[int, int],
     debug_dir=None,
-) -> dict:
-    from rocsync.timeline import detect_dropouts, fit_timeline, median_frame_period
+):
+    """Fit board time against the tracker's own clock and describe the result.
 
-    # The device reports its own clock, so regress board time directly on it.
-    fit = fit_timeline(
-        frame_times,
+    Thin wrapper around `summarize_timeline` -- the fit, dropout detection and
+    reporting are exactly what the video path uses, just fed the tracker's raw
+    microsecond ticks (`FTK_TICK_MS`) and a fixed inlier band instead of one derived
+    from a frame period, since the tracker is not frame-periodic the way a container
+    is. Raises ValueError when the timeline cannot be fitted.
+    """
+    from rocsync.timeline import summarize_timeline
+
+    statistics, fit, _, _, _ = summarize_timeline(
         timestamps,
+        frame_times,
+        n_frames=len(frame_times),
+        fps=None,
+        source_tick_ms=FTK_TICK_MS,
         residual_threshold=FIT_RESIDUAL_THRESHOLD_MS,
         max_trials=10000,  # more trials for more consistent results
-    )
-
-    period = median_frame_period(frame_times.values())
-    n_gaps, n_dropped_frames, largest_gap_ms, _ = detect_dropouts(frame_times.values(), period)
-
-    considered = {
-        k: timestamps[k]
-        for k, is_inlier in zip(fit.order, fit.inlier_mask, strict=True)
-        if is_inlier
-    }
-    exposure_times = [end - start for start, end in considered.values()]
-
-    results = fit.to_dict()
-    results.update(
-        {
-            "n_frames": len(frame_times),
-            "median_frame_period": period,
-            "measured_fps": 1000 / period if period else None,
-            "n_gaps": n_gaps,
-            "n_dropped_frames": n_dropped_frames,
-            "largest_gap_ms": largest_gap_ms,
-            "mean_exposure_time": float(np.mean(exposure_times)),
-            "min_exposure_time": float(np.min(exposure_times)),
-            "max_exposure_time": float(np.max(exposure_times)),
-            "std_exposure_time": float(np.std(exposure_times)),
-        }
     )
 
     if debug_dir is not None:
@@ -183,7 +169,7 @@ def fit_ftk_timestamps(
         y = np.array([timestamps[k][0] for k in fit.order])
         x_range = np.array([np.min(x), np.max(x)]).reshape(-1, 1)
         plot_timechart(x, y, x_range, fit.predict(x_range), debug_dir)
-    return results
+    return statistics
 
 
 def process_ftk_recording(
@@ -285,14 +271,33 @@ def process_ftk_recording(
 
     if len(timestamps) > 0:
         try:
-            results = fit_ftk_timestamps(timestamps, frame_times, debug_dir)
-            results.update(stats)
-            return results
+            statistics = fit_ftk_timestamps(timestamps, frame_times, debug_dir)
         except ValueError as e:
             errprint(f"Error: Unable to fit the FTK timeline: {e}")
-    elif board is None and n_marker_frames == 0:
+            _print_decode_stats(stats)
+            return None
+
+        warn_about_statistics(statistics)
+        print_statistics(statistics)
+        return {**statistics.to_dict(), **stats}
+
+    if board is None and n_marker_frames == 0:
         errprint(
             "Error: no registered geometry found in this recording; "
             "pass --board-version to decode from raw fiducials"
         )
+    else:
+        errprint("Error: no frame in this recording decoded a timestamp.")
+    _print_decode_stats(stats)
     return None
+
+
+def _print_decode_stats(stats: dict):
+    """Why a recording did or didn't decode -- printed on every path so a run that
+    ends in `Unable to time-sync` still says whether frames decoded at all."""
+    print(
+        f"Marker frames: {stats['n_marker_frames']}, decoded: {stats['n_decoded']} "
+        f"(pose: {stats['n_pose_decodes']}, constellation: {stats['n_constellation_decodes']})"
+    )
+    for reason, count in stats["n_rejects"].items():
+        print(f"  Rejected {count} frame(s): {reason}")

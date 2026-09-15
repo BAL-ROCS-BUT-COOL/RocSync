@@ -26,15 +26,18 @@ RING_EDGE_MARGIN = 1  # ring LEDs of slack required at either end of the period
 
 # Why a decode attempt produced no board_time. Shared vocabulary across every decode
 # path -- image, 3D fiducial, 2D blob -- so a caller pooling results across routes
-# counts the same three reasons rather than each route inventing its own strings.
+# counts the same reasons rather than each route inventing its own strings.
 # NO_CORNERS: the board itself was not located. COUNTER_ZERO: a quad was accepted but
 # the counter read zero, so either the count has not started or (for a board whose
 # orientation the accepted quad left ambiguous) the ring index would be meaningless.
 # RING: the counter is running but no single usable arc was read -- no contiguous lit
 # run, or one sitting across the wrap where the counter incremented mid-exposure.
+# CLUTTERED: the point set was rejected before any search, for being too large to be
+# plausibly just the board's own fiducials.
 NO_CORNERS = "no_corners"
 COUNTER_ZERO = "counter_zero"
 RING = "ring"
+CLUTTERED = "cluttered"
 
 
 def _ring(radius_mm, period, centre):

@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 from rocsync.board_profiles import PROFILES_BY_NAME
 from rocsync.dataset import VIDEO_SUFFIXES
+from rocsync.fiducials import MAX_FIDUCIALS
 from rocsync.ftk import process_ftk_recording
 from rocsync.printer import errprint, succprint, warnprint
 from rocsync.timecode import parse_hms
@@ -134,7 +135,16 @@ def main():
         "--board-version",
         choices=["auto", *PROFILES_BY_NAME],
         default="auto",
-        help="board hardware revision (default: auto-detect from ArUco marker ID)",
+        help="board hardware revision (default: auto-detect from ArUco marker ID; also "
+        "used for a FusionTrack CSV whose recording carries no registered geometry)",
+    )
+    parser.add_argument(
+        "--max-fiducials",
+        type=int,
+        default=MAX_FIDUCIALS,
+        metavar="N",
+        help="skip a FusionTrack frame with more than N raw fiducials as too cluttered "
+        f"to search (default: {MAX_FIDUCIALS}); the search cost is quadratic in this",
     )
 
     # Specify time windows to search for ROCsync
@@ -274,7 +284,9 @@ def main():
             )
         elif file in ftk_recordings:
             entry_type = "ftk"
-            ret = process_ftk_recording(file, debug_dir)
+            ret = process_ftk_recording(
+                file, debug_dir, board=board, max_fiducials=args.max_fiducials
+            )
 
         if ret is not None:
             result[str(file)] = {"type": entry_type, **ret}

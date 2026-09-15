@@ -7,11 +7,10 @@ count of milliseconds, so a near miss is a wrong answer.
 
 Two properties matter most here and are hard to check on hardware:
 
-* **Origin-convention independence.** ``fiducial_decode.process_frame`` adds (5, 5) to
-  transformed fiducials ("Adjust for PCB origin") while the current .ini already places
-  its first fiducial at (5, 5) -- a convention this route sidesteps entirely by fitting
-  the in-plane frame from the corner LEDs themselves. The test for it is that the decode
-  is unchanged when the pose's translation is deliberately offset.
+* **Origin-convention independence.** This route fits the in-plane frame from the
+  corner LEDs themselves rather than trusting any convention baked into a registered
+  geometry's own origin. The test for it is that the decode is unchanged when the
+  pose's translation is deliberately offset.
 * **Off-plane rejection**, this route's advantage over the 2D-blob route. Confusers
   placed off the board plane must not participate.
 """
@@ -100,10 +99,8 @@ def test_decode_without_a_registered_geometry(counter, lit):
 def test_decode_is_independent_of_the_pose_origin_convention():
     """The whole reason the in-plane frame is fitted rather than taken from the pose.
 
-    fiducial_decode.process_frame adds (5, 5) to transformed fiducials while the
-    current .ini already puts its first fiducial at (5, 5). If the decode depended on
-    that convention, shifting the pose's translation would change the answer. It must
-    not.
+    If the decode depended on the pose's own origin convention, shifting the pose's
+    translation would change the answer. It must not.
     """
     profile = BOARD_V2
     counter, lit = 4242, [55, 56]

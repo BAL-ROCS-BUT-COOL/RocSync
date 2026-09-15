@@ -11,10 +11,6 @@ when a caller actually passes one.
 ``read_leds`` decides lit/unlit by nearest-point distance against a tolerance derived
 from the board's own ring pitch (``fiducial_tol_mm``), which is the natural precision a
 tracker's own centroids carry -- unlike an image, there is no intensity to threshold.
-``process_frame`` is the 3D-fiducial entry point: it transforms fiducials into the
-board's local frame from a registered rigid body's own position and rotation, rotates
-in 90-degree steps until the counter reads non-zero (the four corners are otherwise
-interchangeable), and reads the counter and ring once oriented.
 
 ``decode_board_points`` is the entry point for callers that have already resolved the
 board's orientation themselves -- typically via ``board_detection.find_board``, which
@@ -35,8 +31,6 @@ from rocsync.camera import CameraType
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
-
-FTK_PLANE_TOL_MM = 5.0  # out-of-plane slack for a fiducial to count as on the board
 
 
 @dataclass

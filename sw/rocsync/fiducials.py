@@ -25,15 +25,13 @@ even the pose path still runs it: a pose only fixes the plane's orientation and 
 not which LED is which, and ``find_board`` settles that from what is actually lit,
 insensitive to the plane's convention.
 
-This is a different, more conservative choice than ``fiducial_decode.process_frame``
-(also 3D fiducials, but transforms them by a registered rigid body's own reported
-rotation and rotates in 90-degree steps until the counter reads non-zero). That method
-trusts the registration outright; measured on the FusionTrack, trusting it barely ever
-matches, and even when it does, a genuinely 4-fold-symmetric board (counter at zero)
-would settle its rotation by guessing rather than by evidence. ``process_frame`` remains
-what it always was -- the reader for ``ftk.process_ftk_recording``'s offline CSV
-analysis, a different consumer with a registered marker it can simply trust -- and nothing
-here calls it.
+This module is now ``ftk.process_ftk_recording``'s own decoder for offline CSV
+analysis too, in place of the rigid-body-trusting approach it used to use (transform
+fiducials by a registered marker's reported rotation, then rotate in 90-degree steps
+until the counter reads non-zero): that approach trusted the registration outright,
+and measured on the FusionTrack, trusting it barely ever matches -- and even when it
+does, a genuinely 4-fold-symmetric board (counter at zero) would settle its rotation
+by guessing rather than by evidence.
 """
 
 from __future__ import annotations
@@ -44,9 +42,16 @@ import cv2
 import numpy as np
 
 from rocsync.board_detection import find_board
-from rocsync.board_profiles import NO_CORNERS, BoardProfile
+from rocsync.board_profiles import CLUTTERED, NO_CORNERS, BoardProfile
 from rocsync.camera import CameraType
 from rocsync.fiducial_decode import Decode, decode_board_points
+
+# A board in the plane puts ~20-30 fiducials there itself (4-5 always-on, ~10 lit
+# counter bits, the lit ring arc); plane_from_constellation's own docstring notes a
+# volume can easily hold 40. Past that the O(N^2) diagonal search is both slow and
+# awash in false 339.4mm pairs, so a frame this cluttered is rejected outright rather
+# than searched.
+MAX_FIDUCIALS = 64
 
 
 @dataclass
@@ -68,21 +73,28 @@ def _quat_to_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:
     )
 
 
-def plane_from_pose(position_xyz, quaternion_xyzw) -> PlaneFit:
-    """The board plane from a tracked rigid body's own pose.
+def plane_from_rotation(position_xyz, rotation) -> PlaneFit:
+    """The board plane from a tracked rigid body's own pose, given as a 3x3 rotation.
 
-    Only the orientation's first two axes are used, as the plane's basis; the in-plane
+    Only the rotation's first two columns are used, as the plane's basis; the in-plane
     origin and handedness are settled later by ``find_board``. So this is insensitive to
-    both the geometry-origin convention and to the planar mirror ambiguity that
-    ``fiducial_decode.process_frame`` patches by swapping rotation columns when r22 < 0.
+    both the geometry-origin convention and to the planar mirror ambiguity that the old
+    ``fiducial_decode.process_frame`` patched by swapping rotation columns when r22 < 0
+    -- no such patch is needed here.
 
-    Takes plain arrays rather than a ``geometry_msgs/Pose`` -- the boundary this module
-    crosses is 3D points and a rotation, not a ROS message shape.
+    Takes a plain array rather than a ROS message -- the boundary this module crosses
+    is 3D points and a rotation, not a message shape. A tracker reporting a quaternion
+    instead should go through ``plane_from_pose``.
     """
-    x, y, z, w = quaternion_xyzw
-    rot = _quat_to_matrix(x, y, z, w)
+    rot = np.asarray(rotation, dtype=float).reshape(3, 3)
     origin = np.asarray(position_xyz, dtype=float)
     return PlaneFit(origin=origin, basis=rot[:, :2].T.copy(), source="pose")
+
+
+def plane_from_pose(position_xyz, quaternion_xyzw) -> PlaneFit:
+    """The board plane from a tracked rigid body's own pose, given as a quaternion."""
+    x, y, z, w = quaternion_xyzw
+    return plane_from_rotation(position_xyz, _quat_to_matrix(x, y, z, w))
 
 
 def plane_from_constellation(points: np.ndarray, tolerance_mm: float = 6.0) -> PlaneFit | None:
@@ -154,9 +166,18 @@ def decode_fiducials(
     plane: PlaneFit | None,
     plane_tolerance_mm: float = 5.0,
     tolerance_mm: float = 6.0,
+    max_fiducials: int = MAX_FIDUCIALS,
+    ax=None,
 ) -> Decode:
-    """Decode from 3D fiducials, given a board plane (or find one)."""
+    """Decode from 3D fiducials, given a board plane (or find one).
+
+    Rejects outright, before any search, a point set larger than ``max_fiducials`` --
+    see the constant's own docstring. Checked here rather than only by callers so every
+    caller (a FusionTrack CSV, a ROS node) inherits the same bound.
+    """
     points_3d = np.asarray(points_3d, dtype=float).reshape(-1, 3)
+    if len(points_3d) > max_fiducials:
+        return Decode(reject=CLUTTERED)
     if plane is None:
         plane = plane_from_constellation(points_3d, tolerance_mm)
     if plane is None:
@@ -181,6 +202,10 @@ def decode_fiducials(
         (flat * board.px_per_mm).reshape(-1, 1, 2).astype(np.float32), homography
     ).reshape(-1, 2)
 
-    result = decode_board_points(mapped_px / board.px_per_mm, profile)
+    if ax is not None:
+        for x, y in mapped_px / board.px_per_mm:
+            ax.scatter(x, y, color="green")
+
+    result = decode_board_points(mapped_px / board.px_per_mm, profile, ax=ax)
     result.plane_source = plane.source
     return result

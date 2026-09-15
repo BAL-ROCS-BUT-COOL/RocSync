@@ -277,6 +277,7 @@ def process_ftk_recording(
             _print_decode_stats(stats)
             return None
 
+        _print_decode_stats(stats)
         warn_about_statistics(statistics)
         print_statistics(statistics)
         return {**statistics.to_dict(), **stats}
@@ -293,8 +294,9 @@ def process_ftk_recording(
 
 
 def _print_decode_stats(stats: dict):
-    """Why a recording did or didn't decode -- printed on every path so a run that
-    ends in `Unable to time-sync` still says whether frames decoded at all."""
+    """Why a recording did or didn't decode -- printed on every path, so a run that
+    ends in `Unable to time-sync` still says whether frames decoded at all, and a
+    successful one still shows how many frames were thrown out before the fit."""
     print(
         f"Marker frames: {stats['n_marker_frames']}, decoded: {stats['n_decoded']} "
         f"(pose: {stats['n_pose_decodes']}, constellation: {stats['n_constellation_decodes']})"

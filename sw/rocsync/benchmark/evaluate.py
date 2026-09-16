@@ -122,7 +122,9 @@ def resolve_retimed_keys(benchmark, retimed):
     """
     if not retimed:
         return benchmark
-    images = {source_key(key, retimed): value for key, value in benchmark["images"].items()}
+    images = {
+        source_key(key, retimed): value for key, value in (benchmark.get("images") or {}).items()
+    }
     result = {**benchmark, "images": images}
     if benchmark.get("videos"):
         result["videos"] = {

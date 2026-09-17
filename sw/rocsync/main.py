@@ -162,10 +162,11 @@ def main():
         nargs=2,
         action="append",
         metavar=("START", "END"),
-        help="time span to search, in hh:mm:ss format with optionally fractional "
-        "seconds; 'end' is the end of the file and 'end-hh:mm:ss' counts back from it, "
-        "e.g. --window end-0:00:30 end. Repeat for several spans; overlapping ones are "
-        "merged (default: whole file)",
+        help="time span to search (videos and FusionTrack recordings), in hh:mm:ss "
+        "format with optionally fractional seconds; 'end' is the end of the recording "
+        "and 'end-hh:mm:ss' counts back from it, e.g. --window end-0:00:30 end. For a "
+        "FusionTrack recording the span is measured from its first frame. Repeat for "
+        "several spans; overlapping ones are merged (default: whole recording)",
     )
     parser.add_argument(
         "--recurse_in_dir",
@@ -259,9 +260,9 @@ def main():
 
     for file in tqdm(videos + images + ftk_recordings, desc="Processing files", position=0):
         if str(file) in result:
-            print(f"Skipping {file}, already processed.")
+            print(f"\nSkipping {file}, already processed.")
             continue
-        print(f"Working on {file}")
+        print(f"\nWorking on {file}")
 
         debug_dir = None
         if args.debug:
@@ -303,17 +304,18 @@ def main():
                 board=board,
                 max_fiducials=args.max_fiducials,
                 marker_ids=ftk_marker_ids,
+                windows=windows,
             )
 
         if ret is not None:
             result[str(file)] = {"type": entry_type, **ret}
         else:
-            errprint(f"Error: Unable to time-sync {file}.")
+            errprint(f"\nError: Unable to time-sync {file}.")
 
         # Save result to file after every video to avoid data loss
         with output_path.open("w") as f:
             json.dump(result, f, indent=4, cls=NpEncoder)
-        print(f"Result written to {args.output}")
+        print(f"\nResult written to {args.output}")
 
 
 if __name__ == "__main__":

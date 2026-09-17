@@ -6,6 +6,9 @@ constellation if that fails.
 
 matplotlib, tqdm and ``rocsync.timeline`` are imported where they are used, so importing
 this module stays light.
+
+``--window`` search spans are measured from the first frame's ``ftk_timestamp``, since the
+tracker clock starts at its own boot, not at the start of the recording.
 """
 
 from collections.abc import Mapping
@@ -16,9 +19,11 @@ from rocsync.board_profiles import ALL_PROFILES, BoardProfile
 from rocsync.fiducials import MAX_FIDUCIALS, decode_fiducials, plane_from_rotation
 from rocsync.printer import errprint, print, warnprint
 from rocsync.recording_statistics import print_statistics, warn_about_statistics
+from rocsync.timecode import resolve_windows
 
 FIT_RESIDUAL_THRESHOLD_MS = 10  # RANSAC inlier band; the tracker is not frame-periodic
 FTK_TICK_MS = 0.001  # the FusionTrack reports its frame clock in microseconds
+FTK_TICK_S = FTK_TICK_MS / 1000.0
 
 
 marker_format = [
@@ -127,6 +132,8 @@ def fit_ftk_timestamps(
     timestamps: dict[int, tuple[int, int]],
     frame_times: dict[int, int],
     debug_dir=None,
+    window_frame_times: list[dict[int, int]] | None = None,
+    timeline_windowed: bool = False,
 ):
     """Fit board time against the tracker's own clock and describe the result.
 
@@ -135,6 +142,9 @@ def fit_ftk_timestamps(
     microsecond ticks (`FTK_TICK_MS`) and a fixed inlier band instead of one derived
     from a frame period, since the tracker is not frame-periodic the way a container
     is. Raises ValueError when the timeline cannot be fitted.
+
+    `window_frame_times`/`timeline_windowed` are forwarded to `summarize_timeline` so a
+    gap between two disjoint `--window` spans is not counted as a dropout.
     """
     from rocsync.timeline import summarize_timeline
 
@@ -143,6 +153,8 @@ def fit_ftk_timestamps(
         frame_times,
         n_frames=len(frame_times),
         fps=None,
+        window_frame_times=window_frame_times,
+        timeline_windowed=timeline_windowed,
         source_tick_ms=FTK_TICK_MS,
         residual_threshold=FIT_RESIDUAL_THRESHOLD_MS,
         max_trials=10000,  # more trials for more consistent results
@@ -156,29 +168,64 @@ def fit_ftk_timestamps(
     return statistics
 
 
+def _scan_extent(filename):
+    """Line count plus the first and last ``ftk_timestamp`` in the file, in the one
+    pass the progress bar's total already costs. The tracker writes in timestamp
+    order, so these bound the recording.
+    """
+    total_lines, first_ts, last_ts = 0, None, None
+    with open(filename) as file:
+        for line in file:
+            total_lines += 1
+            fields = [f.strip() for f in line.strip().split(",")]
+            if len(fields) < 3 or fields[2] not in ("m", "f"):
+                continue
+            try:
+                ts = int(fields[1])
+            except ValueError:
+                continue
+            if first_ts is None:
+                first_ts = ts
+            last_ts = ts
+    return total_lines, first_ts, last_ts
+
+
 def process_ftk_recording(
     filename: str,
     debug_dir=None,
     board: BoardProfile | None = None,
     max_fiducials: int = MAX_FIDUCIALS,
     marker_ids: Mapping[int, BoardProfile] | None = None,
+    windows: list[tuple[float, float]] | None = None,
 ) -> dict | None:
     """Fit a board timeline from a FusionTrack CSV recording.
 
     ``marker_ids`` maps registered marker ids to the board they track, defaulting to each
     profile's ``ftk_marker_id``. A frame with such a marker is decoded as that board;
-    any other frame as ``board``, or skipped if ``board`` is None.
+    any other frame as ``board``, or skipped if ``board`` is None. ``windows`` restricts
+    the search to time spans from the first frame; None or empty searches everything.
     """
     from tqdm import tqdm
 
     if marker_ids is None:
         marker_ids = {p.ftk_marker_id: p for p in ALL_PROFILES}
 
-    with open(filename) as file:
-        total_lines = sum(1 for _ in file)
+    total_lines, first_ts, last_ts = _scan_extent(filename)
+
+    # Whether the reported span and dropouts describe the file or just the windows
+    timeline_windowed = bool(windows)
+    try:
+        windows = resolve_windows(
+            windows, lambda: (last_ts - first_ts) * FTK_TICK_S if first_ts is not None else None
+        )
+    except ValueError as e:
+        errprint(f"Error: Unable to resolve the search windows: {e}")
+        return None
 
     timestamps = {}
     frame_times = {}
+    window_frame_times = [{} for _ in windows]
+    current = 0  # windows and frames are both in ascending time order
     n_marker_frames = 0
     n_pose_decodes = 0
     n_constellation_decodes = 0
@@ -186,8 +233,16 @@ def process_ftk_recording(
 
     with open(filename) as file, tqdm(total=total_lines, desc="Processing lines") as pbar:
         for ftk_timestamp, markers, fiducials in _iter_frames(file, pbar):
+            # Window times run from the first frame, not from the tracker's boot
+            offset_s = (ftk_timestamp - first_ts) * FTK_TICK_S
+            while current < len(windows) and offset_s > windows[current][1]:
+                current += 1
+            if current == len(windows) or offset_s < windows[current][0]:
+                continue
+
             # Every reported frame counts towards the frame count and dropouts
             frame_times[ftk_timestamp] = ftk_timestamp
+            window_frame_times[current][ftk_timestamp] = ftk_timestamp
 
             registered = next((m for m in markers if int(m["marker_id"]) in marker_ids), None)
             if registered is not None:
@@ -254,9 +309,16 @@ def process_ftk_recording(
     if board is not None:
         stats["board_version"] = board.name
 
+    if timeline_windowed and not frame_times:
+        errprint("Error: no frame of this recording falls inside the requested search window(s).")
+        _print_decode_stats(stats)
+        return None
+
     if len(timestamps) > 0:
         try:
-            statistics = fit_ftk_timestamps(timestamps, frame_times, debug_dir)
+            statistics = fit_ftk_timestamps(
+                timestamps, frame_times, debug_dir, window_frame_times, timeline_windowed
+            )
         except ValueError as e:
             errprint(f"Error: Unable to fit the FTK timeline: {e}")
             _print_decode_stats(stats)

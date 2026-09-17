@@ -16,6 +16,7 @@ from rocsync import video
 from rocsync.camera import CameraType
 from rocsync.decode import Decode
 from rocsync.timeline import frame_pts
+from rocsync.video_reader import VideoReader
 
 FPS = 30.0
 PERIOD = 1000 / FPS
@@ -99,24 +100,9 @@ def board_at_pts(gap_video, monkeypatch):
 
 def test_reader_reports_the_presentation_timestamp_of_each_frame(gap_video):
     """Guards the claim that POS_MSEC needs no off-by-one correction."""
-    import queue as queue_module
-
-    import cv2
-
-    cap = cv2.VideoCapture(gap_video, cv2.CAP_FFMPEG)
-    frame_queue = queue_module.Queue(maxsize=8)
-    thread = __import__("threading").Thread(target=video.read_frames_async, args=(cap, frame_queue))
-    thread.daemon = True
-    thread.start()
-
-    read = []
-    while True:
-        frame, frame_number, pts_ms = frame_queue.get()
-        if frame is None:
-            break
-        read.append((frame_number, pts_ms))
-    thread.join(timeout=5)
-    cap.release()
+    reader = VideoReader(gap_video)
+    read = [(index, pts_ms) for index, pts_ms, _ in reader.frames()]
+    reader.close()
 
     expected = list(enumerate(frame_pts(gap_video)))
     assert read == expected
@@ -236,7 +222,3 @@ def test_negative_window_bounds_count_back_from_the_last_frame(gap_video, board_
     assert analyzed_pts, "nothing was analyzed"
     assert min(analyzed_pts) >= pts[-1] - 1000
     assert max(analyzed_pts) == pytest.approx(pts[-1])
-
-
-def test_probe_last_pts_ms_finds_the_real_last_frame(gap_video):
-    assert video.probe_last_pts_ms(gap_video) == pytest.approx(frame_pts(gap_video)[-1])

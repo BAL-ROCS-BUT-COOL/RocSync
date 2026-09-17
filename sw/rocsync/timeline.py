@@ -400,7 +400,7 @@ def frame_pts(video_path):
 
     Timestamps are relative to the stream's start time, so a clip whose container starts
     at 47 s still begins at 0.0 here. `clock_offset_ms` is defined against this view,
-    which is also the one `read_frames_async` feeds the pipeline; an absolute container
+    which is also the one `VideoReader` feeds the pipeline; an absolute container
     timestamp has to have the start time subtracted first.
     """
     output = run_ffprobe(

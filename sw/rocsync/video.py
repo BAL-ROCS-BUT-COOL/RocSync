@@ -13,6 +13,7 @@ from tqdm import tqdm
 from rocsync.clips import MAX_FRAMES_IN_FLIGHT
 from rocsync.printer import errprint, warnprint
 from rocsync.recording_statistics import print_statistics, warn_about_statistics
+from rocsync.timecode import resolve_windows
 from rocsync.timeline import source_frame_period_ms, summarize_timeline
 from rocsync.video_reader import VideoReader
 from rocsync.vision import CameraType, process_frame
@@ -39,45 +40,6 @@ def _produce_frames(reader, frame_queue, start_index, stop_index, stop_event):
         if not put((frame, index, pts_ms)):
             return
     put((None, None, None))
-
-
-def resolve_windows(windows, reader):
-    """Turns requested search windows into absolute [start, end] spans in seconds.
-
-    A negative bound is an offset from the last frame's presentation timestamp. The
-    result is sorted, and overlapping spans are merged so that no frame is scanned --
-    and no gap between frames counted -- twice. `reader` is only ever touched when a
-    negative bound needs resolving against it.
-    """
-    if not windows:
-        return [(0.0, math.inf)]
-
-    last_pts_s = None
-    if any(bound < 0 for window in windows for bound in window):
-        pts = reader.pts
-        if not pts:
-            raise ValueError("no frame could be read to resolve a window bound given from the end")
-        last_pts_s = pts[-1] / 1000.0
-
-    resolved = []
-    for start, end in windows:
-        if start < 0:
-            start = max(0.0, last_pts_s + start)
-        if end < 0:
-            end = max(0.0, last_pts_s + end)
-        if start >= end:
-            raise ValueError(f"window [{start:.3f}s, {end:.3f}s] starts at or after it ends")
-        resolved.append((start, end))
-
-    resolved.sort()
-    merged = [resolved[0]]
-    for start, end in resolved[1:]:
-        merged_start, merged_end = merged[-1]
-        if start <= merged_end:  # overlapping or touching
-            merged[-1] = (merged_start, max(merged_end, end))
-        else:
-            merged.append((start, end))
-    return merged
 
 
 def export_frames(video_path, output_path, fit, n_frames=None):
@@ -240,7 +202,7 @@ def process_video(
     timeline_windowed = bool(windows)
 
     try:
-        windows = resolve_windows(windows, reader)
+        windows = resolve_windows(windows, lambda: reader.pts[-1] / 1000.0 if reader.pts else None)
     except ValueError as e:
         errprint(f"Error: Unable to resolve the search windows: {e}")
         reader.close()

@@ -70,7 +70,7 @@ rocsync -c ir --board-version v2 ir_recording.mp4
 | `-y, --yes` | Do not ask for confirmation when processing multiple files |
 | `--debug DIRECTORY` | Directory to store debug images (very slow) |
 | `--board-version {auto,v1,v2}` | Board hardware revision (default: `auto`, detected from the ArUco marker ID) |
-| `--window START END` | Time span to search, in `hh:mm:ss` format with optionally fractional seconds; `end` is the end of the file and `end-hh:mm:ss` counts back from it, e.g. `--window end-0:00:30 end`. Repeat for several spans; overlapping ones are merged (default: whole file) |
+| `--window START END` | Time span to search (videos and FusionTrack recordings), in `hh:mm:ss` format with optionally fractional seconds; `end` is the end of the recording and `end-hh:mm:ss` counts back from it, e.g. `--window end-0:00:30 end`. For a FusionTrack recording the span is measured from its first frame. Repeat for several spans; overlapping ones are merged (default: whole recording) |
 | `--recurse_in_dir` | Recursively search for videos and images in directories |
 
 Run `rocsync -h` for the authoritative list.

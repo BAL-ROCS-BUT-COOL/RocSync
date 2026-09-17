@@ -14,9 +14,9 @@ from rocsync.dataset import VIDEO_SUFFIXES
 from rocsync.timeline import (
     frame_pts,
     measured_residual_threshold_ms,
-    run_ffprobe,
     source_frame_period_ms,
 )
+from rocsync.video_reader import VideoReader
 
 STEP_ORDER = [
     "aruco_detection",
@@ -31,8 +31,6 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 FRAME_KEY_SEPARATOR = "#"
 FRAME_INDEX_DIGITS = 6  # zero-padded so keys sort in frame order
 FRAME_CACHE_SIZE = 4  # a decoded 4K frame is ~25 MB
-FORWARD_GRAB_LIMIT = 12  # a seek re-decodes from the preceding keyframe anyway
-SEEK_BACKOFF_FRAMES = 32  # retry margin for a seek that landed past the frame wanted
 
 MIN_REFERENCE_FRAMES = 5  # a two-point fit is exact by construction and proves nothing
 
@@ -89,34 +87,14 @@ def count_video_frames(path):
 
     Enumeration defines the keys, so an over-reported count would invent keys that no
     frame can ever fill -- and that the annotator's jump-to-unannotated would then land
-    on forever. The stream's packets are therefore counted rather than the count the
-    container claims taken at its word.
+    on forever. `frame_pts` counts the stream's packets rather than taking the
+    container's own count at its word, and already falls back to a full decode for a
+    file ffprobe cannot read the packet timestamps of.
     """
-    counted = _probe_packet_count(path)
-    if counted:
-        return counted
-
-    # ffprobe could not answer, so demux the file here instead
-    cap = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG)
-    if not cap.isOpened():
-        return 0
     try:
-        # grab() demuxes without decoding pixels, so counting for real stays cheap
-        counted = 0
-        while cap.grab():
-            counted += 1
-        return counted
-    finally:
-        cap.release()
-
-
-def _probe_packet_count(path):
-    """Packets the video stream holds, or None if ffprobe could not count them."""
-    output = run_ffprobe(
-        path, "-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0"
-    )
-    counted = (output or "").strip().rstrip(",")
-    return int(counted) if counted.isdigit() else None
+        return len(frame_pts(path))
+    except OSError:
+        return 0
 
 
 def residual_threshold_ms(video_entry):
@@ -276,10 +254,8 @@ class FrameSource:
 
     def __init__(self):
         self._cache = OrderedDict()
-        self._cap = None
-        self._cap_path = None
-        self._next_index = -1  # index the open capture would read next; -1 forces a seek
-        self._pts: dict[Path, list[float] | None] = {}  # every frame's presentation timestamp
+        self._reader = None
+        self._reader_path = None
 
     def read(self, ref):
         """Decoded BGR image for `ref`, or None if it could not be read."""
@@ -296,93 +272,20 @@ class FrameSource:
         return frame
 
     def _read_video(self, ref):
-        if self._cap is None or self._cap_path != ref.path:
+        if self._reader is None or self._reader_path != ref.path:
             self.close()
-            cap = cv2.VideoCapture(str(ref.path), cv2.CAP_FFMPEG)
-            if not cap.isOpened():
+            try:
+                self._reader = VideoReader(ref.path)
+            except OSError:
                 return None
-            self._cap, self._cap_path, self._next_index = cap, ref.path, 0
-        cap = self._cap
-        pts = self._frame_pts(ref.path)
-
-        ahead = ref.index - self._next_index
-        frame = (
-            self._grab_forward(cap, ahead, pts, ref.index)
-            if 0 <= ahead <= FORWARD_GRAB_LIMIT
-            else None
-        )
-        if frame is None:
-            frame = self._seek_and_read(cap, pts, ref.index)
-        self._next_index = ref.index + 1 if frame is not None else -1
-        return frame
-
-    def _frame_pts(self, path):
-        """Presentation timestamps for `path`, or None when they cannot be read."""
-        if path not in self._pts:
-            self._pts[path] = frame_pts(path) or None
-        return self._pts[path]
-
-    def _window(self, pts, index):
-        """The timestamp span that belongs to frame `index` and to no other."""
-        low = (pts[index - 1] + pts[index]) / 2 if index > 0 else pts[index] - 1.0
-        high = (pts[index] + pts[index + 1]) / 2 if index + 1 < len(pts) else pts[index] + 1.0
-        return low, high
-
-    def _is_frame(self, cap, pts, index):
-        """Whether the frame just read off `cap` is the one `index` names."""
-        if pts is None or index >= len(pts):
-            return True
-        low, high = self._window(pts, index)
-        return low < cap.get(cv2.CAP_PROP_POS_MSEC) < high
-
-    def _grab_forward(self, cap, ahead, pts, index):
-        """Frame `index`, reached by reading on from where the capture stands.
-
-        None when it is not what came back, which leaves the caller to seek: an earlier
-        read may have been served a neighbouring frame, and counting on from there lands
-        every later frame one out.
-        """
-        for _ in range(ahead):
-            if not cap.grab():
-                return None
-        success, frame = cap.read()
-        return frame if success and self._is_frame(cap, pts, index) else None
-
-    def _seek_and_read(self, cap, pts, index):
-        """Frame `index`, reached by seeking, or None if it could not be read.
-
-        `CAP_PROP_POS_FRAMES` converts the index into a timestamp through the stream's
-        average frame rate, so a recording whose frames are not spaced at that rate --
-        anything variable-rate, or cut from a faster source -- lands on a neighbour,
-        while the capture still reports the index that was asked for. The frame is
-        identified by its own timestamp instead: read on when the seek falls short, and
-        seek further back when it overshoots.
-        """
-        if pts is None or index >= len(pts):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, index)
-            success, frame = cap.read()
-            return frame if success else None
-
-        low, high = self._window(pts, index)
-        for start in (index, max(index - SEEK_BACKOFF_FRAMES, 0), 0):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-            while True:
-                if not cap.grab():
-                    return None
-                now = cap.get(cv2.CAP_PROP_POS_MSEC)
-                if now > low:
-                    break
-            if now < high:
-                success, frame = cap.retrieve()
-                return frame if success else None
-        return None
+            self._reader_path = ref.path
+        return self._reader.read(ref.index)
 
     def close(self):
-        if self._cap is not None:
-            self._cap.release()
-        self._cap = None
-        self._cap_path = None
-        self._next_index = -1
+        if self._reader is not None:
+            self._reader.close()
+        self._reader = None
+        self._reader_path = None
 
     def __enter__(self):
         return self

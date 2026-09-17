@@ -14,7 +14,6 @@ import numpy as np
 import pytest
 
 from rocsync.benchmark.common import (
-    FORWARD_GRAB_LIMIT,
     FRAME_CACHE_SIZE,
     FrameRef,
     FrameSource,
@@ -22,6 +21,7 @@ from rocsync.benchmark.common import (
     count_video_frames,
     frame_key,
 )
+from rocsync.video_reader import FORWARD_GRAB_LIMIT
 
 N_FRAMES = 20
 FPS = 10

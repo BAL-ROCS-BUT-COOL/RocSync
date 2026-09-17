@@ -37,6 +37,7 @@ from rocsync.benchmark.common import (
 from rocsync.board_profiles import PROFILES_BY_ARUCO
 from rocsync.camera import CameraType
 from rocsync.timeline import source_frame_period_ms, summarize_timeline
+from rocsync.video_reader import VideoReader
 from rocsync.vision import process_frame
 
 
@@ -198,14 +199,6 @@ def run_benchmark(frames, ground_truth=None, debug_dir=None, try_hard=False):
     return results
 
 
-def _container_fps(path):
-    """Nominal frame rate the container reports."""
-    cap = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    cap.release()
-    return fps
-
-
 def _fit_record(rel_path, timestamps, frame_times, fps, frame_period_ms, timeline_windowed=False):
     """Fit one video's clock, returning its summary plus a per-frame table keyed like `images`.
 
@@ -276,8 +269,10 @@ def fit_videos(frames, results, data_dir, ground_truth=None):
         }
         decoded[rel_path] = timestamps
         clip_frame_times[rel_path] = frame_times
+        with VideoReader(path) as reader:
+            fps = reader.fps
         videos[rel_path] = _fit_record(
-            rel_path, timestamps, frame_times, _container_fps(path), source_frame_period_ms(path)
+            rel_path, timestamps, frame_times, fps, source_frame_period_ms(path)
         )
 
     for clip in retimed_videos(ground_truth or {}).values():
@@ -295,12 +290,14 @@ def fit_videos(frames, results, data_dir, ground_truth=None):
             if index + clip.frame_offset in source_pts
         }
         timestamps = {index + clip.frame_offset: ts for index, ts in decoded[clip.path].items()}
+        with VideoReader(source_path) as reader:
+            fps = reader.fps
         videos[clip.source] = {
             **_fit_record(
                 clip.source,
                 timestamps,
                 window,
-                _container_fps(source_path),
+                fps,
                 source_frame_period_ms(source_path),
                 timeline_windowed=True,
             ),

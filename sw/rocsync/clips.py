@@ -12,7 +12,7 @@ import numpy as np
 from tqdm import tqdm
 
 from rocsync.timecode import ms_to_timecode, timecode_to_ms, timecode_to_path_part
-from rocsync.timeline import frame_pts
+from rocsync.video_reader import VideoReader
 
 
 class Clip:
@@ -107,20 +107,6 @@ def select_frame_indices(
 # with the clip.
 MAX_FRAMES_IN_FLIGHT = 8
 
-SEEK_BACKOFF_FRAMES = 32  # retry margin for a seek that landed past the frame wanted
-
-
-def _grabbed_index(cap, timestamps, default):
-    """Index of the frame just grabbed, read off its own timestamp.
-
-    `default` stands in when there are no timestamps to compare against, which leaves
-    the seek trusted the way it always was.
-    """
-    if not timestamps:
-        return default
-    now = cap.get(cv2.CAP_PROP_POS_MSEC)
-    return min(range(len(timestamps)), key=lambda i: abs(timestamps[i] - now))
-
 
 def read_frames_at_indices(
     video_path: str,
@@ -132,82 +118,41 @@ def read_frames_at_indices(
     The indices are known up front and are non-decreasing. Reading them with a
     seek per frame makes the decoder discard its state and start again from the
     preceding keyframe, which costs far more than simply decoding every frame in
-    between once, so the file is walked linearly and each requested frame is
-    handed straight to its consumer. Neither the decode cost nor the memory
-    scales with how the clip was sampled.
+    between once, so the file is walked linearly from the first wanted frame, and
+    a frame nobody asked for is grabbed but never retrieved -- which skips
+    converting and copying it. Neither the decode cost nor the memory scales with
+    how the clip was sampled.
 
-    A repeated index yields the same
-    decoded frame again, so an output faster than the source repeats frames
-    rather than re-reading them. Frames are not copied -- consumers that keep a
-    frame beyond its iteration must copy it themselves.
-
-    Where the one seek lands is confirmed against the frame timestamps rather than
-    assumed: `CAP_PROP_POS_FRAMES` converts the index through the stream's average
-    frame rate, so a recording whose frames are not spaced at that rate -- anything
-    variable-rate, or cut from a faster source -- lands on a neighbour while still
-    reporting the index that was asked for, and every frame after it would then be
-    handed out under the wrong index.
+    A repeated index yields the same decoded frame again, so an output faster
+    than the source repeats frames rather than re-reading them. Frames are not
+    copied -- consumers that keep a frame beyond its iteration must copy it
+    themselves.
 
     Stops early and warns if the source runs out of frames.
     """
     if not frame_indices:
         return
 
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise OSError(f"Could not open video file: {video_path}")
+    reader = VideoReader(video_path)
+    wanted = set(frame_indices)
+    first = max(0, frame_indices[0])
 
+    pbar = tqdm(total=len(frame_indices), desc=desc)
     try:
-        # Skipping to the first requested frame is the one seek worth doing.
-        first = max(0, frame_indices[0])
-        starts = iter((first, max(first - SEEK_BACKOFF_FRAMES, 0), 0))
-        source_index = first
-        timestamps = []
-        if first > 0:
-            timestamps = frame_pts(video_path)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, next(starts))
-            source_index = None  # where the seek landed, resolved off the first grab
+        out_index = 0
+        for index, _pts_ms, frame in reader.frames(start=first, decode_if=wanted.__contains__):
+            if frame is None:
+                continue
+            while out_index < len(frame_indices) and frame_indices[out_index] <= index:
+                yield out_index, frame
+                out_index += 1
+                pbar.update(1)
 
-        pbar = tqdm(total=len(frame_indices), desc=desc)
-        try:
-            out_index = 0
-            while out_index < len(frame_indices):
-                if not cap.grab():
-                    print(
-                        f"Warning: {video_path} ended after "
-                        f"{out_index}/{len(frame_indices)} requested frames"
-                    )
-                    return
-
-                if source_index is None:
-                    source_index = _grabbed_index(cap, timestamps, first)
-                    if source_index > first:
-                        # Overshot: seek again from further back, or give up and scan
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, next(starts, 0))
-                        source_index = None
-                        continue
-
-                # Frames between two wanted ones are grabbed but never retrieved,
-                # which skips converting and copying them into an image. Sampling
-                # below the source frame rate skips most of the file this way.
-                if frame_indices[out_index] > source_index:
-                    source_index += 1
-                    continue
-
-                success, frame = cap.retrieve()
-                if not success:
-                    print(
-                        f"Warning: {video_path} ended after "
-                        f"{out_index}/{len(frame_indices)} requested frames"
-                    )
-                    return
-
-                while out_index < len(frame_indices) and frame_indices[out_index] <= source_index:
-                    yield out_index, frame
-                    out_index += 1
-                    pbar.update(1)
-                source_index += 1
-        finally:
-            pbar.close()
+        if out_index < len(frame_indices):
+            print(
+                f"Warning: {video_path} ended after "
+                f"{out_index}/{len(frame_indices)} requested frames"
+            )
     finally:
-        cap.release()
+        pbar.close()
+        reader.close()

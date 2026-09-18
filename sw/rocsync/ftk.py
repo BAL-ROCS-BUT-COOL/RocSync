@@ -187,6 +187,14 @@ def fit_ftk_timestamps(
     return statistics
 
 
+def _window_label(windows):
+    """The `--window` spans, formatted like `process_video_window`'s own label."""
+    return ", ".join(
+        f"[{start:.3f}s, " + ("end]" if math.isinf(end) else f"{end:.3f}s]")
+        for start, end in windows
+    )
+
+
 def _scan_extent(filename):
     """Line count plus the first and last ``ftk_timestamp`` in the file, in the one
     pass the progress bar's total already costs. The tracker writes in timestamp
@@ -251,7 +259,12 @@ def process_ftk_recording(
     n_constellation_decodes = 0
     n_rejects = {}
 
-    with open(filename) as file, tqdm(total=total_lines, desc="Processing lines") as pbar:
+    window_label = _window_label(windows)
+
+    def describe():
+        return f"Analyzing frames in time window {window_label} --> Found {len(timestamps)} timestamps"
+
+    with open(filename) as file, tqdm(total=total_lines, desc=describe(), position=1) as pbar:
         for ftk_timestamp, markers, fiducials in _iter_frames(file, pbar):
             # Window times run from the first frame: the tracker's clock origin is its
             # own boot, not the start of the recording.
@@ -318,6 +331,7 @@ def process_ftk_recording(
 
             if result.reject is None:
                 timestamps[ftk_timestamp] = (result.ring_start, result.ring_end)
+                pbar.set_description(describe())
             else:
                 n_rejects[result.reject] = n_rejects.get(result.reject, 0) + 1
 

@@ -26,6 +26,8 @@ class RecordingStatistics:
     # board_ms = clock_rate * source_ticks + clock_offset_ms
     clock_rate: float
     clock_offset_ms: float
+    clock_rate_stderr: float  # 1 sigma on clock_rate, in board ms per source tick
+    extrapolation_stderr_ms: float  # 3 sigma on board time at the ends of the fitted span
     source_tick_ms: float  # ms per source-clock tick; 1.0 for a container's own pts
 
     # Start and end
@@ -38,6 +40,8 @@ class RecordingStatistics:
     n_dropped_frames: int
     largest_gap_ms: float
     timeline_windowed: bool  # True if only part of the recording was analyzed
+    inlier_span_ms: float  # board-clock lever arm the rate was measured over
+    inlier_mid_ms: float  # board time the rate pivots about
 
     # Exposure
     mean_exposure_time: float
@@ -55,6 +59,11 @@ class RecordingStatistics:
         return d
 
 
+CLOCK_DRIFT_WARN_PPM = 1000  # 0.1%: a crystal is good to tens of ppm, a misdeclared fps is worse
+CLOCK_DRIFT_BAD_PPM = 50000  # 5%: not a clock at all any more
+RATE_STDERR_WARN_MS = 5.0  # extrapolated ends this uncertain are not worth reporting a rate for
+
+
 def warn_about_statistics(statistics: RecordingStatistics):
     """The sanity warnings every clock fit gets, regardless of source type."""
     if statistics.n_considered_frames < 0.8 * (
@@ -65,10 +74,25 @@ def warn_about_statistics(statistics: RecordingStatistics):
         )
         warnprint(f"WARNING: Estimated model has fewer than 80% inliers ({fraction:.2%}).")
 
-    drift = statistics.clock_rate / statistics.source_tick_ms
-    if abs(drift - 1) > 0.05:
+    if statistics.extrapolation_stderr_ms > RATE_STDERR_WARN_MS:
         warnprint(
-            f"WARNING: Source clock runs at {drift:.4f}x board time; expected approximately 1x."
+            f"WARNING: Clock rate is not reliably measurable: {statistics.n_considered_frames} "
+            f"inliers span only {statistics.inlier_span_ms / 1000:.3f} s of a "
+            f"{statistics.source_duration / 1000:.1f} s recording, leaving the fit uncertain by "
+            f"±{statistics.extrapolation_stderr_ms:.0f} ms at the ends of the analyzed span. "
+            "Widen --window or improve board visibility."
+        )
+
+    drift_ppm = (statistics.clock_rate / statistics.source_tick_ms - 1) * 1e6
+    if abs(drift_ppm) > CLOCK_DRIFT_BAD_PPM:
+        warnprint(
+            f"WARNING: Source clock runs {drift_ppm:+.0f} ppm off board time; "
+            "that is not drift, something is wrong with the fit."
+        )
+    elif abs(drift_ppm) > CLOCK_DRIFT_WARN_PPM:
+        warnprint(
+            f"WARNING: Source clock runs {drift_ppm:+.0f} ppm off board time; "
+            f"expected within {CLOCK_DRIFT_WARN_PPM} ppm."
         )
 
     if statistics.n_dropped_frames:
@@ -117,12 +141,26 @@ def print_statistics(statistics: RecordingStatistics):
             f"{nominal}/{statistics.measured_fps:.3f} fps",
         )
     )
-    print(
-        format_str.format(
-            "Clock rate (board/source):",
-            f"{statistics.clock_rate / statistics.source_tick_ms:.6f}x",
-        )
+    drift = statistics.clock_rate / statistics.source_tick_ms
+    drift_ppm = (drift - 1) * 1e6
+    printresult(
+        "Clock rate (board/source)",
+        f"{drift:.6f}x ({drift_ppm:+.0f} ppm)",
+        abs(drift_ppm) <= CLOCK_DRIFT_WARN_PPM,
     )
+    stderr_ppm = statistics.clock_rate_stderr / statistics.source_tick_ms * 1e6
+    printresult(
+        "Clock rate uncertainty (3σ at span ends)",
+        f"±{statistics.extrapolation_stderr_ms:.1f} ms (±{stderr_ppm:.0f} ppm)",
+        statistics.extrapolation_stderr_ms <= RATE_STDERR_WARN_MS,
+    )
+    if statistics.source_duration > 0:
+        printresult(
+            "Inlier span / analyzed span",
+            f"{statistics.inlier_span_ms / 1000:.1f}/{statistics.source_duration / 1000:.1f} s "
+            f"({statistics.inlier_span_ms / statistics.source_duration:.0%})",
+            statistics.inlier_span_ms / statistics.source_duration >= 0.5,
+        )
     scope = "analyzed window" if statistics.timeline_windowed else "source"
     print(
         format_str.format(

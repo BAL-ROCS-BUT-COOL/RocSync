@@ -209,10 +209,12 @@ def main():
                 print(f"Skipping {file}, already synced.")
                 continue
 
-        # -ss and -t are container time, so map the window through this video's fit
-        clock_rate, clock_offset_ms = affine_from_statistics(statistics)
+        # -ss is an input option in container time; -t is an output option, and with
+        # setpts the output clock is board time, so only the copy path rescales it
+        clock_rate, clock_offset_ms = clock_maps[file]
         cut_time = (origin_ms - clock_offset_ms) / clock_rate / 1000
-        duration = (end_ms - origin_ms) / clock_rate / 1000
+        span_ms = end_ms - origin_ms
+        duration = span_ms / 1000 if args.compensate_drift else span_ms / clock_rate / 1000
 
         # ffmpeg runs in the background, so throttle before starting another one
         while args.jobs and len(running) >= args.jobs:
@@ -255,13 +257,17 @@ def sync_video(
     compensate_drift: bool = True,
     use_nvenc: bool = False,
 ) -> subprocess.Popen:
-    """Cut `duration` seconds starting `cut_time` seconds into the video, both in
-    container time, rescaling by `clock_rate` if drift is compensated."""
-    if abs(clock_rate - 1) > 0.05:
+    """Cut starting `cut_time` seconds into the video, both in container time. With
+    drift compensation, `duration` is the board-time span to keep, since setpts makes
+    the output clock board time; otherwise it is container time like `cut_time`."""
+    drift_ppm = (clock_rate - 1) * 1e6
+    if abs(drift_ppm) > 50000:
         warnprint(
-            f"Video clock runs at {clock_rate:.4f}x board time; "
+            f"Video clock runs at {clock_rate:.4f}x board time ({drift_ppm:+.0f} ppm); "
             f"drift compensation will rescale it substantially."
         )
+    elif abs(drift_ppm) > 1000:
+        warnprint(f"Video clock runs at {drift_ppm:+.0f} ppm off board time.")
 
     ffmpeg_command = [
         "ffmpeg",
@@ -269,8 +275,6 @@ def sync_video(
         f"{cut_time:.6f}",
         "-i",
         video_path,
-        "-t",
-        f"{duration:.6f}",
     ]
 
     if compensate_drift:
@@ -283,11 +287,16 @@ def sync_video(
             f"setpts=PTS*{clock_rate}",
             "-r",
             str(frame_rate),
+            # -t only approximates the frame count to within a frame; pin it exactly
+            "-frames:v",
+            str(round(duration * frame_rate)),
         ]
     else:
         ffmpeg_command += [
             "-c:v",
             "copy",
+            "-t",
+            f"{duration:.6f}",
         ]
     ffmpeg_command += [
         "-y",

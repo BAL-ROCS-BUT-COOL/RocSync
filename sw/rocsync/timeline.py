@@ -42,6 +42,10 @@ class TimelineFit:
     residual_threshold: float
     source_time_min: float  # smallest source-clock value offered to the fit
     source_time_max: float  # largest source-clock value offered to the fit
+    clock_rate_stderr: float  # 1 sigma on clock_rate, in board ms per source tick
+    extrapolation_stderr_ms: float  # 3 sigma on predicted board time at the fitted span's ends
+    inlier_source_span: float  # source ticks between the first and last inlier
+    inlier_source_mid: float  # mean inlier source tick; the rate pivots about it
 
     def predict(self, pts_ms):
         """Board time in ms for one or many container timestamps in ms."""
@@ -52,6 +56,8 @@ class TimelineFit:
         return {
             "clock_rate": self.clock_rate,
             "clock_offset_ms": self.clock_offset_ms,
+            "clock_rate_stderr": self.clock_rate_stderr,
+            "extrapolation_stderr_ms": self.extrapolation_stderr_ms,
             "r2_before": self.r2_before,
             "rmse_before": self.rmse_before,
             "r2_after": self.r2_after,
@@ -112,6 +118,14 @@ def detect_dropouts(pts, period):
 MEASURED_RESIDUAL_FRACTION = 1 / 3  # of a source frame
 MEASURED_RESIDUAL_MIN_MS = 2.0  # never tighter than the board itself resolves
 MEASURED_RESIDUAL_MAX_MS = 50.0  # below the ring period, so a counter step still shows
+
+# A slope is only as trustworthy as the lever arm it was measured over: a handful of
+# frames clustered in a second of a much longer recording fits a rate to within
+# thousands of ppm, which r2 cannot see -- it is scale-free and reads high on any tight
+# cluster regardless of how far that cluster is from spanning the recording.
+RATE_STDERR_COVERAGE = 3.0  # report 3 sigma, not 1
+RATE_STDERR_MIN_SIGMA_MS = 1.0  # the board resolves no finer, so no fit is tighter
+RATE_MIN_INLIERS = 3  # two points fit a line exactly and say nothing about its noise
 
 
 def measured_residual_threshold_ms(frame_period_ms):
@@ -190,6 +204,27 @@ def fit_timeline(
 
     inlier_mask = model.inlier_mask_
     inlier_x, inlier_y = x[inlier_mask], y[inlier_mask]
+    rmse_after = root_mean_squared_error(inlier_y, model.predict(inlier_x))
+
+    # How much the fit could actually pin down, from the lever arm the inliers gave it
+    n_inliers = int(np.sum(inlier_mask))
+    flat_x = inlier_x.reshape(-1)
+    mean_x = float(flat_x.mean()) if n_inliers else 0.0
+    inlier_source_span = float(flat_x.max() - flat_x.min()) if n_inliers else 0.0
+    sxx = float(np.sum((flat_x - mean_x) ** 2))
+    if n_inliers < RATE_MIN_INLIERS or sxx <= 0:
+        clock_rate_stderr = extrapolation_stderr_ms = float("inf")
+    else:
+        sigma = max(rmse_after * np.sqrt(n_inliers / (n_inliers - 2)), RATE_STDERR_MIN_SIGMA_MS)
+        clock_rate_stderr = sigma / np.sqrt(sxx)
+
+        def se_at(x0):
+            return sigma * np.sqrt(1 / n_inliers + (x0 - mean_x) ** 2 / sxx)
+
+        extrapolation_stderr_ms = RATE_STDERR_COVERAGE * max(
+            se_at(source_time_min), se_at(source_time_max)
+        )
+
     return TimelineFit(
         clock_rate=clock_rate,
         clock_offset_ms=clock_offset_ms,
@@ -198,10 +233,14 @@ def fit_timeline(
         r2_before=model.score(x, y),
         rmse_before=root_mean_squared_error(y, model.predict(x)),
         r2_after=model.score(inlier_x, inlier_y),
-        rmse_after=root_mean_squared_error(inlier_y, model.predict(inlier_x)),
+        rmse_after=rmse_after,
         residual_threshold=threshold,
         source_time_min=source_time_min,
         source_time_max=source_time_max,
+        clock_rate_stderr=float(clock_rate_stderr),
+        extrapolation_stderr_ms=float(extrapolation_stderr_ms),
+        inlier_source_span=inlier_source_span,
+        inlier_source_mid=mean_x,
     )
 
 
@@ -321,6 +360,8 @@ def summarize_timeline(
         largest_gap_ms=largest_gap_ticks * source_tick_ms,
         timeline_windowed=timeline_windowed,
         source_tick_ms=source_tick_ms,
+        inlier_span_ms=fit.inlier_source_span * source_tick_ms,
+        inlier_mid_ms=fit.inlier_source_mid * source_tick_ms,
         mean_exposure_time=float(np.mean(exposure_times)),
         min_exposure_time=float(np.min(exposure_times)),
         max_exposure_time=float(np.max(exposure_times)),

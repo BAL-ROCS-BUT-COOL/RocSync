@@ -70,11 +70,20 @@ def main():
         default=4,
         help="Maximum number of ffmpeg processes to run concurrently, or 0 for no limit (default: 4)",
     )
+    parser.add_argument(
+        "--assume-no-drift",
+        action="store_true",
+        help="For videos whose clock rate could not be reliably measured, fall back to an "
+        "offset-only map instead of refusing to align them. Implies stream copy; "
+        "incompatible with --compensate-drift.",
+    )
 
     args = parser.parse_args()
 
     if args.jobs < 0:
         parser.error("--jobs must be 0 (unlimited) or a positive number")
+    if args.assume_no_drift and args.compensate_drift:
+        parser.error("--assume-no-drift and --compensate-drift cannot be combined")
 
     with open(args.sync_file) as file:
         stats = json.load(file)
@@ -96,6 +105,48 @@ def main():
         round(next(iter(videos.values()))["nominal_fps"]) if args.fps is None else args.fps
     )
     print(f"Syncing {len(videos)} videos to {nominal_fps} FPS")
+
+    # A clock rate this uncertain would misplace the output by more than a frame
+    max_extrapolation_ms = 1000 / nominal_fps
+
+    # Refuse before starting any ffmpeg, or fall back to an offset-only map per file
+    clock_maps = {}
+    failed_conditioning = []
+    for file, statistics in videos.items():
+        clock_rate, clock_offset_ms = affine_from_statistics(statistics)
+        extrapolation_stderr_ms = statistics.get("extrapolation_stderr_ms")
+        if extrapolation_stderr_ms is None:
+            warnprint(
+                f"{file}: sync entry predates clock-rate conditioning checks; "
+                "re-run rocsync to verify its clock rate is measurable."
+            )
+        elif extrapolation_stderr_ms > max_extrapolation_ms:
+            if not args.assume_no_drift:
+                failed_conditioning.append((file, extrapolation_stderr_ms))
+                continue
+            # Pivot the map about the inlier centroid instead of trusting the slope
+            source_tick_ms = statistics.get("source_tick_ms", 1.0)
+            inlier_mid_ms = statistics.get("inlier_mid_ms")
+            warnprint(
+                f"{file}: clock rate not reliably measurable "
+                f"(±{extrapolation_stderr_ms:.0f} ms); using an offset-only map."
+            )
+            if inlier_mid_ms is None:
+                errprint(f"{file}: --assume-no-drift needs inlier_mid_ms; re-run rocsync.")
+                return 1
+            clock_offset_ms += (clock_rate - source_tick_ms) * inlier_mid_ms
+            clock_rate = source_tick_ms
+        clock_maps[file] = (clock_rate, clock_offset_ms)
+
+    if failed_conditioning:
+        for file, extrapolation_stderr_ms in failed_conditioning:
+            errprint(
+                f"{file}: clock rate is not reliably measurable "
+                f"(±{extrapolation_stderr_ms:.0f} ms at the ends of the analyzed span, "
+                f"tolerance is ±{max_extrapolation_ms:.1f} ms). Widen --window, improve "
+                "board visibility, or pass --assume-no-drift to align on offset alone."
+            )
+        return 1
 
     use_nvenc = args.compensate_drift and hevc_nvenc_available()
     if args.compensate_drift and not use_nvenc:

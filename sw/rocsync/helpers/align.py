@@ -190,7 +190,7 @@ def main():
     running: list[tuple[str, subprocess.Popen]] = []
     failed: list[str] = []
     started = 0
-    for file, statistics in videos.items():
+    for file, (clock_rate, clock_offset_ms) in clock_maps.items():
         # Check if the output file already exists
         video_name, _ = os.path.splitext(os.path.basename(file))
         video_folder = os.path.dirname(file)
@@ -210,7 +210,6 @@ def main():
                 continue
 
         # -ss and -t are container time, so map the window through this video's fit
-        clock_rate, clock_offset_ms = affine_from_statistics(statistics)
         cut_time = (origin_ms - clock_offset_ms) / clock_rate / 1000
         duration = (end_ms - origin_ms) / clock_rate / 1000
 
@@ -257,11 +256,14 @@ def sync_video(
 ) -> subprocess.Popen:
     """Cut `duration` seconds starting `cut_time` seconds into the video, both in
     container time, rescaling by `clock_rate` if drift is compensated."""
-    if abs(clock_rate - 1) > 0.05:
+    drift_ppm = (clock_rate - 1) * 1e6
+    if abs(drift_ppm) > 50000:
         warnprint(
-            f"Video clock runs at {clock_rate:.4f}x board time; "
+            f"Video clock runs at {clock_rate:.4f}x board time ({drift_ppm:+.0f} ppm); "
             f"drift compensation will rescale it substantially."
         )
+    elif abs(drift_ppm) > 1000:
+        warnprint(f"Video clock runs at {drift_ppm:+.0f} ppm off board time.")
 
     ffmpeg_command = [
         "ffmpeg",

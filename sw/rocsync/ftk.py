@@ -1,14 +1,20 @@
 """Read an Atracsys FusionTrack CSV recording and fit its board timeline.
 
+Each frame is decoded from its fiducials by ``rocsync.fiducials.decode_fiducials``: first
+on the plane of a registered board marker, if the frame has one, then on the corner-LED
+constellation if that fails.
+
 matplotlib, tqdm and ``rocsync.timeline`` are imported where they are used, so importing
 this module stays light.
 """
 
+from collections.abc import Mapping
+
 import numpy as np
 
-from rocsync.board_profiles import PROFILES_BY_FTK
-from rocsync.fiducial_decode import process_frame
-from rocsync.printer import errprint
+from rocsync.board_profiles import ALL_PROFILES, BoardProfile
+from rocsync.fiducials import MAX_FIDUCIALS, decode_fiducials, plane_from_rotation
+from rocsync.printer import errprint, print, warnprint
 
 FIT_RESIDUAL_THRESHOLD_MS = 10  # RANSAC inlier band; the tracker is not frame-periodic
 
@@ -42,6 +48,61 @@ fiducial_format = [
     "z_position",
     "triangulation_error",
 ]
+
+
+def _iter_frames(file, pbar):
+    """Group a FusionTrack CSV into frames: ``(ftk_timestamp, markers, fiducials)``.
+
+    The tracker writes one record per detected object per acquisition, in timestamp
+    order, so a group is flushed as soon as the timestamp changes.
+    """
+    seen = set()
+    ts, markers, fiducials = None, [], []
+    while True:
+        line = file.readline()
+        if not line:
+            break
+        pbar.update(1)
+        fields = [f.strip() for f in line.strip().split(",")]
+        if len(fields) < 3:
+            continue
+
+        if fields[2] == "m" and len(fields) >= len(marker_format):
+            record = dict(zip(marker_format, fields[: len(marker_format)], strict=True))
+        elif fields[2] == "f" and len(fields) >= len(fiducial_format):
+            record = dict(zip(fiducial_format, fields[: len(fiducial_format)], strict=True))
+        else:
+            continue
+
+        record_ts = int(record["ftk_timestamp"])
+        if record_ts != ts:
+            if ts is not None:
+                yield ts, markers, fiducials
+            if record_ts in seen:
+                warnprint(f"Non-contiguous ftk_timestamp {record_ts}; frame may be split")
+            seen.add(record_ts)
+            ts, markers, fiducials = record_ts, [], []
+
+        (markers if fields[2] == "m" else fiducials).append(record)
+
+    if ts is not None:
+        yield ts, markers, fiducials
+
+
+def _frame_plane(marker):
+    """The board plane from a registered marker's own reported position and rotation."""
+    position = np.array(
+        [float(marker["x_position"]), float(marker["y_position"]), float(marker["z_position"])]
+    )
+    rotation = np.array(
+        [
+            [marker["r00"], marker["r01"], marker["r02"]],
+            [marker["r10"], marker["r11"], marker["r12"]],
+            [marker["r20"], marker["r21"], marker["r22"]],
+        ],
+        dtype=float,
+    )
+    return plane_from_rotation(position, rotation)
 
 
 def plot_timechart(x, y, x_range, y_pred, debug_dir):
@@ -109,145 +170,131 @@ def fit_ftk_timestamps(
     return results
 
 
-def process_ftk_recording(filename: str, debug_dir=None) -> dict | None:
+def process_ftk_recording(
+    filename: str,
+    debug_dir=None,
+    board: BoardProfile | None = None,
+    max_fiducials: int = MAX_FIDUCIALS,
+    marker_ids: Mapping[int, BoardProfile] | None = None,
+) -> dict | None:
+    """Fit a board timeline from a FusionTrack CSV recording.
+
+    ``marker_ids`` maps registered marker ids to the board they track, defaulting to each
+    profile's ``ftk_marker_id``. A frame with such a marker is decoded as that board;
+    any other frame as ``board``, or skipped if ``board`` is None.
+    """
     from tqdm import tqdm
+
+    if marker_ids is None:
+        marker_ids = {p.ftk_marker_id: p for p in ALL_PROFILES}
 
     with open(filename) as file:
         total_lines = sum(1 for _ in file)
 
     timestamps = {}
     frame_times = {}
+    n_marker_frames = 0
+    n_pose_decodes = 0
+    n_constellation_decodes = 0
+    n_rejects = {}
+
     with open(filename) as file, tqdm(total=total_lines, desc="Processing lines") as pbar:
-        while True:
-            line = file.readline()
-            if not line:
-                break
-            pbar.update(1)
-            fields = line.strip().split(",")
+        for ftk_timestamp, markers, fiducials in _iter_frames(file, pbar):
+            # Every reported frame counts towards the frame count and dropouts
+            frame_times[ftk_timestamp] = ftk_timestamp
 
-            # Find frame with detected marker
-            if len(fields) >= len(marker_format) and fields[2] == "m":
-                marker = dict(zip(marker_format, fields[: len(marker_format)], strict=True))
+            registered = next((m for m in markers if int(m["marker_id"]) in marker_ids), None)
+            if registered is not None:
+                n_marker_frames += 1
+                frame_board = marker_ids[int(registered["marker_id"])]
+            else:
+                frame_board = board
+            if frame_board is None:
+                continue
 
-                # Get board profile for the PCB associated with this marker
-                board = PROFILES_BY_FTK.get(int(marker["marker_id"]))
-                if board is None:
-                    continue
+            points_3d = np.array(
+                [
+                    [float(f["x_position"]), float(f["y_position"]), float(f["z_position"])]
+                    for f in fiducials
+                ]
+            )
 
-                # Record every frame the tracker reported for this board,
-                # whether or not the counter/ring below decodes: the frame
-                # count and any dropouts are measured off this map.
-                ftk_timestamp = int(marker["ftk_timestamp"])
-                frame_times[ftk_timestamp] = ftk_timestamp
+            ax = None
+            fig = None
+            if debug_dir is not None and len(points_3d) >= 4:
+                import matplotlib.pyplot as plt
 
-                # Read and collect all related fiducials (type "f") immediately after this marker
-                fiducials = []
-                current_pos = file.tell()
-                while True:
-                    fid_line = file.readline()
-                    if not fid_line:
-                        break
-                    fid_fields = fid_line.strip().split(",")
-                    if (
-                        len(fid_fields) < len(fiducial_format)
-                        or fid_fields[2] != "f"
-                        or fid_fields[1] != marker["ftk_timestamp"]
-                    ):
-                        # Not a fiducial or not part of the marker; stop collecting and restore cursor
-                        file.seek(current_pos)
-                        break
+                fig, ax = plt.subplots(figsize=(6, 6))
+                ax.invert_yaxis()
+                ax.grid(True)
+                ax.set_aspect("equal")
 
-                    pbar.update(1)
-                    fiducial = dict(
-                        zip(fiducial_format, fid_fields[: len(fiducial_format)], strict=True)
-                    )
-                    fiducials.append(fiducial)
-                    current_pos = file.tell()
-
-                position = np.array(
-                    [
-                        float(marker["x_position"]),
-                        float(marker["y_position"]),
-                        float(marker["z_position"]),
-                        1.0,
-                    ]
+            result = None
+            source = "pose"
+            if registered is not None:
+                plane = _frame_plane(registered)
+                result = decode_fiducials(
+                    points_3d, frame_board, plane, max_fiducials=max_fiducials, ax=ax
                 )
+                if result.reject is None:
+                    n_pose_decodes += 1
 
-                # Make sure z-axis is pointing towards the camera
-                if float(marker["r22"]) < 0:
-                    rotation_matrix = np.array(
-                        [
-                            [
-                                float(marker["r01"]),
-                                float(marker["r00"]),
-                                float(marker["r02"]),
-                                0.0,
-                            ],
-                            [
-                                float(marker["r11"]),
-                                float(marker["r10"]),
-                                float(marker["r12"]),
-                                0.0,
-                            ],
-                            [
-                                float(marker["r21"]),
-                                float(marker["r20"]),
-                                float(marker["r22"]),
-                                0.0,
-                            ],
-                            [0.0, 0.0, 0.0, 1.0],
-                        ]
-                    )
-                else:
-                    rotation_matrix = np.array(
-                        [
-                            [
-                                float(marker["r00"]),
-                                float(marker["r01"]),
-                                float(marker["r02"]),
-                                0.0,
-                            ],
-                            [
-                                float(marker["r10"]),
-                                float(marker["r11"]),
-                                float(marker["r12"]),
-                                0.0,
-                            ],
-                            [
-                                float(marker["r20"]),
-                                float(marker["r21"]),
-                                float(marker["r22"]),
-                                0.0,
-                            ],
-                            [0.0, 0.0, 0.0, 1.0],
-                        ]
-                    )
+            # A pose reject falls through to the constellation search
+            if result is None or result.reject is not None:
+                source = "constellation"
+                result = decode_fiducials(
+                    points_3d, frame_board, None, max_fiducials=max_fiducials, ax=ax
+                )
+                if result.reject is None:
+                    n_constellation_decodes += 1
 
-                # Plot debug info if enabled
-                if debug_dir is not None:
-                    import matplotlib.pyplot as plt
+            if fig is not None:
+                ax.set_title(f"{frame_board.name} {result.reject or source}")
+                fig.savefig(f"{debug_dir}/{ftk_timestamp}.png", bbox_inches="tight")
+                plt.close(fig)
 
-                    fig, ax = plt.subplots(figsize=(6, 6))
-                    ax.set_title("Detected Fiducials")
-                    ax.invert_yaxis()
-                    ax.grid(True)
-                    ax.set_aspect("equal")
+            if result.reject is None:
+                timestamps[ftk_timestamp] = (result.ring_start, result.ring_end)
+            else:
+                n_rejects[result.reject] = n_rejects.get(result.reject, 0) + 1
 
-                    result = process_frame(position, rotation_matrix, fiducials, board, ax)
-                    # if result is not None and result[0] > 100:
-                    fig.savefig(
-                        f"{debug_dir}/{marker['ftk_timestamp']}.png",
-                        bbox_inches="tight",
-                    )
-                    plt.close(fig)
-                else:
-                    result = process_frame(position, rotation_matrix, fiducials, board)
+    stats = {
+        "n_marker_frames": n_marker_frames,
+        "n_decoded": len(timestamps),
+        "n_pose_decodes": n_pose_decodes,
+        "n_constellation_decodes": n_constellation_decodes,
+        "n_rejects": n_rejects,
+    }
+    if board is not None:
+        stats["board_version"] = board.name
 
-                if result is not None:
-                    timestamps[int(marker["ftk_timestamp"])] = result
     if len(timestamps) > 0:
         try:
-            return fit_ftk_timestamps(timestamps, frame_times, debug_dir)
+            results = fit_ftk_timestamps(timestamps, frame_times, debug_dir)
         except ValueError as e:
             errprint(f"Error: Unable to fit the FTK timeline: {e}")
+            _print_decode_stats(stats)
+            return None
+
+        _print_decode_stats(stats)
+        return {**results, **stats}
+
+    if board is None and n_marker_frames == 0:
+        errprint(
+            "Error: no registered geometry found in this recording; "
+            "pass --board-version to decode from raw fiducials"
+        )
+    else:
+        errprint("Error: no frame in this recording decoded a timestamp.")
+    _print_decode_stats(stats)
     return None
+
+
+def _print_decode_stats(stats: dict):
+    """Print how many frames decoded, from which plane, and why the others were rejected."""
+    print(
+        f"Marker frames: {stats['n_marker_frames']}, decoded: {stats['n_decoded']} "
+        f"(pose: {stats['n_pose_decodes']}, constellation: {stats['n_constellation_decodes']})"
+    )
+    for reason, count in stats["n_rejects"].items():
+        print(f"  Rejected {count} frame(s): {reason}")

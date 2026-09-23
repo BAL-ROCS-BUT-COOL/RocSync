@@ -2,7 +2,7 @@
 ## What did we observe? 
 During an experiment with Peter Zhang we wanted to check the quality of the timesyncing between two sensors, namely the Atracsys fusionTrack 500 and Luxonis OAK-D Pro W. I had been implementing timesyncing between the datahub clock and the fusiontrack clock using the NICs of the datahubs and the PTP protocol, see relevant file in the documentation.
 
-We used the [RocSync](https://github.com/BAL-ROCS-BUT-COOL/RocSync/tree/main) in order to compare the timestamps we got from both cameras. It allows to assign a frame to within 1ms accuracy if the RocSync board is detected on said frame. We noticed an interesting pattern when plotting the timestamps we got from the RocSync compared to the timestamps that "our own timesyncing", namely ROS2/PTP were giving us. The latter should in theory be accurate up to microsecond levels. The pattern can be seen below:
+We used RocSync revision 1 to compare the timestamps we got from both cameras. It allows to assign a frame to within 1ms accuracy if the RocSync board is detected on said frame. We noticed an interesting pattern when plotting the timestamps we got from the RocSync compared to the timestamps that "our own timesyncing", namely ROS2/PTP were giving us. The latter should in theory be accurate up to microsecond levels. The pattern can be seen below:
 
 ![Timestamp Comparison Pattern](timestamp_comparisons_rocsync_fusiontrack.png)
 

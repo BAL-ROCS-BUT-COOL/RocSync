@@ -158,10 +158,11 @@ def main():
                 print(f"Skipping {file}, already synced.")
                 continue
 
-        # -ss and -t are container time, so map the window through this video's fit
+        # -ss is container time; the output span is board time once setpts rescales it
         clock_rate, clock_offset_ms = affine_from_statistics(statistics)
         cut_time = (origin_ms - clock_offset_ms) / clock_rate / 1000
-        duration = (end_ms - origin_ms) / clock_rate / 1000
+        span_ms = end_ms - origin_ms
+        duration = span_ms / 1000 if args.compensate_drift else span_ms / clock_rate / 1000
 
         # ffmpeg runs in the background, so throttle before starting another one
         while args.jobs and len(running) >= args.jobs:
@@ -204,8 +205,9 @@ def sync_video(
     compensate_drift: bool = True,
     use_nvenc: bool = False,
 ) -> subprocess.Popen:
-    """Cut `duration` seconds starting `cut_time` seconds into the video, both in
-    container time, rescaling by `clock_rate` if drift is compensated."""
+    """Cut starting `cut_time` seconds into the video, both in container time. With
+    drift compensation, `duration` is the board-time span to keep, since setpts makes
+    the output clock board time; otherwise it is container time like `cut_time`."""
     if abs(clock_rate - 1) > 0.05:
         warnprint(
             f"Video clock runs at {clock_rate:.4f}x board time; "
@@ -218,8 +220,6 @@ def sync_video(
         f"{cut_time:.6f}",
         "-i",
         video_path,
-        "-t",
-        f"{duration:.6f}",
     ]
 
     if compensate_drift:
@@ -232,11 +232,16 @@ def sync_video(
             f"setpts=PTS*{clock_rate}",
             "-r",
             str(frame_rate),
+            # -t only approximates the frame count to within a frame; pin it exactly
+            "-frames:v",
+            str(round(duration * frame_rate)),
         ]
     else:
         ffmpeg_command += [
             "-c:v",
             "copy",
+            "-t",
+            f"{duration:.6f}",
         ]
     ffmpeg_command += [
         "-y",

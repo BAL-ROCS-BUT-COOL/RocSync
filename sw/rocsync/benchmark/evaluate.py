@@ -11,11 +11,9 @@ visible flags, not from a global status field.
 """
 
 import argparse
-import json
 import os
 import sys
 from collections import Counter
-from pathlib import Path
 
 import cv2
 import numpy as np
@@ -26,13 +24,16 @@ from rocsync.benchmark.common import (
     annotation_camera,
     confusion_metrics,
     descriptive_stats,
+    group_keys_by_path,
+    load_ground_truth,
+    load_result_files,
     parse_frame_key,
     reconstruct_timestamp,
     rectification_errors,
     residual_threshold_ms,
+    resolve_retimed_keys,
     retimed_videos,
     ring_visible,
-    source_key,
 )
 from rocsync.board_profiles import BOARD_V1, PROFILES_BY_ARUCO
 
@@ -68,29 +69,6 @@ STEP_PRED_POSITIVE = {
 }
 
 
-def load_benchmarks(paths):
-    """Load benchmark JSON files, keyed by stem name.
-
-    If *paths* is a single directory, loads all .json files from it.
-    Otherwise, each element is treated as a filepath to a .json file.
-    """
-    benchmarks = {}
-    if len(paths) == 1 and Path(paths[0]).is_dir():
-        files = sorted(Path(paths[0]).glob("*.json"))
-    else:
-        files = [Path(p) for p in paths]
-    for path in files:
-        with open(path) as f:
-            benchmarks[path.stem] = json.load(f)
-    return benchmarks
-
-
-def load_ground_truth(path):
-    """Load ground truth JSON file."""
-    with open(path) as f:
-        return json.load(f)
-
-
 def coverage_report(gt_images, benchmarks):
     """Which ground truth frames each column scores, and where the columns disagree.
 
@@ -107,36 +85,8 @@ def coverage_report(gt_images, benchmarks):
 
 def describe_keys(keys, indent="    "):
     """One line per input file behind a set of frame keys, with how many it contributes."""
-    counts = Counter(parse_frame_key(key)[0] for key in keys)
+    counts = {path: len(group) for path, group in group_keys_by_path(keys).items()}
     return "\n".join(f"{indent}{path}: {n} frame(s)" for path, n in sorted(counts.items()))
-
-
-def resolve_retimed_keys(benchmark, retimed):
-    """Move a run's per-frame predictions onto the keys the annotations use.
-
-    A retimed clip carries no annotations of its own, so a prediction about its frame
-    j is a prediction about frame j + offset of the recording it was cut from. Doing
-    this once at load leaves every per-frame metric comparing keys as it always has.
-    Each video's own `frames` table is remapped the same way; a table already keyed by
-    annotation keys, like a derived recording's, passes through unchanged.
-    """
-    if not retimed:
-        return benchmark
-    images = {source_key(key, retimed): value for key, value in benchmark["images"].items()}
-    result = {**benchmark, "images": images}
-    if benchmark.get("videos"):
-        result["videos"] = {
-            path: {
-                **record,
-                "frames": {
-                    source_key(key, retimed): frame for key, frame in record["frames"].items()
-                },
-            }
-            if "frames" in record
-            else record
-            for path, record in benchmark["videos"].items()
-        }
-    return result
 
 
 # ── Geometry helpers ─────────────────────────────────────────────────────────
@@ -1272,7 +1222,7 @@ def main():
     gt = load_ground_truth(args.ground_truth)
     gt_images = gt["images"]
 
-    benchmarks = load_benchmarks(args.paths)
+    benchmarks = load_result_files(args.paths)
     if not benchmarks:
         print("No benchmark .json files found", file=sys.stderr)
         sys.exit(1)

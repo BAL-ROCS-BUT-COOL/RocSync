@@ -175,7 +175,7 @@ def run_benchmark(frames, ground_truth=None, debug_dir=None, try_hard=False):
             profile = PROFILES_BY_ARUCO.get(aruco_id)
 
             stats = {}
-            success, timestamp = process_frame(
+            decode = process_frame(
                 image,
                 camera,
                 i,
@@ -191,7 +191,7 @@ def run_benchmark(frames, ground_truth=None, debug_dir=None, try_hard=False):
 
             results[ref.key] = {
                 **result,
-                "success": success and timestamp is not None,
+                "success": decode.reject is None,
                 "timing": timing,
             }
 

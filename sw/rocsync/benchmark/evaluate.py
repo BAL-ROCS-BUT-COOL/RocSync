@@ -538,8 +538,7 @@ def compute_clock_metrics(benchmark, gt) -> dict[str, dict]:
         def predict(pts, rate=rate, offset=offset):
             return rate * pts + offset
 
-        first = predict(ref.pts_min_ms) - float(ref.predict(ref.pts_min_ms))
-        last = predict(ref.pts_max_ms) - float(ref.predict(ref.pts_max_ms))
+        first, last = ref.span_errors(rate, offset)
 
         # Per-frame accuracy against the annotations themselves, and whether the fit's
         # own outlier rejection agrees with them

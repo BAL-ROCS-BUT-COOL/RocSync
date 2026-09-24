@@ -112,7 +112,11 @@ def process_video_window(
     exact = window_start > 0 or math.isfinite(window_end)
     if exact:
         start_index = reader.index_at(window_start_ms)
-        stop_index = reader.index_at(window_end_ms, side="right") if math.isfinite(window_end) else len(reader)
+        stop_index = (
+            reader.index_at(window_end_ms, side="right")
+            if math.isfinite(window_end)
+            else len(reader)
+        )
         expected_frames = max(0, stop_index - start_index)
     else:
         start_index, stop_index = 0, None
@@ -227,6 +231,8 @@ def process_video(
         timestamps.update(window_timestamps)
         frame_times.update(window_times)
         window_frame_times.append(window_times)
+    # A windowed run still judges the clock fit at the file's first and last frame
+    source_extent = (reader.pts[0], reader.pts[-1]) if timeline_windowed and reader.pts else None
     reader.close()
 
     # Fit board time against the frames' own presentation timestamps, both in ms
@@ -239,6 +245,7 @@ def process_video(
             window_frame_times=window_frame_times,
             timeline_windowed=timeline_windowed,
             frame_period_ms=frame_period_ms,
+            source_extent=source_extent,
         )
     except ValueError as e:
         errprint(f"Error: {e}")

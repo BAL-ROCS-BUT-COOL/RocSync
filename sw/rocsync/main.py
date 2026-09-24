@@ -313,8 +313,9 @@ def main():
             errprint(f"\nError: Unable to time-sync {file}.")
 
         # Save result to file after every video to avoid data loss
-        with output_path.open("w") as f:
-            json.dump(result, f, indent=4, cls=NpEncoder)
+        # Serialized before opening, so a non-finite value can't truncate earlier results
+        text = json.dumps(result, indent=4, cls=NpEncoder, allow_nan=False)
+        output_path.write_text(text)
         print(f"\nResult written to {args.output}")
 
 

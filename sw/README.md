@@ -75,6 +75,9 @@ rocsync -c ir --board-version v2 ir_recording.mp4
 
 Run `rocsync -h` for the authoritative list.
 
+Results for the inputs that could be time-synced are written either way; the exit status is
+non-zero if any input could not be, so a script can tell.
+
 
 ## Example
 ```

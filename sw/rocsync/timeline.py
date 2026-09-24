@@ -447,15 +447,21 @@ def frame_pts(video_path):
     output = run_ffprobe(
         video_path,
         "-show_entries",
-        "stream=time_base,start_pts:packet=pts",
+        "stream=time_base,start_pts:packet=pts,flags",
         "-of",
         "default=noprint_wrappers=1",
     )
     ticks, stream = [], {}
+    pts = None  # a packet's pts, held until its flags say whether it is shown
     for line in (output or "").splitlines():
         name, _, value = line.partition("=")
-        if name == "pts" and _is_float(value):
-            ticks.append(float(value))
+        if name == "pts":
+            pts = float(value) if _is_float(value) else None
+        elif name == "flags":
+            # 'D' marks a packet an edit list cuts away: decoded, but never displayed
+            if pts is not None and "D" not in value:
+                ticks.append(pts)
+            pts = None
         elif value and value != "N/A":
             stream[name] = value
 

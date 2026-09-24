@@ -137,7 +137,7 @@ def describe(path, extra_spans=(), try_hard=False):
             "clock_rate": entry["clock_rate"],
             "clock_offset_ms": entry["clock_offset_ms"],
             "tolerance_ms": max(
-                statistics.median_frame_period / 2, statistics.extrapolation_stderr_ms
+                statistics.median_frame_period / 2, entry["extrapolation_stderr_ms"] or 0.0
             ),
         }
     return described

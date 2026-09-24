@@ -70,8 +70,10 @@ def run_arguments(ground_truth, data_dir, rel_path):
     camera = cameras.most_common(1)[0][0] if cameras else CameraType.RGB
     if camera == CameraType.INFRARED:
         boards = Counter(entry.get("aruco", {}).get("id") for entry in entries)
-        profile = PROFILES_BY_ARUCO[boards.most_common(1)[0][0]]
-        return ("-c", camera.value, "--board-version", profile.name)
+        board_id = boards.most_common(1)[0][0]
+        if board_id not in PROFILES_BY_ARUCO:
+            pytest.fail(f"{rel_path}: no board profile for annotated aruco id {board_id!r}")
+        return ("-c", camera.value, "--board-version", PROFILES_BY_ARUCO[board_id].name)
 
     # RGB identifies the board from its marker, but only reads one held close enough
     areas = [a for a in map(marker_area, entries) if a is not None]

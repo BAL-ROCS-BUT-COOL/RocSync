@@ -135,6 +135,7 @@ def fit_ftk_timestamps(
     debug_dir=None,
     window_frame_times: list[dict[int, int]] | None = None,
     timeline_windowed: bool = False,
+    source_extent: tuple[int, int] | None = None,
 ):
     """Fit board time against the tracker's own clock and describe the result.
 
@@ -145,7 +146,8 @@ def fit_ftk_timestamps(
     is. Raises ValueError when the timeline cannot be fitted.
 
     `window_frame_times`/`timeline_windowed` are forwarded to `summarize_timeline` so a
-    gap between two disjoint `--window` spans is not counted as a dropout.
+    gap between two disjoint `--window` spans is not counted as a dropout, and
+    `source_extent` so the fit is judged at the recording's first and last frame.
     """
     from rocsync.timeline import summarize_timeline
 
@@ -159,6 +161,7 @@ def fit_ftk_timestamps(
         source_tick_ms=FTK_TICK_MS,
         residual_threshold=FIT_RESIDUAL_THRESHOLD_MS,
         max_trials=10000,  # more trials for more consistent results
+        source_extent=source_extent,
     )
 
     if debug_dir is not None:
@@ -243,7 +246,9 @@ def process_ftk_recording(
     window_label = _window_label(windows)
 
     def describe():
-        return f"Analyzing frames in time window {window_label} --> Found {len(timestamps)} timestamps"
+        return (
+            f"Analyzing frames in time window {window_label} --> Found {len(timestamps)} timestamps"
+        )
 
     with open(filename) as file, tqdm(total=total_lines, desc=describe(), position=1) as pbar:
         for ftk_timestamp, markers, fiducials in _iter_frames(file, pbar):
@@ -330,9 +335,17 @@ def process_ftk_recording(
         return None
 
     if len(timestamps) > 0:
+        assert (
+            first_ts is not None and last_ts is not None
+        )  # a decoded frame means a non-empty file
         try:
             statistics = fit_ftk_timestamps(
-                timestamps, frame_times, debug_dir, window_frame_times, timeline_windowed
+                timestamps,
+                frame_times,
+                debug_dir,
+                window_frame_times,
+                timeline_windowed,
+                source_extent=(first_ts, last_ts),
             )
         except ValueError as e:
             errprint(f"Error: Unable to fit the FTK timeline: {e}")

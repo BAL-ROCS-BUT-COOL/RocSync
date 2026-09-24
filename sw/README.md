@@ -116,10 +116,19 @@ rocsync-align output.json --output_dir synced
 
 | Option | Description |
 | --- | --- |
-| `--output_dir DIR` | Where synchronized videos are written (default: `synced`) |
+| `--output_dir DIR` | Where synchronized videos are written; a relative path is taken inside each video's own folder, an absolute one is used as is (default: `synced`) |
 | `--compensate-drift` | Compensate clock drift by re-encoding; significantly slower but more accurate |
 | `--fps FPS` | Target frame rate (default: the source rate of the first video) |
 | `--jobs N` | Maximum concurrent `ffmpeg` processes, or `0` for no limit (default: `4`) |
+
+Every output covers the board-time span that all videos share, and each output frame is the
+source frame nearest its board time, so it is at most half a source frame off.
+
+- A stream copy, the default, keeps each video's frames and clock. It cuts at a keyframe and
+  leaves the exact start to a container edit list, which some players ignore. Its end can run a
+  few frames long when the video has B-frames.
+- With `--compensate-drift`, every output is re-encoded at `--fps` and plays on board time, so
+  the videos stay in step to their last frame and all have the same number of frames.
 
 This needs `ffmpeg` on your `PATH`; `--compensate-drift` uses `hevc_nvenc` when the available
 `ffmpeg` provides it.

@@ -190,6 +190,7 @@ environment without activating it.
 | Task | Command |
 | --- | --- |
 | Run the test suite | `uv run pytest` |
+| Run the end-to-end tests | `uv run pytest -m e2e` (see below) |
 | Format the code | `uv run ruff format .` |
 | Check formatting only | `uv run ruff format --check .` |
 | Lint | `uv run ruff check .` |
@@ -206,3 +207,36 @@ not installed. Install `ffmpeg` to run the full suite.
 
 To add or change a dependency, edit `pyproject.toml` and run `uv sync`, then commit the updated
 `uv.lock` alongside it.
+
+### End-to-end tests
+
+The default suite leaves out the tests marked `e2e`, which run the installed command-line tools
+on whole videos and take minutes to hours. Select them with `-m e2e`; a tier whose data is not
+configured skips itself.
+
+| Tier | What it runs | Needs | Takes |
+| --- | --- | --- | --- |
+| `tests/test_e2e_align.py` | `rocsync-align` on synthetic cameras whose clock is known, in stream-copy and `--compensate-drift` mode | `ffmpeg` | under a minute |
+| `tests/test_e2e_benchmark.py` | `rocsync` on the annotated benchmark videos, scored against their reference clocks | `ROCSYNC_BENCHMARK_DIR` | minutes |
+| `tests/test_e2e_real.py` | `rocsync`, `rocsync-align` in both modes, and `rocsync` again on full-length recordings, whose synced files must then show the same board time | `ROCSYNC_REAL_SAMPLES_DIR`, `ffmpeg` | about half an hour, longer on the first run |
+
+```bash
+ROCSYNC_BENCHMARK_DIR=/path/to/validation_data uv run pytest -m e2e tests/test_e2e_benchmark.py
+```
+
+The real-sample tier runs on copies of the recordings downscaled to 540 lines, which keep every
+frame's timestamp. They are made on first use and kept in `~/.cache/rocsync/e2e`, or wherever
+`ROCSYNC_E2E_CACHE_DIR` points.
+
+Where each recording shows the board, and how its result is judged, comes from
+`tests/e2e_real_samples.json`. To build that manifest, the generator searches the first 5 and
+last 10 minutes of every copy. It widens a search that ends while the board is still in view.
+`--search START END` adds a span for a board shown mid-recording. `--try-hard` searches, fits,
+and later tests with rocsync's `--try-hard`, for a board too small to be found otherwise.
+Regenerate it after adding recordings, review the table it prints, and commit it:
+
+```bash
+uv run python -m tests.generate_real_samples_manifest /path/to/real_samples [--only SESSION]
+uv run python -m tests.generate_real_samples_manifest /path/to/real_samples \
+    --only SESSION/FILE --search 0:37:00 0:40:00 --try-hard
+```

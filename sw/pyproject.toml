@@ -74,4 +74,6 @@ exclude = ["**/__pycache__", ".venv", "build", "dist"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = ["--strict-markers", "--strict-config"]
+# The end-to-end tiers run the CLI tools on real videos and take minutes to hours
+addopts = ["--strict-markers", "--strict-config", "-m", "not e2e"]
+markers = ["e2e: slow end-to-end runs of the command-line tools; select with -m e2e"]

@@ -337,7 +337,7 @@ def compute_homography_metrics(benchmark_images, gt_images, key):
         gt_positive = board is not None and gt_H is not None
         pred_positive = pred_H is not None
 
-        if gt_positive and pred_positive:
+        if board is not None and gt_positive and pred_positive:
             errors = rectification_errors(pred_H, gt_H, board.layout_coords(annotation_camera(gt)))
             if errors is None:
                 fn += 1
@@ -538,8 +538,7 @@ def compute_clock_metrics(benchmark, gt) -> dict[str, dict]:
         def predict(pts, rate=rate, offset=offset):
             return rate * pts + offset
 
-        first = predict(ref.pts_min_ms) - float(ref.predict(ref.pts_min_ms))
-        last = predict(ref.pts_max_ms) - float(ref.predict(ref.pts_max_ms))
+        first, last = ref.span_errors(rate, offset)
 
         # Per-frame accuracy against the annotations themselves, and whether the fit's
         # own outlier rejection agrees with them
@@ -1035,9 +1034,7 @@ def print_report(methods, all_metrics, col_width, label_width=LABEL_WIDTH_DEFAUL
     print("  RECTIFICATION")
     print(f"{'=' * 100}")
 
-    _print_rectification_block(
-        methods, all_metrics, "rough", "Coarse fit", col_width, label_width
-    )
+    _print_rectification_block(methods, all_metrics, "rough", "Coarse fit", col_width, label_width)
     print()
     _print_rectification_block(methods, all_metrics, "fine", "Final fit", col_width, label_width)
 

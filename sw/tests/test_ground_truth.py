@@ -175,7 +175,7 @@ def test_every_reference_clock_still_fits_its_annotations(ground_truth):
     references = ground_truth.get("videos", {})
     if not references:
         pytest.skip("no reference clocks in this ground truth")
-        
+
     unverifiable = []
     outlier_videos = []
     clock_fit_divergence = []
@@ -185,7 +185,7 @@ def test_every_reference_clock_still_fits_its_annotations(ground_truth):
         threshold = residual_threshold_ms(stored)
         starts = clip_starts(ground_truth["images"], rel_path, stored)
         outliers = reference_outliers(ReferenceClock.from_dict(stored), starts, pts, threshold)
-        
+
         if len(starts) < MIN_REFERENCE_FRAMES:
             unverifiable.append(rel_path)
         if outliers:

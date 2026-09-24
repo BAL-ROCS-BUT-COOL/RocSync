@@ -194,7 +194,11 @@ def main():
         parser.error("--ftk-marker-id requires an explicit --board-version")
 
     board = PROFILES_BY_NAME.get(args.board_version) if args.board_version != "auto" else None
-    ftk_marker_ids = {args.ftk_marker_id: board} if args.ftk_marker_id is not None else None
+    ftk_marker_ids = (
+        {args.ftk_marker_id: board}
+        if args.ftk_marker_id is not None and board is not None
+        else None
+    )
 
     # Parse the search windows; they are resolved against the video and merged later
     windows = []

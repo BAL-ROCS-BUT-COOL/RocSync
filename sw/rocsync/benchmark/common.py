@@ -15,7 +15,6 @@ from rocsync.dataset import VIDEO_SUFFIXES
 from rocsync.timeline import (
     frame_pts,
     measured_residual_threshold_ms,
-    source_frame_period_ms,
 )
 from rocsync.video_reader import VideoReader
 

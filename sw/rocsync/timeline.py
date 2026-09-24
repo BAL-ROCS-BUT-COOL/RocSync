@@ -24,7 +24,7 @@ import numpy as np
 from sklearn.linear_model import LinearRegression, RANSACRegressor
 from sklearn.metrics import root_mean_squared_error
 
-from rocsync.recording_statistics import RecordingStatistics
+from rocsync.recording_statistics import RATE_STDERR_COVERAGE, RecordingStatistics
 
 
 @dataclass
@@ -43,9 +43,8 @@ class TimelineFit:
     source_time_min: float  # smallest source-clock value offered to the fit
     source_time_max: float  # largest source-clock value offered to the fit
     clock_rate_stderr: float  # 1 sigma on clock_rate, in board ms per source tick
-    extrapolation_stderr_ms: float  # 3 sigma on predicted board time at the fitted span's ends
+    extrapolation_stderr_ms: float  # 3 sigma on predicted board time at the recording's ends
     inlier_source_span: float  # source ticks between the first and last inlier
-    inlier_source_mid: float  # mean inlier source tick; the rate pivots about it
 
     def predict(self, pts_ms):
         """Board time in ms for one or many container timestamps in ms."""
@@ -119,11 +118,7 @@ MEASURED_RESIDUAL_FRACTION = 1 / 3  # of a source frame
 MEASURED_RESIDUAL_MIN_MS = 2.0  # never tighter than the board itself resolves
 MEASURED_RESIDUAL_MAX_MS = 50.0  # below the ring period, so a counter step still shows
 
-# A slope is only as trustworthy as the lever arm it was measured over: a handful of
-# frames clustered in a second of a much longer recording fits a rate to within
-# thousands of ppm, which r2 cannot see -- it is scale-free and reads high on any tight
-# cluster regardless of how far that cluster is from spanning the recording.
-RATE_STDERR_COVERAGE = 3.0  # report 3 sigma, not 1
+# r2 can't see a short lever arm; the rate's stderr can
 RATE_STDERR_MIN_SIGMA_MS = 1.0  # the board resolves no finer, so no fit is tighter
 RATE_MIN_INLIERS = 3  # two points fit a line exactly and say nothing about its noise
 
@@ -149,6 +144,7 @@ def fit_timeline(
     residual_threshold=None,
     frame_period_ms=None,
     max_trials=1000,
+    source_extent=None,
 ):
     """Robustly fit board time against a source clock.
 
@@ -163,6 +159,9 @@ def fit_timeline(
     `frame_times` itself, since a subsampled/decimated recording's frames are
     spaced by the sampling, not the sensor, and would otherwise inflate the
     threshold enough to accept far-too-large misdecodes as inliers.
+
+    `source_extent` is the (first, last) source tick of the whole recording, where the
+    fit's extrapolation uncertainty is evaluated; it defaults to the frames that were read.
 
     Only frames present in both dicts are used. Raises ValueError if fewer than
     two such frames exist, or if the fit is degenerate (a non-positive or
@@ -221,9 +220,8 @@ def fit_timeline(
         def se_at(x0):
             return sigma * np.sqrt(1 / n_inliers + (x0 - mean_x) ** 2 / sxx)
 
-        extrapolation_stderr_ms = RATE_STDERR_COVERAGE * max(
-            se_at(source_time_min), se_at(source_time_max)
-        )
+        extent_min, extent_max = source_extent or (source_time_min, source_time_max)
+        extrapolation_stderr_ms = RATE_STDERR_COVERAGE * max(se_at(extent_min), se_at(extent_max))
 
     return TimelineFit(
         clock_rate=clock_rate,
@@ -240,7 +238,6 @@ def fit_timeline(
         clock_rate_stderr=float(clock_rate_stderr),
         extrapolation_stderr_ms=float(extrapolation_stderr_ms),
         inlier_source_span=inlier_source_span,
-        inlier_source_mid=mean_x,
     )
 
 
@@ -255,6 +252,7 @@ def summarize_timeline(
     source_tick_ms=1.0,
     residual_threshold=None,
     max_trials=1000,
+    source_extent=None,
 ):
     """Fit board time against a source clock and describe the result.
 
@@ -282,6 +280,8 @@ def summarize_timeline(
     not a safe stand-in. Without one, the source's nominal fps is used instead.
     `residual_threshold`/`max_trials` pass straight through to `fit_timeline`, for a
     source (like a tracker) whose inlier band isn't sized off a frame period at all.
+    `source_extent` is the (first, last) source tick of the whole recording, so a
+    windowed run still reports how uncertain the fit is at the recording's ends.
 
     Returns (statistics, fit, considered, rejected, gaps). Raises ValueError when the
     timeline cannot be fitted.
@@ -306,6 +306,7 @@ def summarize_timeline(
             residual_threshold=residual_threshold,
             frame_period_ms=frame_period_ms or nominal_period_ms,
             max_trials=max_trials,
+            source_extent=source_extent,
         )
     except ValueError as e:
         raise ValueError(f"Unable to fit the frame timeline: {e}") from e
@@ -361,7 +362,6 @@ def summarize_timeline(
         timeline_windowed=timeline_windowed,
         source_tick_ms=source_tick_ms,
         inlier_span_ms=fit.inlier_source_span * source_tick_ms,
-        inlier_mid_ms=fit.inlier_source_mid * source_tick_ms,
         mean_exposure_time=float(np.mean(exposure_times)),
         min_exposure_time=float(np.min(exposure_times)),
         max_exposure_time=float(np.max(exposure_times)),

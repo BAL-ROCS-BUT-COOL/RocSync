@@ -539,6 +539,12 @@ class ReferenceClock:
         """Board time in ms for one or many container timestamps in ms."""
         return self.clock_rate * np.asarray(pts_ms, dtype=float) + self.clock_offset_ms
 
+    def span_errors(self, clock_rate, clock_offset_ms):
+        """(first, last): another clock's board time minus this one's at either end of the span."""
+        ends = np.array([self.pts_min_ms, self.pts_max_ms])
+        first, last = clock_rate * ends + clock_offset_ms - self.predict(ends)
+        return float(first), float(last)
+
     def to_dict(self, threshold_ms):
         """Serialized form, recording the tolerance the reference was checked against."""
         return {**asdict(self), "residual_threshold_ms": threshold_ms}

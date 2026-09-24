@@ -7,13 +7,18 @@ here come from a real ZED recording (5046 frames, one 27.8 s dropout at ~11.2 s)
 where the index fit reported 0.858x and a first frame of -5.593 s.
 """
 
+import json
+import math
+
 import pytest
 
+from rocsync.recording_statistics import RATE_STDERR_COVERAGE
 from rocsync.timeline import (
     affine_from_statistics,
     detect_dropouts,
     fit_timeline,
     median_frame_period,
+    summarize_timeline,
 )
 
 PERIOD = 1000 / 29.97  # 33.3667 ms
@@ -153,3 +158,46 @@ def test_affine_reads_clock_rate_and_clock_offset_ms():
 def test_affine_rejects_entries_without_a_complete_clock_fit():
     with pytest.raises(KeyError, match="clock_rate/clock_offset_ms"):
         affine_from_statistics({"clock_rate": 0.858, "first_frame": -5593.0})
+
+
+def test_extrapolation_uncertainty_is_judged_at_the_recording_ends():
+    """A fit over a short window must report how uncertain it is at the far end of the file.
+
+    Three inliers at 0/1000/2000 ms with residuals +10/-20/+10 ms fit the line y = x
+    exactly by OLS, leaving s^2 = 600 / (3 - 2) and Sxx = 2e6. By the textbook standard
+    error of a regression line, s * sqrt(1/n + (x0 - 1000)^2 / Sxx):
+      at x0 = 0 or 2000:  sqrt(600 * 5/6)            = sqrt(500)
+      at x0 = 101000:     sqrt(600 * (1/3 + 5000))   = sqrt(3000200)
+    """
+    frame_times = {0: 0.0, 1: 1000.0, 2: 2000.0}
+    timestamps = {0: (10.0, 19.0), 1: (980.0, 989.0), 2: (2010.0, 2019.0)}
+
+    windowed = fit_timeline(frame_times, timestamps, residual_threshold=100.0)
+    whole = fit_timeline(
+        frame_times, timestamps, residual_threshold=100.0, source_extent=(0.0, 101000.0)
+    )
+
+    assert windowed.clock_rate == pytest.approx(1.0, abs=1e-9)
+    assert windowed.extrapolation_stderr_ms == pytest.approx(
+        RATE_STDERR_COVERAGE * math.sqrt(500), rel=1e-9
+    )
+    assert whole.extrapolation_stderr_ms == pytest.approx(
+        RATE_STDERR_COVERAGE * math.sqrt(3000200), rel=1e-9
+    )
+    # The extent changes where the fit is judged, never the fit itself
+    assert whole.clock_rate == windowed.clock_rate
+    assert whole.clock_rate_stderr == windowed.clock_rate_stderr
+
+
+def test_unmeasurable_clock_rate_serializes_as_valid_json():
+    """Two inliers fit a line exactly and leave its uncertainty unknown, not Infinity."""
+    frame_times = {i: i * PERIOD for i in range(100)}
+    timestamps = board_timestamps({0: frame_times[0], 99: frame_times[99]})
+
+    statistics, fit, _, _, _ = summarize_timeline(timestamps, frame_times, 100, 29.97)
+    assert math.isinf(fit.extrapolation_stderr_ms)
+
+    entry = json.loads(json.dumps(statistics.to_dict(), allow_nan=False))
+    assert entry["clock_rate_stderr"] is None
+    assert entry["extrapolation_stderr_ms"] is None
+    assert entry["clock_rate"] == pytest.approx(1.0, abs=1e-9)

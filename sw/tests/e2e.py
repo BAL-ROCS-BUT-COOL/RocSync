@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -190,7 +191,9 @@ def downscaled(source, target):
         return target
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    partial = target.with_name(f"{target.stem}.partial{target.suffix}")
+    partial = target.with_name(
+        f"{target.stem}.partial.{os.getpid()}.{threading.get_ident()}{target.suffix}"
+    )
     for command in _downscale_commands(source, partial):
         done = subprocess.run(command).returncode == 0
         if done and frame_pts(partial) == pytest.approx(frame_pts(source), abs=1e-6):

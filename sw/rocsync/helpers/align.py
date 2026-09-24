@@ -7,6 +7,12 @@ import subprocess
 import cv2
 
 from rocsync.printer import errprint, succprint, warnprint
+from rocsync.recording_statistics import (
+    CLOCK_DRIFT_BAD_PPM,
+    CLOCK_DRIFT_WARN_PPM,
+    drift_ppm,
+    rate_uncertainty_limit_ms,
+)
 from rocsync.timeline import affine_from_statistics, per_frame_times
 
 
@@ -35,6 +41,34 @@ def reap(running: list[tuple[str, subprocess.Popen]], failed: list[str], block: 
         if returncode != 0:
             failed.append(path)
             errprint(f"ffmpeg exited with {returncode} for {path}")
+
+
+def warn_about_clock(file, statistics, compensate_drift):
+    """Warn about a clock fit that may misplace this video; aligning proceeds regardless."""
+    if "extrapolation_stderr_ms" not in statistics:
+        warnprint(f"{file}: sync entry has no clock-rate uncertainty; re-run rocsync to assess it.")
+    elif statistics["extrapolation_stderr_ms"] is None:
+        warnprint(f"{file}: clock-rate uncertainty could not be measured (too few inliers).")
+    else:
+        uncertainty_ms = statistics["extrapolation_stderr_ms"]
+        limit_ms = rate_uncertainty_limit_ms(statistics["median_frame_period"])
+        if uncertainty_ms > limit_ms:
+            warnprint(
+                f"{file}: clock rate uncertain by ±{uncertainty_ms:.1f} ms at the first/last "
+                f"frame (limit ±{limit_ms:.1f} ms, half a frame); frames far from the "
+                "RocSync windows may be misplaced."
+            )
+
+    clock_rate, _ = affine_from_statistics(statistics)
+    ppm = drift_ppm(clock_rate)
+    if abs(ppm) > CLOCK_DRIFT_BAD_PPM:
+        rescale = " Drift compensation will rescale it substantially." if compensate_drift else ""
+        warnprint(
+            f"{file}: video clock runs {ppm:+.0f} ppm off board time; that is not drift, "
+            f"something is wrong with the fit.{rescale}"
+        )
+    elif abs(ppm) > CLOCK_DRIFT_WARN_PPM:
+        warnprint(f"{file}: video clock runs {ppm:+.0f} ppm off board time.")
 
 
 def main():
@@ -75,6 +109,8 @@ def main():
 
     if args.jobs < 0:
         parser.error("--jobs must be 0 (unlimited) or a positive number")
+    if args.fps is not None and args.fps <= 0:
+        parser.error("--fps must be a positive number")
 
     with open(args.sync_file) as file:
         stats = json.load(file)
@@ -120,6 +156,7 @@ def main():
             errprint(f"No frames found in {file}; cannot align it.")
             return 1
         spans[file] = (board_times[0], board_times[-1])
+        warn_about_clock(file, statistics, args.compensate_drift)
 
     # Window covered by every video, in board time
     origin_ms = max(start for start, _ in spans.values())
@@ -206,12 +243,6 @@ def sync_video(
 ) -> subprocess.Popen:
     """Cut `duration` seconds starting `cut_time` seconds into the video, both in
     container time, rescaling by `clock_rate` if drift is compensated."""
-    if abs(clock_rate - 1) > 0.05:
-        warnprint(
-            f"Video clock runs at {clock_rate:.4f}x board time; "
-            f"drift compensation will rescale it substantially."
-        )
-
     ffmpeg_command = [
         "ffmpeg",
         "-ss",

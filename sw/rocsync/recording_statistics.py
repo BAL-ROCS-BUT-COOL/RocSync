@@ -1,3 +1,4 @@
+import math
 from dataclasses import asdict, dataclass
 
 from rocsync.printer import print, printresult, warnprint
@@ -26,6 +27,8 @@ class RecordingStatistics:
     # board_ms = clock_rate * source_ticks + clock_offset_ms
     clock_rate: float
     clock_offset_ms: float
+    clock_rate_stderr: float  # 1 sigma on clock_rate, in board ms per source tick
+    extrapolation_stderr_ms: float  # 3 sigma on board time at the recording's first/last frame
     source_tick_ms: float  # ms per source-clock tick; 1.0 for a container's own pts
 
     # Start and end
@@ -38,6 +41,7 @@ class RecordingStatistics:
     n_dropped_frames: int
     largest_gap_ms: float
     timeline_windowed: bool  # True if only part of the recording was analyzed
+    inlier_span_ms: float  # source time between the first and last inlier
 
     # Exposure
     mean_exposure_time: float
@@ -52,7 +56,26 @@ class RecordingStatistics:
     def to_dict(self):
         d = asdict(self)
         del d["considered_timestamps"], d["rejected_timestamps"]
-        return d
+        # JSON has no Infinity/NaN; an unmeasurable value is stored as null
+        return {
+            k: None if isinstance(v, float) and not math.isfinite(v) else v for k, v in d.items()
+        }
+
+
+CLOCK_DRIFT_WARN_PPM = 1000  # 0.1%: a crystal is good to tens of ppm, a misdeclared fps is worse
+CLOCK_DRIFT_BAD_PPM = 50000  # 5%: not a clock at all any more
+RATE_STDERR_COVERAGE = 3.0  # report 3 sigma, not 1
+RATE_UNCERTAINTY_MAX_FRAMES = 0.5  # of the median frame period, before the fit may misplace a frame
+
+
+def drift_ppm(clock_rate, source_tick_ms=1.0):
+    """How far a source clock runs off board time, in parts per million."""
+    return (clock_rate / source_tick_ms - 1) * 1e6
+
+
+def rate_uncertainty_limit_ms(median_frame_period_ms):
+    """Largest extrapolation uncertainty that still places every frame correctly."""
+    return RATE_UNCERTAINTY_MAX_FRAMES * median_frame_period_ms
 
 
 def warn_about_statistics(statistics: RecordingStatistics):
@@ -65,10 +88,26 @@ def warn_about_statistics(statistics: RecordingStatistics):
         )
         warnprint(f"WARNING: Estimated model has fewer than 80% inliers ({fraction:.2%}).")
 
-    drift = statistics.clock_rate / statistics.source_tick_ms
-    if abs(drift - 1) > 0.05:
+    limit_ms = rate_uncertainty_limit_ms(statistics.median_frame_period)
+    if statistics.extrapolation_stderr_ms > limit_ms:
         warnprint(
-            f"WARNING: Source clock runs at {drift:.4f}x board time; expected approximately 1x."
+            f"WARNING: Clock rate is not reliably measurable: {statistics.n_considered_frames} "
+            f"inliers span only {statistics.inlier_span_ms / 1000:.3f} s, leaving the fit "
+            f"uncertain by ±{statistics.extrapolation_stderr_ms:.1f} ms at the recording's "
+            f"first/last frame (limit ±{limit_ms:.1f} ms, half a frame). "
+            "Widen --window or improve board visibility."
+        )
+
+    ppm = drift_ppm(statistics.clock_rate, statistics.source_tick_ms)
+    if abs(ppm) > CLOCK_DRIFT_BAD_PPM:
+        warnprint(
+            f"WARNING: Source clock runs {ppm:+.0f} ppm off board time; "
+            "that is not drift, something is wrong with the fit."
+        )
+    elif abs(ppm) > CLOCK_DRIFT_WARN_PPM:
+        warnprint(
+            f"WARNING: Source clock runs {ppm:+.0f} ppm off board time; "
+            f"expected within {CLOCK_DRIFT_WARN_PPM} ppm."
         )
 
     if statistics.n_dropped_frames:
@@ -117,12 +156,28 @@ def print_statistics(statistics: RecordingStatistics):
             f"{nominal}/{statistics.measured_fps:.3f} fps",
         )
     )
-    print(
-        format_str.format(
-            "Clock rate (board/source):",
-            f"{statistics.clock_rate / statistics.source_tick_ms:.6f}x",
-        )
+    ppm = drift_ppm(statistics.clock_rate, statistics.source_tick_ms)
+    printresult(
+        "Clock rate (board/source)",
+        f"{statistics.clock_rate / statistics.source_tick_ms:.6f}x ({ppm:+.0f} ppm)",
+        abs(ppm) <= CLOCK_DRIFT_WARN_PPM,
     )
+    stderr_ppm = (
+        RATE_STDERR_COVERAGE * statistics.clock_rate_stderr / statistics.source_tick_ms * 1e6
+    )
+    printresult(
+        "Clock rate uncertainty (3σ at first/last frame)",
+        f"±{statistics.extrapolation_stderr_ms:.1f} ms (±{stderr_ppm:.0f} ppm)",
+        statistics.extrapolation_stderr_ms
+        <= rate_uncertainty_limit_ms(statistics.median_frame_period),
+    )
+    if statistics.source_duration > 0:
+        printresult(
+            "Inlier span / analyzed span",
+            f"{statistics.inlier_span_ms / 1000:.1f}/{statistics.source_duration / 1000:.1f} s "
+            f"({statistics.inlier_span_ms / statistics.source_duration:.0%})",
+            statistics.inlier_span_ms / statistics.source_duration >= 0.5,
+        )
     scope = "analyzed window" if statistics.timeline_windowed else "source"
     print(
         format_str.format(

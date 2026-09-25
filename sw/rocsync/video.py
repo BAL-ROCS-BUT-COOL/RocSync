@@ -18,10 +18,12 @@ from rocsync.timeline import source_frame_period_ms, summarize_timeline
 from rocsync.video_reader import VideoReader
 from rocsync.vision import CameraType, process_frame
 
+SCAN_WINDOW = 5  # frames analyzed after every frame the board was seen in
 
-def _produce_frames(reader, frame_queue, start_index, stop_index, stop_event):
+
+def _produce_frames(reader, frame_queue, start_index, stop_index, stop_event, decode_if=None):
     """Push (frame, frame number, pts) onto the queue for `reader.frames(start_index,
-    stop_index)`, until exhausted, EOF, or `stop_event` fires.
+    stop_index, decode_if)`, until exhausted, EOF, or `stop_event` fires.
     """
 
     def put(item):
@@ -34,7 +36,7 @@ def _produce_frames(reader, frame_queue, start_index, stop_index, stop_event):
                 continue
         return False
 
-    for index, pts_ms, frame in reader.frames(start_index, stop_index):
+    for index, pts_ms, frame in reader.frames(start_index, stop_index, decode_if):
         if stop_event is not None and stop_event.is_set():
             return
         if not put((frame, index, pts_ms)):
@@ -122,12 +124,24 @@ def process_video_window(
         start_index, stop_index = 0, None
         expected_frames = reader.reported_frame_count
 
+    if stride is None:
+        # One analyzed frame per second, or every frame without a usable frame rate
+        stride = int(fps) if fps >= 1 else 1
+
+    # The reader commits to decoding up to a full queue plus one frame ahead of the analysis,
+    # so frames that close after a stride frame are decoded before its outcome is known
+    lag = MAX_FRAMES_IN_FLIGHT + 1
+    scanning = threading.Event()
+
+    def may_analyze(index):
+        return scanning.is_set() or index % stride <= lag
+
     # Read frames in separate thread
     frame_queue = queue.Queue(maxsize=MAX_FRAMES_IN_FLIGHT)
     stop_event = threading.Event()
     thread = threading.Thread(
         target=_produce_frames,
-        args=(reader, frame_queue, start_index, stop_index, stop_event),
+        args=(reader, frame_queue, start_index, stop_index, stop_event, may_analyze),
     )
     thread.daemon = True
     thread.start()
@@ -135,9 +149,6 @@ def process_video_window(
     timestamps = {}
     frame_times = {}
     scan_window = 0
-    if stride is None:
-        # One analyzed frame per second, or every frame without a usable frame rate
-        stride = int(fps) if fps >= 1 else 1
 
     window_label = f"[{window_start:.3f}s, " + (
         "end]" if math.isinf(window_end) else f"{window_end:.3f}s]"
@@ -150,7 +161,7 @@ def process_video_window(
     try:
         while True:
             frame, frame_number, pts_ms = frame_queue.get()  # blocking wait
-            if frame is None:
+            if frame_number is None:
                 break
             pbar.update(1)
 
@@ -165,10 +176,14 @@ def process_video_window(
                 if decode.board_time is not None:
                     timestamps[frame_number] = decode.board_time
                 if decode.board_seen:
-                    scan_window = 5
+                    scan_window = SCAN_WINDOW
                     pbar.set_description(
                         f"Analyzing frames in time window {window_label} --> Found {len(timestamps)} timestamps"
                     )
+                if scan_window > 0:
+                    scanning.set()
+                else:
+                    scanning.clear()
     finally:
         pbar.close()
         stop_event.set()

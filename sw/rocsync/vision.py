@@ -1,3 +1,4 @@
+import math
 import time
 from functools import cache
 
@@ -20,6 +21,9 @@ ARUCO_DICTIONARY = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 
 CLAHE_CLIP_LIMIT = 2.0
 CLAHE_TILE_GRID_SIZE = (8, 8)
+
+ARUCO_PRIOR_MARGIN = 1.0  # region around a prior marker, in marker sizes per side
+ARUCO_THRESHOLD_REACH = 32  # px beyond a tile edge the marker thresholding may look
 
 # Keys `rocsync.benchmark` expects to find in a stats dict, whether or not the frame decoded.
 _STATS_KEYS = (
@@ -87,6 +91,12 @@ def _make_aruco_detector():
 blob_detector = _make_blob_detector()
 aruco_detector = _make_aruco_detector()
 clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_GRID_SIZE)
+
+
+@cache
+def _clahe(grid):
+    """CLAHE over `grid` tiles, for a crop cut along the full frame's tile edges."""
+    return cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=grid)
 
 
 def read_led(img, x, y, radius):
@@ -243,9 +253,62 @@ def find_corners_dots(mask, frame_number, board, debug_dir=None):
     )
 
 
-def find_corners_aruco(mask, frame_number, debug_dir=None):
+def _aruco_in_region(image, prior, board_ids, recrop=True):
+    """`find_corners_aruco` on the box around the `prior` marker corners, or {} if no marker
+    with an id in `board_ids` is there.
+
+    The box snaps outward to the full frame's CLAHE tiles, at least half a tile past the
+    marker, so the region around it equalizes exactly as on the full frame. A marker found
+    outside that zone is looked for again in a box around where it was found.
+    """
+    height, width = image.shape[:2]
+    corners = prior.reshape(-1, 2)
+    (x0, y0), (x1, y1) = corners.min(axis=0), corners.max(axis=0)
+    pad = ARUCO_PRIOR_MARGIN * max(x1 - x0, y1 - y0)
+    columns, rows = CLAHE_TILE_GRID_SIZE
+    tile_w, tile_h = math.ceil(width / columns), math.ceil(height / rows)
+    # Past half a tile no pixel near the marker interpolates towards a tile outside the box
+    reach_x, reach_y = tile_w / 2 + ARUCO_THRESHOLD_REACH, tile_h / 2 + ARUCO_THRESHOLD_REACH
+    pad_x, pad_y = max(pad, reach_x), max(pad, reach_y)
+    left = max(0, int((x0 - pad_x) // tile_w) * tile_w)
+    top = max(0, int((y0 - pad_y) // tile_h) * tile_h)
+    right = min(width, math.ceil((x1 + pad_x) / tile_w) * tile_w)
+    bottom = min(height, math.ceil((y1 + pad_y) / tile_h) * tile_h)
+    grid = (math.ceil((right - left) / tile_w), math.ceil((bottom - top) / tile_h))
+    crop = image[top:bottom, left:right]
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+    markers, marker_ids, _ = aruco_detector.detectMarkers(_clahe(grid).apply(gray))
+    if marker_ids is None:
+        return {}
+    offset = np.array([left, top], dtype=np.float32)
+    found = {i.item(): m + offset for i, m in zip(marker_ids, markers, strict=True)}
+    marker = next((c for i, c in found.items() if i in board_ids), None)
+    if marker is None:
+        return {}
+    if recrop:
+        (u0, v0), (u1, v1) = marker.reshape(-1, 2).min(axis=0), marker.reshape(-1, 2).max(axis=0)
+        exact = (
+            (left == 0 or u0 - left >= reach_x)
+            and (top == 0 or v0 - top >= reach_y)
+            and (right == width or right - u1 >= reach_x)
+            and (bottom == height or bottom - v1 >= reach_y)
+        )
+        if not exact:
+            return _aruco_in_region(image, marker, board_ids, recrop=False)
+    return found
+
+
+def find_corners_aruco(mask, frame_number, debug_dir=None, prior=None, board_ids=None):
     """Locate the board's ArUco marker, equalizing the image first so it survives
-    under- and over-exposure."""
+    under- and over-exposure.
+
+    With `prior` corners, only the region around them is searched first; the full frame
+    is searched if no marker with an id in `board_ids` is found there.
+    """
+    if prior is not None and not debug_dir:
+        found = _aruco_in_region(mask, prior, PROFILES_BY_ARUCO if board_ids is None else board_ids)
+        if found:
+            return found
     gray = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY) if mask.ndim == 3 else mask
     normalized = clahe.apply(gray)
     markers, marker_ids, _ = aruco_detector.detectMarkers(normalized)
@@ -285,6 +348,33 @@ def rectify_board(
     `min_aruco_area_fraction` rejects frames where the board was held too far away; pass 0
     to read whatever the marker detector found, however small. `try_hard` forces it to 0.
     """
+    return _rectify_board(
+        image,
+        camera_type,
+        frame_number,
+        board,
+        debug_dir,
+        board_size,
+        stats,
+        min_aruco_area_fraction,
+        try_hard,
+    )[:3]
+
+
+def _rectify_board(
+    image,
+    camera_type,
+    frame_number,
+    board=None,
+    debug_dir=None,
+    board_size=DEFAULT_BOARD_SIZE,
+    stats=None,
+    min_aruco_area_fraction=MIN_ARUCO_AREA_FRACTION,
+    try_hard=False,
+    prior=None,
+):
+    """`rectify_board`, searching for the marker around `prior` corners first, and also
+    returning the board's marker corners in the image, or None where it was not found."""
     _init_stats(stats)
     if try_hard:
         min_aruco_area_fraction = 0.0
@@ -292,10 +382,11 @@ def rectify_board(
         case CameraType.RGB:
             # Detect ArUco markers
             t0 = time.perf_counter()
-            markers = find_corners_aruco(image, frame_number, debug_dir)
+            board_ids = None if board is None else (board.aruco_marker_id,)
+            markers = find_corners_aruco(image, frame_number, debug_dir, prior, board_ids)
             _record_step(stats, "aruco_detection", t0, success=bool(markers), count=len(markers))
             if not markers:
-                return False, None, None
+                return False, None, None, None
 
             # Resolve board profile
             if board is None:
@@ -305,11 +396,11 @@ def rectify_board(
                         aruco_corners = corners
                         break
                 else:
-                    return False, None, None
+                    return False, None, None, None
             else:
                 board = board.rectify(board_size)
                 if board.aruco_marker_id not in markers:
-                    return False, None, board
+                    return False, None, board, None
                 aruco_corners = markers[board.aruco_marker_id]
 
             if stats is not None:
@@ -332,7 +423,7 @@ def rectify_board(
                 print(
                     f"Rejected {frame_number}: aruco marker only fills {area_percentage:.2%} of the image"
                 )
-                return False, None, board
+                return False, None, board, aruco_corners
 
             # Use coarse PCB to accurately extract corners
             rough_transformation_matrix = cv2.getPerspectiveTransform(
@@ -372,7 +463,7 @@ def rectify_board(
                     image_corners[:4], board.transform_corners(CameraType.RGB)
                 )
             elif not try_hard:
-                return True, None, board
+                return True, None, board, aruco_corners
             elif not found.any():
                 # No always-on LED matched; fall back to the coarse ArUco homography
                 transformation_matrix = rough_transformation_matrix
@@ -385,7 +476,7 @@ def rectify_board(
                 dst = np.vstack([board.aruco_corners_coords, corner_dots[found]]).astype(np.float64)
                 transformation_matrix, _ = cv2.findHomography(src, dst)
                 if transformation_matrix is None:
-                    return True, None, board
+                    return True, None, board, aruco_corners
             t0 = time.perf_counter()
             pcb = _warp_red(image, transformation_matrix, board_size)
             _record_step(stats, "fine_rectification", t0)
@@ -396,6 +487,7 @@ def rectify_board(
             if board is None:
                 raise ValueError("IR mode requires an explicit board version (--board-version)")
             board = board.rectify(board_size)
+            aruco_corners = None
 
             gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             _, mask = cv2.threshold(gray_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -406,7 +498,7 @@ def rectify_board(
             if corners is not None and stats is not None:
                 stats["corner_positions"] = corners.tolist()
             if corners is None:
-                return False, None, board
+                return False, None, board, None
             # find_corners_layout settles the orientation, so this warp is upright
             transformation_matrix = cv2.getPerspectiveTransform(
                 corners, board.transform_corners(CameraType.INFRARED)
@@ -422,7 +514,7 @@ def rectify_board(
 
     if stats is not None:
         stats["rectified"] = pcb
-    return True, pcb, board
+    return True, pcb, board, aruco_corners
 
 
 def process_frame(
@@ -435,11 +527,16 @@ def process_frame(
     stats=None,
     min_aruco_area_fraction=MIN_ARUCO_AREA_FRACTION,
     try_hard=False,
+    prior=None,
 ):
-    """Decode the board time off one image."""
+    """Decode the board time off one image.
+
+    `prior` is the board marker's corners from the previous frame, around which the
+    marker is searched for first.
+    """
     t_start = time.perf_counter()
     _init_stats(stats)
-    detected, pcb, board = rectify_board(
+    detected, pcb, board, aruco_corners = _rectify_board(
         image,
         camera_type,
         frame_number,
@@ -449,9 +546,10 @@ def process_frame(
         stats,
         min_aruco_area_fraction,
         try_hard,
+        prior,
     )
     if pcb is None or board is None:
-        decode = Decode(reject=NO_CORNERS if detected else NO_BOARD)
+        decode = Decode(reject=NO_CORNERS if detected else NO_BOARD, aruco_corners=aruco_corners)
         _finalize_stats(stats, t_start, decode)
         return decode
 
@@ -467,5 +565,6 @@ def process_frame(
         cv2.imwrite(f"{debug_dir}/leds_{frame_number}.png", debug_canvas)
 
     decode = decode_reading(board, counter, ring)
+    decode.aruco_corners = aruco_corners
     _finalize_stats(stats, t_start, decode)
     return decode

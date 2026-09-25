@@ -230,6 +230,12 @@ def find_corners_aruco(mask, frame_number, debug_dir=None):
     return {id.item(): marker for id, marker in zip(marker_ids, markers, strict=True)}
 
 
+def _warp_red(image, homography, board_size):
+    """Red channel of `image` warped onto the board grid, without copying a strided channel."""
+    warped = cv2.warpPerspective(image, homography, (board_size, board_size))
+    return np.ascontiguousarray(warped[:, :, 2])
+
+
 def rectify_board(
     image,
     camera_type,
@@ -299,16 +305,11 @@ def rectify_board(
                 )
                 return False, None, board
 
-            red_channel = image[:, :, 2]
-            mask = red_channel
-
             # Use coarse PCB to accurately extract corners
             rough_transformation_matrix = cv2.getPerspectiveTransform(
                 aruco_corners, board.aruco_corners_coords
             )
-            rough_pcb = cv2.warpPerspective(
-                mask, rough_transformation_matrix, (board_size, board_size)
-            )
+            rough_pcb = _warp_red(image, rough_transformation_matrix, board_size)
             if stats is not None:
                 # Corners are detected in this grid; the benchmark needs it to get back to image space
                 stats["rough_homography"] = rough_transformation_matrix
@@ -357,7 +358,7 @@ def rectify_board(
                 if transformation_matrix is None:
                     return True, None, board
             t0 = time.perf_counter()
-            pcb = cv2.warpPerspective(mask, transformation_matrix, (board_size, board_size))
+            pcb = _warp_red(image, transformation_matrix, board_size)
             _record_step(stats, "fine_rectification", t0)
             if stats is not None:
                 stats["homography"] = transformation_matrix

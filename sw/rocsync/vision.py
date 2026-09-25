@@ -1,4 +1,5 @@
 import time
+from functools import cache
 
 import cv2
 import numpy as np
@@ -96,6 +97,34 @@ def read_led(img, x, y, radius):
     return led_intensity
 
 
+@cache
+def _disc_offsets(radius):
+    """(dy, dx) of the pixels `cv2.circle` fills around an integer centre."""
+    disc = np.zeros((2 * radius + 1, 2 * radius + 1), dtype=np.uint8)
+    cv2.circle(disc, (radius, radius), radius, (255), -1)
+    dy, dx = np.nonzero(disc)
+    return dy - radius, dx - radius
+
+
+def read_leds(img, coords, radius):
+    """`read_led` for every (x, y) row of `coords` at once."""
+    coords = np.asarray(coords, dtype=int).reshape(-1, 2)
+    dy, dx = _disc_offsets(radius)
+    xs = coords[:, :1] + dx
+    ys = coords[:, 1:] + dy
+    height, width = img.shape[:2]
+    inside = np.full(len(coords), img.ndim == 2)
+    inside &= (xs.min(axis=1) >= 0) & (ys.min(axis=1) >= 0)
+    inside &= (xs.max(axis=1) < width) & (ys.max(axis=1) < height)
+    intensities = np.empty(len(coords))
+    if inside.any():
+        intensities[inside] = np.quantile(img[ys[inside], xs[inside]], 0.75, axis=1)
+    # Discs the image edge clips, and multi-channel images, take the single-LED path
+    for i in np.flatnonzero(~inside):
+        intensities[i] = read_led(img, coords[i, 0], coords[i, 1], radius)
+    return intensities
+
+
 def read_ring(extracted_board, camera_type, board, draw_on=None, stats=None):
     """Ring reading of a rectified board: first and last lit LED, or None."""
     t_start = time.perf_counter()
@@ -105,10 +134,10 @@ def read_ring(extracted_board, camera_type, board, draw_on=None, stats=None):
 
     # Collect LED intensities relative to local background
     led_intensities = np.zeros(board.period, dtype=np.uint8)
-    for i, ((x, y), (x_bg, y_bg)) in enumerate(zip(led_coords, bg_coords, strict=True)):
-        led_intensity = read_led(extracted_board, x, y, radius)
-        bg_intensity = read_led(extracted_board, x_bg, y_bg, radius)
-        led_intensities[i] = np.clip(led_intensity - bg_intensity, 0, 255)
+    contrast = read_leds(extracted_board, led_coords, radius) - read_leds(
+        extracted_board, bg_coords, radius
+    )
+    led_intensities[: len(contrast)] = np.clip(contrast, 0, 255)
 
     # Apply Otsu's thresholding to led_intensities
     _, otsu_thresh = cv2.threshold(led_intensities, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -138,11 +167,11 @@ def read_counter(extracted_board, camera_type, board, draw_on=None, stats=None):
     radius = board.led_sample_radius
 
     # Collect LED intensities relative to local background
-    led_intensities = np.zeros(led_coords.shape[0], dtype=np.uint8)
-    for i, (x, y) in enumerate(led_coords):
-        led_intensity = read_led(extracted_board, x, y, radius)
-        bg_intensity = read_led(extracted_board, x, bg_y, radius)
-        led_intensities[i] = np.clip(led_intensity - bg_intensity, 0, 255)
+    bg_coords = np.column_stack([led_coords[:, 0], np.full(len(led_coords), bg_y)])
+    contrast = read_leds(extracted_board, led_coords, radius) - read_leds(
+        extracted_board, bg_coords, radius
+    )
+    led_intensities = np.clip(contrast, 0, 255).astype(np.uint8)
 
     # Apply Otsu's thresholding to led_intensities
     _, otsu_thresh = cv2.threshold(led_intensities, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)

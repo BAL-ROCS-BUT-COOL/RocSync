@@ -149,6 +149,7 @@ def process_video_window(
     timestamps = {}
     frame_times = {}
     scan_window = 0
+    prior, prior_frame = None, None  # board marker corners, and the frame they were found in
 
     window_label = f"[{window_start:.3f}s, " + (
         "end]" if math.isinf(window_end) else f"{window_end:.3f}s]"
@@ -170,8 +171,15 @@ def process_video_window(
 
             if scan_window > 0 or frame_number % stride == 0:
                 decode = process_frame(
-                    frame, camera_type, frame_number, board, debug_dir, try_hard=try_hard
+                    frame,
+                    camera_type,
+                    frame_number,
+                    board,
+                    debug_dir,
+                    try_hard=try_hard,
+                    prior=prior if prior_frame == frame_number - 1 else None,
                 )
+                prior, prior_frame = decode.aruco_corners, frame_number
                 scan_window -= 1
                 if decode.board_time is not None:
                     timestamps[frame_number] = decode.board_time

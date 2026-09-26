@@ -64,7 +64,7 @@ rocsync -c ir --board-version v2 ir_recording.mp4
 | Option | Description |
 | --- | --- |
 | `-c, --camera_type {rgb,ir}` | Type of camera (default: `rgb`) |
-| `-s, --stride N` | Scan every N-th frame only (default: same as framerate, videos only) |
+| `-i, --interval SECONDS` | Analyze at least one frame every SECONDS, placed relative to keyframes so skipped frames need not be decoded (default: `1`; `0` = every frame; videos only) |
 | `-e, --export_frames DIRECTORY` | Directory to store all raw frames as PNGs with timestamp (videos only) |
 | `-o, --output FILE` | JSON file to store results (default: `output.json`) |
 | `-y, --yes` | Do not ask for confirmation when processing multiple files |

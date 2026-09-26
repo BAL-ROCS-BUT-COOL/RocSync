@@ -112,7 +112,7 @@ def test_reader_reports_the_presentation_timestamp_of_each_frame(gap_video):
 
 
 def test_process_video_recovers_the_clock_across_a_dropout(gap_video, board_at_pts):
-    statistics = video.process_video(gap_video, CameraType.RGB, stride=1)
+    statistics = video.process_video(gap_video, CameraType.RGB, interval=0)
     assert statistics is not None, "process_video found no board"
 
     # The container clock is correct as it stands, so no rescaling is needed.
@@ -135,7 +135,7 @@ def test_process_video_recovers_the_clock_across_a_dropout(gap_video, board_at_p
 
 
 def test_last_frame_is_anchored_on_a_frame_that_exists(gap_video, board_at_pts):
-    statistics = video.process_video(gap_video, CameraType.RGB, stride=1)
+    statistics = video.process_video(gap_video, CameraType.RGB, interval=0)
     assert statistics is not None, "process_video found no board"
 
     pts = frame_pts(gap_video)
@@ -152,7 +152,7 @@ def test_window_selects_frames_by_timestamp_not_by_index(gap_video, board_at_pts
     """A window after the gap must not be shifted by the missing frames."""
     window_start, window_end = 2.0, 3.0
     timestamps, frame_times = video.process_video_window(
-        gap_video, CameraType.RGB, window_start, window_end, stride=1
+        gap_video, CameraType.RGB, window_start, window_end, interval=0
     )
 
     analyzed_pts = [pts for _, pts in board_at_pts]
@@ -176,7 +176,7 @@ def test_window_selects_frames_by_timestamp_not_by_index(gap_video, board_at_pts
 
 def test_a_single_window_is_the_only_span_analyzed(gap_video, board_at_pts):
     """A lone window must not be widened to the whole file."""
-    video.process_video(gap_video, CameraType.RGB, stride=1, windows=[(2.5, 3.5)])
+    video.process_video(gap_video, CameraType.RGB, interval=0, windows=[(2.5, 3.5)])
 
     analyzed_pts = [pts for _, pts in board_at_pts]
     assert analyzed_pts, "nothing was analyzed"
@@ -186,7 +186,7 @@ def test_a_single_window_is_the_only_span_analyzed(gap_video, board_at_pts):
 
 def test_disjoint_windows_are_analyzed_and_the_span_between_them_is_not(gap_video, board_at_pts):
     statistics = video.process_video(
-        gap_video, CameraType.RGB, stride=1, windows=[(0.0, 0.5), (3.0, 3.5)]
+        gap_video, CameraType.RGB, interval=0, windows=[(0.0, 0.5), (3.0, 3.5)]
     )
     assert statistics is not None, "process_video found no board"
 
@@ -202,7 +202,7 @@ def test_disjoint_windows_are_analyzed_and_the_span_between_them_is_not(gap_vide
 
 def test_overlapping_windows_are_merged_into_one_scan(gap_video, board_at_pts):
     statistics = video.process_video(
-        gap_video, CameraType.RGB, stride=1, windows=[(0.0, 2.0), (1.0, 3.0)]
+        gap_video, CameraType.RGB, interval=0, windows=[(0.0, 2.0), (1.0, 3.0)]
     )
     assert statistics is not None, "process_video found no board"
 
@@ -218,7 +218,7 @@ def test_overlapping_windows_are_merged_into_one_scan(gap_video, board_at_pts):
 
 def test_negative_window_bounds_count_back_from_the_last_frame(gap_video, board_at_pts):
     pts = frame_pts(gap_video)
-    video.process_video(gap_video, CameraType.RGB, stride=1, windows=[(-1.0, math.inf)])
+    video.process_video(gap_video, CameraType.RGB, interval=0, windows=[(-1.0, math.inf)])
 
     analyzed_pts = [p for _, p in board_at_pts]
     assert analyzed_pts, "nothing was analyzed"

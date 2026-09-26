@@ -16,7 +16,7 @@ from rocsync.fiducials import MAX_FIDUCIALS
 from rocsync.ftk import process_ftk_recording
 from rocsync.printer import errprint, succprint, warnprint
 from rocsync.timecode import parse_hms
-from rocsync.video import process_video
+from rocsync.video import DEFAULT_INTERVAL_S, process_video
 from rocsync.vision import CameraType, process_frame
 
 
@@ -62,6 +62,17 @@ def mkdir_unique(name, parent_dir):
 WINDOW_TIME_FORMATS = "hh:mm:ss, 'end' or 'end-hh:mm:ss'"
 
 
+def non_negative_seconds(text: str) -> float:
+    """A finite duration in seconds, 0 or more."""
+    try:
+        seconds = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number of seconds: {text!r}") from None
+    if not math.isfinite(seconds) or seconds < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or more seconds: {text!r}")
+    return seconds
+
+
 def parse_time(time_str: str) -> float:
     """Parses a time in hh:mm:ss format, "end" for the end of the file, or
     "end-hh:mm:ss" for an offset back from it.
@@ -99,11 +110,13 @@ def main():
         help="specify the type of camera (default: rgb)",
     )
     parser.add_argument(
-        "-s",
-        "--stride",
-        type=int,
-        metavar="N",
-        help="scan every N-th frame only (default: same as framerate, only applies to videos)",
+        "-i",
+        "--interval",
+        type=non_negative_seconds,
+        default=DEFAULT_INTERVAL_S,
+        metavar="SECONDS",
+        help="analyze at least one frame every SECONDS, placed relative to keyframes "
+        f"(default: {DEFAULT_INTERVAL_S:g}; 0 = every frame; only applies to videos)",
     )
     parser.add_argument(
         "-e",
@@ -288,7 +301,7 @@ def main():
                 file,
                 CameraType(args.camera_type),
                 export_dir=export_dir,
-                stride=args.stride,
+                interval=args.interval,
                 debug_dir=debug_dir,
                 windows=windows,
                 board=board,

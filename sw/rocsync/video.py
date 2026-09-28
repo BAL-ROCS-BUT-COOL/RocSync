@@ -21,7 +21,7 @@ from rocsync.video_reader import VideoReader, to_bgr
 from rocsync.vision import CameraType, process_frame
 
 SCAN_WINDOW = 5  # frames analyzed after every frame the board was seen in
-DEFAULT_INTERVAL_S = 1.0  # longest gap between two analyzed frames, in seconds
+DEFAULT_INTERVAL_S = 1.1  # longest gap between two analyzed frames, in seconds
 
 
 def _queue_putter(frame_queue, stop_event):

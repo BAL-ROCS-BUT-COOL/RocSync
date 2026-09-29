@@ -15,6 +15,7 @@ classifiers = [
 ]
 dependencies = [
     "matplotlib>=3.8",
+    "av>=12",
     "numpy>=2.0",
     "scipy>=1.11",
     "opencv-python>=4.10",
@@ -35,8 +36,7 @@ rocsync-evaluate = "rocsync.benchmark.evaluate:main"
 rocsync-inspect = "rocsync.benchmark.inspect:main"
 
 [dependency-groups]
-# av only powers rocsync-retime, which authors benchmark datasets from a checkout
-dev = ["av>=12", "basedpyright>=1.39", "pytest>=9.1.1", "ruff>=0.16.3"]
+dev = ["basedpyright>=1.39", "pytest>=9.1.1", "ruff>=0.16.3"]
 
 [tool.setuptools]
 # Only the library ships; tests/ and evaluation/ stay out of site-packages

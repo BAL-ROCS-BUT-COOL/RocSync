@@ -1,3 +1,5 @@
+import bisect
+import itertools
 import math
 import os
 import queue
@@ -15,16 +17,15 @@ from rocsync.printer import errprint, warnprint
 from rocsync.recording_statistics import print_statistics, warn_about_statistics
 from rocsync.timecode import resolve_windows
 from rocsync.timeline import source_frame_period_ms, summarize_timeline
-from rocsync.video_reader import VideoReader
+from rocsync.video_reader import VideoReader, to_bgr
 from rocsync.vision import CameraType, process_frame
 
 SCAN_WINDOW = 5  # frames analyzed after every frame the board was seen in
+DEFAULT_INTERVAL_S = 1.1  # longest gap between two analyzed frames, in seconds
 
 
-def _produce_frames(reader, frame_queue, start_index, stop_index, stop_event, decode_if=None):
-    """Push (frame, frame number, pts) onto the queue for `reader.frames(start_index,
-    stop_index, decode_if)`, until exhausted, EOF, or `stop_event` fires.
-    """
+def _queue_putter(frame_queue, stop_event):
+    """put() onto `frame_queue` that gives up, returning False, once `stop_event` fires."""
 
     def put(item):
         # Wake up regularly so a consumer that went away cannot wedge this thread
@@ -36,12 +37,122 @@ def _produce_frames(reader, frame_queue, start_index, stop_index, stop_event, de
                 continue
         return False
 
+    return put
+
+
+def _produce_frames(reader, frame_queue, start_index, stop_index, stop_event, decode_if=None):
+    """Push (frame, frame number, pts) onto the queue for `reader.frames(start_index,
+    stop_index, decode_if)`, until exhausted, EOF, or `stop_event` fires.
+    """
+    put = _queue_putter(frame_queue, stop_event)
     for index, pts_ms, frame in reader.frames(start_index, stop_index, decode_if):
         if stop_event is not None and stop_event.is_set():
             return
         if not put((frame, index, pts_ms)):
             return
     put((None, None, None))
+
+
+def sample_schedule(pts, keyframes, start, stop, interval_ms):
+    """Frames in [start, stop) to analyze, at most `interval_ms` apart and within it of the
+    window's last frame.
+
+    Decoding can only start at a keyframe, so a frame's cost grows with its distance from
+    the one before it. Each keyframe-to-keyframe chunk is therefore either skipped, while
+    the next chunk's keyframe is still within reach, or sampled evenly from its keyframe,
+    and never decoded past the last frame it has to deliver. `interval_ms` 0 is every frame.
+    """
+    if interval_ms <= 0:
+        return list(range(start, stop))
+    if start >= stop:
+        return []
+    inside = keyframes[bisect.bisect_right(keyframes, start) : bisect.bisect_left(keyframes, stop)]
+    schedule, last = [], None
+    for first, after in itertools.pairwise([start, *inside, stop]):
+        end = pts[after] if after < stop else pts[stop - 1]
+        if last is not None and end - last <= interval_ms:
+            continue
+        span = end - pts[first]
+        n = max(1, math.ceil(span / interval_ms))
+        while True:
+            picks = sorted(
+                {
+                    bisect.bisect_right(pts, pts[first] + j * span / n, first, after) - 1
+                    for j in range(n)
+                }
+            )
+            gaps = itertools.pairwise([pts[i] for i in picks] + [end])
+            # A chunk sparser than the interval cannot do better than every frame
+            if n >= after - first or all(b - a <= interval_ms for a, b in gaps):
+                break
+            n += 1
+        schedule += picks
+        last = pts[picks[-1]]
+    return schedule
+
+
+class _Progress:
+    """The last frame the scan is done with, for the reader thread to wait on."""
+
+    def __init__(self):
+        self._done = -1
+        self._changed = threading.Condition()
+
+    def advance(self, frame_number):
+        with self._changed:
+            self._done = frame_number
+            self._changed.notify_all()
+
+    def wait_for(self, frame_number, stop_event):
+        with self._changed:
+            while self._done < frame_number and not stop_event.is_set():
+                self._changed.wait(timeout=0.1)
+
+
+def _produce_schedule(reader, frame_queue, schedule, stop_index, stop_event, scanning, progress):
+    """Push (decoded frame, frame number, pts) onto the queue for every frame the scan may
+    analyze.
+
+    That is each scheduled frame, reached by seeking to its chunk's keyframe unless the
+    reader already stands there, and after a chunk's last scheduled frame, every frame for
+    as long as the scan window stays open (`scanning`). Past that frame nothing is decoded
+    until the scan's verdict on it is in (`progress`). A frame is converted to BGR here if
+    it is sure to be analyzed, and otherwise left for the scan to convert if it needs it.
+    """
+    put = _queue_putter(frame_queue, stop_event)
+    scheduled = set(schedule)
+    last_in_chunk = _last_in_chunk(schedule, reader.keyframes)
+    position = 0
+    while position < len(schedule):
+        last = last_in_chunk[schedule[position]]
+        index = None
+        for index, pts_ms, frame in reader.decoded(schedule[position], stop_index):
+            if index in scheduled or scanning.is_set():
+                frame = to_bgr(frame)
+            if stop_event.is_set() or not put((frame, index, pts_ms)):
+                return
+            if index in scheduled:
+                last = last_in_chunk[index]
+            if index < last or index + 1 in scheduled:
+                continue
+            if index == last:
+                progress.wait_for(index, stop_event)
+            if not scanning.is_set():
+                break
+        else:
+            break  # the window or the file ran out
+        position = bisect.bisect_right(schedule, index)
+    put((None, None, None))
+
+
+def _last_in_chunk(schedule, keyframes):
+    """{scheduled frame: the last scheduled frame before the next keyframe}."""
+    last, chunk, latest = {}, None, None
+    for index in reversed(schedule):
+        if bisect.bisect_right(keyframes, index) != chunk:
+            chunk, latest = bisect.bisect_right(keyframes, index), index
+        last[index] = latest
+    return last
 
 
 def export_frames(video_path, output_path, fit, n_frames=None):
@@ -90,12 +201,16 @@ def process_video_window(
     camera_type: CameraType,
     window_start: float,
     window_end: float,
-    stride=None,
+    interval=DEFAULT_INTERVAL_S,
     debug_dir: str | None = None,
     board=None,
     try_hard=False,
     reader=None,
 ):
+    """(timestamps, frame times) of the window's frames: analyzing at least one frame per
+    `interval` seconds (see `sample_schedule`), and every frame for `SCAN_WINDOW` frames
+    after one the board was seen in. `interval` 0 analyzes every frame.
+    """
     owns_reader = reader is None
     if owns_reader:
         try:
@@ -104,50 +219,34 @@ def process_video_window(
             errprint(f"Error: {e}")
             return {}, {}
 
-    fps = reader.fps
-
     # The window is a time span; presentation timestamps are in milliseconds
-    window_start_ms = window_start * 1000.0
-    window_end_ms = window_end * 1000.0
+    start_index = reader.index_at(window_start * 1000.0)
+    stop_index = (
+        reader.index_at(window_end * 1000.0, side="right")
+        if math.isfinite(window_end)
+        else len(reader)
+    )
+    schedule = sample_schedule(
+        reader.pts, reader.keyframes, start_index, stop_index, interval * 1000
+    )
+    scheduled = set(schedule)
 
-    # Only a window that actually restricts something needs the exact pts index
-    exact = window_start > 0 or math.isfinite(window_end)
-    if exact:
-        start_index = reader.index_at(window_start_ms)
-        stop_index = (
-            reader.index_at(window_end_ms, side="right")
-            if math.isfinite(window_end)
-            else len(reader)
-        )
-        expected_frames = max(0, stop_index - start_index)
-    else:
-        start_index, stop_index = 0, None
-        expected_frames = reader.reported_frame_count
-
-    if stride is None:
-        # One analyzed frame per second, or every frame without a usable frame rate
-        stride = int(fps) if fps >= 1 else 1
-
-    # The reader commits to decoding up to a full queue plus one frame ahead of the analysis,
-    # so frames that close after a stride frame are decoded before its outcome is known
-    lag = MAX_FRAMES_IN_FLIGHT + 1
     scanning = threading.Event()
-
-    def may_analyze(index):
-        return scanning.is_set() or index % stride <= lag
+    progress = _Progress()
 
     # Read frames in separate thread
     frame_queue = queue.Queue(maxsize=MAX_FRAMES_IN_FLIGHT)
     stop_event = threading.Event()
     thread = threading.Thread(
-        target=_produce_frames,
-        args=(reader, frame_queue, start_index, stop_index, stop_event, may_analyze),
+        target=_produce_schedule,
+        args=(reader, frame_queue, schedule, stop_index, stop_event, scanning, progress),
     )
     thread.daemon = True
     thread.start()
 
     timestamps = {}
-    frame_times = {}
+    # Every frame of the window, decoded or not: period and dropouts come from this
+    frame_times = {i: reader.pts[i] for i in range(start_index, stop_index)}
     scan_window = 0
     prior, prior_frame = None, None  # board marker corners, and the frame they were found in
 
@@ -155,23 +254,20 @@ def process_video_window(
         "end]" if math.isinf(window_end) else f"{window_end:.3f}s]"
     )
     pbar = tqdm(
-        total=expected_frames,
+        total=max(0, stop_index - start_index),
         desc=f"Analyzing frames in time window {window_label} --> Found {len(timestamps)} timestamps",
         position=1,
     )
     try:
         while True:
-            frame, frame_number, pts_ms = frame_queue.get()  # blocking wait
+            frame, frame_number, _ = frame_queue.get()  # blocking wait
             if frame_number is None:
                 break
-            pbar.update(1)
+            pbar.update(frame_number + 1 - start_index - pbar.n)
 
-            # Every frame read, analyzed or not: period and dropouts come from this
-            frame_times[frame_number] = pts_ms
-
-            if scan_window > 0 or frame_number % stride == 0:
+            if scan_window > 0 or frame_number in scheduled:
                 decode = process_frame(
-                    frame,
+                    frame if isinstance(frame, np.ndarray) else to_bgr(frame),
                     camera_type,
                     frame_number,
                     board,
@@ -192,6 +288,8 @@ def process_video_window(
                     scanning.set()
                 else:
                     scanning.clear()
+            progress.advance(frame_number)
+        pbar.update(pbar.total - pbar.n)
     finally:
         pbar.close()
         stop_event.set()
@@ -206,7 +304,7 @@ def process_video(
     video_path,
     camera_type,
     export_dir=None,
-    stride=None,
+    interval=DEFAULT_INTERVAL_S,
     debug_dir=None,
     windows=None,
     board=None,
@@ -245,7 +343,7 @@ def process_video(
             camera_type,
             window_start,
             window_end,
-            stride,
+            interval,
             debug_dir,
             board,
             try_hard,

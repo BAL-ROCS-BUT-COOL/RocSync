@@ -223,7 +223,7 @@ def summarize_timeline(
     `RecordingStatistics`: the frame period, the fit, the dropouts, each frame's
     residual and the split into inliers and outliers. Shared with the benchmark and
     with every source type (video, FTK), so what it measures is the summary a real
-    run produces rather than a copy of it.
+    run produces.
 
     `frame_times` holds raw source-clock ticks -- a container's presentation
     timestamp, or a tracker's own counter -- never rescaled, so `clock_rate` (fitted

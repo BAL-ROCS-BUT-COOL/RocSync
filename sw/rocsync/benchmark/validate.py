@@ -240,8 +240,6 @@ def _fit_record(rel_path, timestamps, frame_times, fps, frame_period_ms, timelin
             residual_ms=float(residual), inlier=index in considered
         )
 
-    # The per-frame residuals live in this record's own `frames` table; `to_dict()`
-    # already leaves the considered/rejected timestamp dicts out.
     record = statistics.to_dict()
     return {**record, "n_timestamped_frames": len(timestamps), "error": None, "frames": frames}
 

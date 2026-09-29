@@ -24,7 +24,7 @@ import numpy as np
 from sklearn.linear_model import LinearRegression, RANSACRegressor
 from sklearn.metrics import root_mean_squared_error
 
-from rocsync.recording_statistics import RecordingStatistics
+from rocsync.recording_statistics import RATE_STDERR_COVERAGE, RecordingStatistics
 
 
 @dataclass
@@ -42,6 +42,9 @@ class TimelineFit:
     residual_threshold: float
     source_time_min: float  # smallest source-clock value offered to the fit
     source_time_max: float  # largest source-clock value offered to the fit
+    clock_rate_stderr: float  # 1 sigma on clock_rate, in board ms per source tick
+    extrapolation_stderr_ms: float  # 3 sigma on predicted board time at the recording's ends
+    inlier_source_span: float  # source ticks between the first and last inlier
 
     def predict(self, pts_ms):
         """Board time in ms for one or many container timestamps in ms."""
@@ -52,6 +55,8 @@ class TimelineFit:
         return {
             "clock_rate": self.clock_rate,
             "clock_offset_ms": self.clock_offset_ms,
+            "clock_rate_stderr": self.clock_rate_stderr,
+            "extrapolation_stderr_ms": self.extrapolation_stderr_ms,
             "r2_before": self.r2_before,
             "rmse_before": self.rmse_before,
             "r2_after": self.r2_after,
@@ -113,6 +118,10 @@ MEASURED_RESIDUAL_FRACTION = 1 / 3  # of a source frame
 MEASURED_RESIDUAL_MIN_MS = 2.0  # never tighter than the board itself resolves
 MEASURED_RESIDUAL_MAX_MS = 50.0  # below the ring period, so a counter step still shows
 
+# r2 can't see a short lever arm; the rate's stderr can
+RATE_STDERR_MIN_SIGMA_MS = 1.0  # the board resolves no finer, so no fit is tighter
+RATE_MIN_INLIERS = 3  # two points fit a line exactly and say nothing about its noise
+
 
 def measured_residual_threshold_ms(frame_period_ms):
     """How far a fitted frame may sit from its decoded board time and still be an inlier.
@@ -135,6 +144,7 @@ def fit_timeline(
     residual_threshold=None,
     frame_period_ms=None,
     max_trials=1000,
+    source_extent=None,
 ):
     """Robustly fit board time against a source clock.
 
@@ -149,6 +159,9 @@ def fit_timeline(
     `frame_times` itself, since a subsampled/decimated recording's frames are
     spaced by the sampling, not the sensor, and would otherwise inflate the
     threshold enough to accept far-too-large misdecodes as inliers.
+
+    `source_extent` is the (first, last) source tick of the whole recording, where the
+    fit's extrapolation uncertainty is evaluated; it defaults to the frames that were read.
 
     Only frames present in both dicts are used. Raises ValueError if fewer than
     two such frames exist, or if the fit is degenerate (a non-positive or
@@ -190,6 +203,26 @@ def fit_timeline(
 
     inlier_mask = model.inlier_mask_
     inlier_x, inlier_y = x[inlier_mask], y[inlier_mask]
+    rmse_after = root_mean_squared_error(inlier_y, model.predict(inlier_x))
+
+    # How much the fit could actually pin down, from the lever arm the inliers gave it
+    n_inliers = int(np.sum(inlier_mask))
+    flat_x = inlier_x.reshape(-1)
+    mean_x = float(flat_x.mean()) if n_inliers else 0.0
+    inlier_source_span = float(flat_x.max() - flat_x.min()) if n_inliers else 0.0
+    sxx = float(np.sum((flat_x - mean_x) ** 2))
+    if n_inliers < RATE_MIN_INLIERS or sxx <= 0:
+        clock_rate_stderr = extrapolation_stderr_ms = float("inf")
+    else:
+        sigma = max(rmse_after * np.sqrt(n_inliers / (n_inliers - 2)), RATE_STDERR_MIN_SIGMA_MS)
+        clock_rate_stderr = sigma / np.sqrt(sxx)
+
+        def se_at(x0):
+            return sigma * np.sqrt(1 / n_inliers + (x0 - mean_x) ** 2 / sxx)
+
+        extent_min, extent_max = source_extent or (source_time_min, source_time_max)
+        extrapolation_stderr_ms = RATE_STDERR_COVERAGE * max(se_at(extent_min), se_at(extent_max))
+
     return TimelineFit(
         clock_rate=clock_rate,
         clock_offset_ms=clock_offset_ms,
@@ -198,10 +231,13 @@ def fit_timeline(
         r2_before=model.score(x, y),
         rmse_before=root_mean_squared_error(y, model.predict(x)),
         r2_after=model.score(inlier_x, inlier_y),
-        rmse_after=root_mean_squared_error(inlier_y, model.predict(inlier_x)),
+        rmse_after=rmse_after,
         residual_threshold=threshold,
         source_time_min=source_time_min,
         source_time_max=source_time_max,
+        clock_rate_stderr=float(clock_rate_stderr),
+        extrapolation_stderr_ms=float(extrapolation_stderr_ms),
+        inlier_source_span=inlier_source_span,
     )
 
 
@@ -216,6 +252,7 @@ def summarize_timeline(
     source_tick_ms=1.0,
     residual_threshold=None,
     max_trials=1000,
+    source_extent=None,
 ):
     """Fit board time against a source clock and describe the result.
 
@@ -243,6 +280,8 @@ def summarize_timeline(
     not a safe stand-in. Without one, the source's nominal fps is used instead.
     `residual_threshold`/`max_trials` pass straight through to `fit_timeline`, for a
     source (like a tracker) whose inlier band isn't sized off a frame period at all.
+    `source_extent` is the (first, last) source tick of the whole recording, so a
+    windowed run still reports how uncertain the fit is at the recording's ends.
 
     Returns (statistics, fit, considered, rejected, gaps). Raises ValueError when the
     timeline cannot be fitted.
@@ -267,6 +306,7 @@ def summarize_timeline(
             residual_threshold=residual_threshold,
             frame_period_ms=frame_period_ms or nominal_period_ms,
             max_trials=max_trials,
+            source_extent=source_extent,
         )
     except ValueError as e:
         raise ValueError(f"Unable to fit the frame timeline: {e}") from e
@@ -321,6 +361,7 @@ def summarize_timeline(
         largest_gap_ms=largest_gap_ticks * source_tick_ms,
         timeline_windowed=timeline_windowed,
         source_tick_ms=source_tick_ms,
+        inlier_span_ms=fit.inlier_source_span * source_tick_ms,
         mean_exposure_time=float(np.mean(exposure_times)),
         min_exposure_time=float(np.min(exposure_times)),
         max_exposure_time=float(np.max(exposure_times)),

@@ -9,6 +9,7 @@ This folder contains the firmware for the RocSync device. The project uses [Plat
 - Standby mode that reduces power consumption by keeping the timer running but disabling LEDs
 - (Rev1) Single button to toggle standby mode; brightness is fixed at compile time
 - (Rev2) 5-way buttons for user input. Up/down adjusts counter brightness, left/right adjust ring brightness, and center toggles standby mode. (TODO: implement non-volatile storage for brightness settings)
+- (Rev2) Broadcasts board time over I2C for add-on modules (e.g. an external audio-sync device) to read — see [I2C_PROTOCOL.md](I2C_PROTOCOL.md)
 
 
 ## How to build a PlatformIO based project

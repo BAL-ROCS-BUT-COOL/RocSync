@@ -1,4 +1,6 @@
 #include "ch32fun.h"
+#include "i2c_time_sync.h"
+#include "i2c_time_sync_protocol.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -42,6 +44,13 @@ int corner_brightness = 100;
 
 bool standby = false;
 
+// Board time in ms, on the same epoch and wraparound as what a camera decodes from the
+// ring+counter LEDs (see board_time_from_ring() in sw/rocsync/board_profiles.py): it
+// tracks counter*PERIOD + ring_index to within the same ~1ms edge-of-period ambiguity
+// that decode already tolerates. Broadcast to add-on modules over I2C; see I2C_PROTOCOL.md.
+volatile uint32_t board_time_ms = 0;
+#define BOARD_TIME_WRAP_MS (((uint32_t)1 << COUNTER_BITS) * PERIOD)
+
 void SysTick_Handler(void) __attribute__((interrupt));
 void SysTick_Handler(void)
 {
@@ -68,6 +77,8 @@ void SysTick_Handler(void)
         int counter = (ticks - 1) / (PERIOD * 2) + 1;
         int index = (ticks / 2 + COUNTER_BITS - 1) % PERIOD;
         funDigitalWrite(PIN_COUNTER_DATA, (counter >> index) & 1);
+
+        board_time_ms = i2c_time_sync_advance(board_time_ms, BOARD_TIME_WRAP_MS);
     }
 
     // COUNTER_LATCH: ticks % (PERIOD * 2) == 1
@@ -296,6 +307,7 @@ int main()
     setup_gpio();
     verify_hse();
     t2pwm_init();
+    i2c_time_sync_init();
 
     // Initial states
     funDigitalWrite(PIN_RING_DATA, FUN_LOW);
@@ -326,6 +338,7 @@ int main()
     while (1)
     {
         poll_buttons();
+        i2c_time_sync_poll(board_time_ms);
         Delay_Ms(50);
     }
 }

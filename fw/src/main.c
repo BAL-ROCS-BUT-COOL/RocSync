@@ -307,7 +307,7 @@ int main()
     setup_gpio();
     verify_hse();
     t2pwm_init();
-    i2c_time_sync_init();
+    i2c_time_sync_init(BOARD_TIME_WRAP_MS);
 
     // Initial states
     funDigitalWrite(PIN_RING_DATA, FUN_LOW);
@@ -338,7 +338,7 @@ int main()
     while (1)
     {
         poll_buttons();
-        i2c_time_sync_poll(board_time_ms);
+        i2c_time_sync_poll(&board_time_ms);
         Delay_Ms(50);
     }
 }

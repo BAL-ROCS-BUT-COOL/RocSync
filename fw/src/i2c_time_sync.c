@@ -14,7 +14,12 @@
 // poll_buttons()'s 50ms cadence. Tune on the bench once real hardware exists.
 #define I2C_TIME_SYNC_TIMEOUT_LOOPS 10000
 
+// Upper bound on the wait for the next board-time increment, which is 1ms away at most.
+// Far more iterations than 1ms takes at 24MHz; it only guards against a stopped SysTick.
+#define I2C_TIME_SYNC_EDGE_WAIT_LOOPS 100000
+
 static uint32_t last_broadcast_ms;
+static uint32_t board_time_wrap_ms;
 
 static void i2c1_reset_and_configure(void)
 {
@@ -40,10 +45,11 @@ static void i2c1_reset_and_configure(void)
     I2C1->CTLR1 |= I2C_CTLR1_PE;
 }
 
-void i2c_time_sync_init(void)
+void i2c_time_sync_init(uint32_t wrap_ms)
 {
     i2c1_reset_and_configure();
     last_broadcast_ms = 0;
+    board_time_wrap_ms = wrap_ms;
 }
 
 static int i2c_check_event(uint32_t event_mask)
@@ -109,20 +115,38 @@ static broadcast_result_t broadcast(const uint8_t *payload, int len)
     return timeout ? I2C_TIME_SYNC_OK : I2C_TIME_SYNC_BUS_ERROR;
 }
 
-void i2c_time_sync_poll(uint32_t board_time_ms)
+void i2c_time_sync_poll(const volatile uint32_t *board_time_ms)
 {
+    const uint32_t now = *board_time_ms;
+
     // Unsigned subtraction: correct across board_time_ms's own wraparound the same way
     // it is correct across a plain uint32_t wraparound, except right at the wrap point
     // itself, where it under-counts the elapsed time and triggers one early broadcast --
     // harmless, and rare enough (once per ~29h on REV2) not to warrant extra handling.
-    if (board_time_ms - last_broadcast_ms < I2C_TIME_SYNC_PERIOD_MS)
+    if (now - last_broadcast_ms < I2C_TIME_SYNC_PERIOD_MS)
         return;
 
+    // The frame is sent the moment board_time_ms takes the value it carries, so a follower
+    // that timestamps it learns that instant to within a few microseconds rather than
+    // somewhere in a 1ms window. Packing it beforehand leaves only the spin between the
+    // increment and the START condition.
+    const uint32_t next = i2c_time_sync_advance(now, board_time_wrap_ms);
     uint8_t payload[I2C_TIME_SYNC_PAYLOAD_LEN];
-    i2c_time_sync_pack(board_time_ms, payload);
+    i2c_time_sync_pack(next, payload);
+
+    // The increment has to be observed by the spin itself. If it already happened while
+    // packing, the frame would go out late by an unknown amount, so retry on the next poll.
+    if (*board_time_ms != now)
+        return;
+
+    uint32_t current = now;
+    for (int32_t spins = I2C_TIME_SYNC_EDGE_WAIT_LOOPS; current == now && spins > 0; spins--)
+        current = *board_time_ms;
+    if (current != next)
+        return;
 
     if (broadcast(payload, I2C_TIME_SYNC_PAYLOAD_LEN) == I2C_TIME_SYNC_BUS_ERROR)
         i2c1_reset_and_configure();
 
-    last_broadcast_ms = board_time_ms;
+    last_broadcast_ms = next;
 }

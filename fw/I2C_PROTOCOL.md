@@ -78,10 +78,13 @@ container timestamps and its decoded board-time samples — sparse, occasionally
 in, a robust clock model out. A follower doesn't need to reinvent this; the same approach applies
 directly.
 
-This is deliberately not engineered for sub-millisecond link precision, because it doesn't need to
-be: whatever sits downstream of the I2C read on a module (I2S/DAC/amplifier buffering) will essentially 
-always dominate any jitter this link could introduce. Building a tighter real-time clock link here 
-would buy nothing.
+Each sample is nonetheless made as sharp as the link allows, because that costs RocSync nothing: a
+frame is started the moment `board_time_ms` takes the value it carries (see
+[Frame timing](#frame-timing)), so a follower that timestamps it learns that instant to within
+microseconds rather than somewhere in a 1ms window. This matters to a follower whose own output
+timing is exact. An audio module's I2S output, for example, runs from a fixed DMA pipeline clocked
+by the same crystal as its timer, so it knows when each sample leaves to within microseconds; a
+link quantised to 1ms would be by far the largest error in its chain.
 
 ## Cadence
 
@@ -90,9 +93,9 @@ latency on (re)connection — a module that just powered on gets a usable sample
 **not** for oscillator-drift compensation; 100ms is far too short a window for crystal drift to
 matter at the precision this system already targets everywhere else.
 
-Broadcast cadence jitter is harmless: a late broadcast still carries an exactly-correct value,
-snapshotted fresh at send time. Don't read anything into the spacing between broadcasts beyond
-"a follower is stale if it hasn't seen one in a while."
+Broadcast cadence jitter is harmless: every broadcast waits for the next increment of
+`board_time_ms` and carries exactly that value. Don't read anything into the spacing between
+broadcasts beyond "a follower is stale if it hasn't seen one in a while."
 
 ## Wire format
 
@@ -119,6 +122,34 @@ This deliberately deviates from strict I2C-spec general-call semantics, which re
 following `0x00`+W for `0x06` (reset and program address) or `0x04` (hardware general call). This
 is a private bus, not intended to interoperate with generic SMBus peripherals, so that reservation
 doesn't apply here — it's a conscious choice, not an oversight.
+
+### Frame timing
+
+A frame is a sample of one instant: the moment `board_time_ms` became the value it carries. The
+master packs the frame for the next value in advance, waits for the SysTick handler to increment
+the counter, and issues START as soon as it sees the change. If the increment already happened
+while it was packing, it skips that cycle rather than send a frame of unknown age.
+
+What lies between that instant and anything a follower can observe is fixed rather than random:
+
+- **Increment to START:** the rest of the SysTick handler after the increment, its return, and one
+  turn of the wait loop — microseconds, constant to within the handler's own run-time variation.
+  To be measured with a logic analyser, against the CLK falling edge on the same tick.
+- **START to STOP:** the frame itself, 7 bytes of 9 bit-times at 100kHz, about 630µs, lengthened
+  slightly by the bus's rise times. A SysTick interrupt landing mid-frame can stretch one
+  inter-byte gap by a few microseconds.
+
+A follower that timestamps at STOP, which is what ESP-IDF's slave driver reports, subtracts both.
+They are properties of the hardware and the cable, best measured end to end rather than computed.
+
+**Open item: what the counter means relative to the LEDs.** `board_time_ms` advances on the SysTick
+tick that drives CLK low, while the ring shifts on the next tick, when CLK goes high, 0.5ms later.
+And the tick that raises RING_DATA leaves `board_time_ms ≡ 1 (mod PERIOD)`, both having started
+at zero. Whether these add up to an offset between the I2C value and a camera's decoded time
+depends on how `board_time_from_ring()` assigns a ring index to an instant. At camera precision it
+is inside the ~1ms edge-of-period ambiguity the decode already tolerates; for a follower that
+aligns to microseconds it is a constant that should be pinned down — ideally measured with a
+photodiode on a ring LED — before claiming sub-millisecond agreement with camera timestamps.
 
 ### CRC-8
 
@@ -163,7 +194,8 @@ implementation against, without either side trusting the other's code:
 RocSync's I2C1 peripheral runs in master mode only, at 100kHz standard mode, on PC1 (SDA) / PC2
 (SCL) — see [`i2c_time_sync.c`](src/i2c_time_sync.c). The broadcast is issued from the main loop
 (not from the SysTick ISR that drives LED timing), as a blocking, timeout-guarded transaction; every
-wait is bounded so the main loop can never wedge.
+wait is bounded so the main loop can never wedge. Waiting for the next increment (see
+[Frame timing](#frame-timing)) blocks the loop for up to 1ms more per broadcast.
 
 **No follower connected is the normal, expected state**, not a fault — most of the time nothing
 will be plugged in. The general-call address goes unacknowledged in that case; RocSync detects this
@@ -173,11 +205,15 @@ line, no acknowledge-failure but no progress either) triggers a full peripheral 
 
 ## Building a follower module
 
-Not implemented in this repo — this section is guidance for whoever writes it.
+Not implemented in this repo — this section is guidance for whoever writes it. The Louder-ESP32-S3
+audio module's firmware (the `tdoa-embedded` repository, `firmware/main/rocsync_link.c`) is one
+implementation.
 
 - Configure the I2C peripheral as a slave listening for general call (e.g. ESP-IDF's
   `i2c_slave_config_t::broadcast_en`).
 - Verify the CRC before trusting a frame; discard silently on mismatch.
+- Timestamp a frame in the receive interrupt before doing anything else with it, and correct for
+  the fixed delays in [Frame timing](#frame-timing).
 - Treat a valid frame as one `(local_time, board_time_ms)` correspondence sample, not as a clock to
   synchronize to directly. Keep a rolling window of recent samples and fit them (see "Precision
   philosophy" above) rather than trusting any single sample.

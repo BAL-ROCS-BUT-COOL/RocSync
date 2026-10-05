@@ -14,19 +14,13 @@ from rocsync.clips import MAX_FRAMES_IN_FLIGHT
 from rocsync.printer import errprint, warnprint
 from rocsync.recording_statistics import print_statistics, warn_about_statistics
 from rocsync.timeline import source_frame_period_ms, summarize_timeline
+from rocsync.video_reader import VideoReader
 from rocsync.vision import CameraType, process_frame
 
 
-def read_frames_async(
-    cap, frame_queue, skip_before_pts_ms=None, stop_after_pts_ms=None, stop_event=None
-):
-    """Push (frame, frame number, pts) onto the queue until EOF or the window ends.
-
-    Seeking is deliberately not used to reach the window: OpenCV maps a requested
-    time onto a frame index through the container's average frame rate, which is
-    exactly the quantity a dropped span invalidates -- on a file with a 1.5 s hole,
-    seeking to 2 s lands 8 frames past it. The file is scanned from the start
-    instead, and each frame's own presentation timestamp decides where it belongs.
+def _produce_frames(reader, frame_queue, start_index, stop_index, stop_event):
+    """Push (frame, frame number, pts) onto the queue for `reader.frames(start_index,
+    stop_index)`, until exhausted, EOF, or `stop_event` fires.
     """
 
     def put(item):
@@ -39,72 +33,31 @@ def read_frames_async(
                 continue
         return False
 
-    # Frames outside the window are grabbed but never retrieved into an image
-    while stop_event is None or not stop_event.is_set():
-        if not cap.grab():
-            put((None, None, None))
-            break
-
-        # Straight after grabbing, this is the grabbed frame's own timestamp
-        pts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-        frame_number = int(cap.get(cv2.CAP_PROP_POS_FRAMES) - 1)
-
-        if stop_after_pts_ms is not None and pts_ms > stop_after_pts_ms:
-            put((None, None, None))
-            break
-        if skip_before_pts_ms is not None and pts_ms < skip_before_pts_ms:
-            continue
-
-        ret, frame = cap.retrieve()
-        if not ret:
-            put((None, None, None))
-            break
-
-        if not put((frame, frame_number, pts_ms)):
-            break
+    for index, pts_ms, frame in reader.frames(start_index, stop_index):
+        if stop_event is not None and stop_event.is_set():
+            return
+        if not put((frame, index, pts_ms)):
+            return
+    put((None, None, None))
 
 
-def probe_last_pts_ms(video_path):
-    """Presentation timestamp of the last frame, or None if no frame could be read.
-
-    Seeking near the end is only a starting point: whatever frame the seek lands on,
-    grabbing forward to EOF finds the true last frame, so a frame count the container
-    reports wrongly cannot skew the result.
-    """
-    cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
-    if not cap.isOpened():
-        return None
-    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    try:
-        # An over-reported frame count seeks past the end, so retry further back
-        for first_frame in (max(0, n_frames - 1), max(0, n_frames // 2), 0):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, first_frame)
-            last_pts_ms = None
-            while cap.grab():
-                last_pts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-            if last_pts_ms is not None:
-                return last_pts_ms
-    finally:
-        cap.release()
-    return None
-
-
-def resolve_windows(windows, video_path):
+def resolve_windows(windows, reader):
     """Turns requested search windows into absolute [start, end] spans in seconds.
 
     A negative bound is an offset from the last frame's presentation timestamp. The
     result is sorted, and overlapping spans are merged so that no frame is scanned --
-    and no gap between frames counted -- twice.
+    and no gap between frames counted -- twice. `reader` is only ever touched when a
+    negative bound needs resolving against it.
     """
     if not windows:
         return [(0.0, math.inf)]
 
     last_pts_s = None
     if any(bound < 0 for window in windows for bound in window):
-        last_pts_ms = probe_last_pts_ms(video_path)
-        if last_pts_ms is None:
+        pts = reader.pts
+        if not pts:
             raise ValueError("no frame could be read to resolve a window bound given from the end")
-        last_pts_s = last_pts_ms / 1000.0
+        last_pts_s = pts[-1] / 1000.0
 
     resolved = []
     for start, end in windows:
@@ -128,18 +81,18 @@ def resolve_windows(windows, video_path):
 
 
 def export_frames(video_path, output_path, fit, n_frames=None):
-    cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
-    # cap.set(cv2.CAP_PROP_FFMPEG_HWACCEL, cv2.CAP_FFMPEG_HWACCEL_NVDEC)  # try to use
-    if not cap.isOpened():
-        errprint(f"Error: Could not open video: {video_path}")
+    try:
+        reader = VideoReader(video_path)
+    except OSError as e:
+        errprint(f"Error: {e}")
         return
     if n_frames is None:
-        n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        n_frames = reader.reported_frame_count
     os.makedirs(output_path, exist_ok=True)
 
     # Read frames in separate thread
     frame_queue = queue.Queue(maxsize=MAX_FRAMES_IN_FLIGHT)
-    thread = threading.Thread(target=read_frames_async, args=(cap, frame_queue))
+    thread = threading.Thread(target=_produce_frames, args=(reader, frame_queue, 0, None, None))
     thread.daemon = True
     thread.start()
 
@@ -165,7 +118,7 @@ def export_frames(video_path, output_path, fit, n_frames=None):
         pbar.close()
         for future in futures:
             future.result()
-    cap.release()
+    reader.close()
 
 
 def process_video_window(
@@ -177,23 +130,38 @@ def process_video_window(
     debug_dir: str | None = None,
     board=None,
     try_hard=False,
+    reader=None,
 ):
-    cap = cv2.VideoCapture(video_path)
+    owns_reader = reader is None
+    if owns_reader:
+        try:
+            reader = VideoReader(video_path)
+        except OSError as e:
+            errprint(f"Error: {e}")
+            return {}, {}
 
-    # Extract video metadata
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = reader.fps
 
     # The window is a time span; presentation timestamps are in milliseconds
     window_start_ms = window_start * 1000.0
     window_end_ms = window_end * 1000.0
 
+    # Only a window that actually restricts something needs the exact pts index
+    exact = window_start > 0 or math.isfinite(window_end)
+    if exact:
+        start_index = reader.index_at(window_start_ms)
+        stop_index = reader.index_at(window_end_ms, side="right") if math.isfinite(window_end) else len(reader)
+        expected_frames = max(0, stop_index - start_index)
+    else:
+        start_index, stop_index = 0, None
+        expected_frames = reader.reported_frame_count
+
     # Read frames in separate thread
     frame_queue = queue.Queue(maxsize=MAX_FRAMES_IN_FLIGHT)
     stop_event = threading.Event()
     thread = threading.Thread(
-        target=read_frames_async,
-        args=(cap, frame_queue, window_start_ms, window_end_ms, stop_event),
+        target=_produce_frames,
+        args=(reader, frame_queue, start_index, stop_index, stop_event),
     )
     thread.daemon = True
     thread.start()
@@ -205,9 +173,6 @@ def process_video_window(
         # One analyzed frame per second, or every frame without a usable frame rate
         stride = int(fps) if fps >= 1 else 1
 
-    expected_frames = n_frames
-    if fps > 0 and math.isfinite(window_end - window_start):
-        expected_frames = min(n_frames, math.ceil((window_end - window_start) * fps) + 1)
     window_label = f"[{window_start:.3f}s, " + (
         "end]" if math.isinf(window_end) else f"{window_end:.3f}s]"
     )
@@ -226,9 +191,6 @@ def process_video_window(
             # Every frame read, analyzed or not: period and dropouts come from this
             frame_times[frame_number] = pts_ms
 
-            if not window_start_ms <= pts_ms <= window_end_ms:
-                continue
-
             if scan_window > 0 or frame_number % stride == 0:
                 decode = process_frame(
                     frame, camera_type, frame_number, board, debug_dir, try_hard=try_hard
@@ -245,7 +207,8 @@ def process_video_window(
         pbar.close()
         stop_event.set()
         thread.join(timeout=5)
-        cap.release()
+        if owns_reader:
+            reader.close()
 
     return timestamps, frame_times
 
@@ -260,17 +223,14 @@ def process_video(
     board=None,
     try_hard=False,
 ):
-    # Get video metadata
-    cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
-    # cap.set(cv2.CAP_PROP_FFMPEG_HWACCEL, cv2.CAP_FFMPEG_HWACCEL_NVDEC)  # try to use
-
-    if not cap.isOpened():
-        errprint(f"Error: Could not open video: {video_path}")
+    try:
+        reader = VideoReader(video_path)
+    except OSError as e:
+        errprint(f"Error: {e}")
         return
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    cap.release()
+    fps = reader.fps
+    n_frames = reader.reported_frame_count
 
     # The true sensor frame period, immune to a file that is itself a decimated clip --
     # sizes the clock fit's inlier band instead of the possibly-subsampled frame spacing
@@ -280,12 +240,13 @@ def process_video(
     timeline_windowed = bool(windows)
 
     try:
-        windows = resolve_windows(windows, video_path)
+        windows = resolve_windows(windows, reader)
     except ValueError as e:
         errprint(f"Error: Unable to resolve the search windows: {e}")
+        reader.close()
         return
 
-    # Analyze frames
+    # Analyze frames, all windows sharing this file's one pts index
     timestamps = {}
     frame_times = {}
     window_frame_times = []
@@ -299,10 +260,12 @@ def process_video(
             debug_dir,
             board,
             try_hard,
+            reader=reader,
         )
         timestamps.update(window_timestamps)
         frame_times.update(window_times)
         window_frame_times.append(window_times)
+    reader.close()
 
     # Fit board time against the frames' own presentation timestamps, both in ms
     try:

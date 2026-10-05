@@ -33,7 +33,7 @@ class NpEncoder(json.JSONEncoder):
 
 def process_image(path, camera_type, debug_dir=None, board=None, try_hard=False):
     image = cv2.imread(path)
-    _, timestamp = process_frame(image, camera_type, 0, board, debug_dir, try_hard=try_hard)
+    timestamp = process_frame(image, camera_type, 0, board, debug_dir, try_hard=try_hard).board_time
     if timestamp is not None:
         succprint(f"first frame: {timestamp[0]} ms, last frame: {timestamp[1]} ms")
         # Interpret an image as a single-frame recording: its exposure window is its board-time span

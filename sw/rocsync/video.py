@@ -230,13 +230,13 @@ def process_video_window(
                 continue
 
             if scan_window > 0 or frame_number % stride == 0:
-                rocsync_detected, timestamp = process_frame(
+                decode = process_frame(
                     frame, camera_type, frame_number, board, debug_dir, try_hard=try_hard
                 )
                 scan_window -= 1
-                if timestamp is not None:
-                    timestamps[frame_number] = timestamp
-                if rocsync_detected:
+                if decode.board_time is not None:
+                    timestamps[frame_number] = decode.board_time
+                if decode.board_seen:
                     scan_window = 5
                     pbar.set_description(
                         f"Analyzing frames in time window {window_label} --> Found {len(timestamps)} timestamps"

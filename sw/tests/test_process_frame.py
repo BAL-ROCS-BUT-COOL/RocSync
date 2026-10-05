@@ -42,8 +42,8 @@ def test_piecewise(image, tmp_path):
 
 def test_full(image, tmp_path):
     """The whole RGB frame pipeline, from image to board time."""
-    detected, board_time = process_frame(
+    decode = process_frame(
         image, CameraType.RGB, frame_number=999, board=BOARD_V2, debug_dir=tmp_path
     )
-    assert detected, "board was not detected"
-    assert board_time == EXPECTED_BOARD_TIME
+    assert decode.reject is None, f"decode failed: {decode.reject}"
+    assert decode.board_time == EXPECTED_BOARD_TIME

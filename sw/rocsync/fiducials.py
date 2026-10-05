@@ -16,10 +16,13 @@ from scipy.spatial.transform import Rotation
 
 from rocsync.blobs import decode_camera
 from rocsync.board_profiles import BoardProfile
-from rocsync.decode import NO_BOARD, Decode
+from rocsync.decode import CLUTTERED, NO_BOARD, Decode
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
+
+# The board puts ~20-30 fiducials in its plane; the corner search is quadratic in this
+MAX_FIDUCIALS = 64
 
 
 @dataclass
@@ -29,11 +32,16 @@ class PlaneFit:
     source: str  # "pose" or "constellation"
 
 
-def plane_from_pose(position_xyz, quaternion_xyzw) -> PlaneFit:
-    """The board plane from a tracked rigid body's position and (x, y, z, w) rotation."""
-    rot = Rotation.from_quat(quaternion_xyzw).as_matrix()
+def plane_from_rotation(position_xyz, rotation) -> PlaneFit:
+    """The board plane from a tracked rigid body's position and 3x3 rotation."""
+    rot = np.asarray(rotation, dtype=float).reshape(3, 3)
     origin = np.asarray(position_xyz, dtype=float)
     return PlaneFit(origin=origin, basis=rot[:, :2].T.copy(), source="pose")
+
+
+def plane_from_pose(position_xyz, quaternion_xyzw) -> PlaneFit:
+    """The board plane from a tracked rigid body's position and (x, y, z, w) rotation."""
+    return plane_from_rotation(position_xyz, Rotation.from_quat(quaternion_xyzw).as_matrix())
 
 
 def plane_from_constellation(points: np.ndarray, tolerance_mm: float = 6.0) -> PlaneFit | None:
@@ -95,10 +103,16 @@ def decode_fiducials(
     plane: PlaneFit | None,
     plane_tolerance_mm: float = 5.0,
     tolerance_mm: float = 6.0,
+    max_fiducials: int = MAX_FIDUCIALS,
     ax: Axes | None = None,
 ) -> Decode:
-    """Decode from 3D fiducials on ``plane``, or on the corner constellation if None."""
+    """Decode from 3D fiducials on ``plane``, or on the corner constellation if None.
+
+    More than ``max_fiducials`` points are rejected as ``CLUTTERED`` before any search.
+    """
     points_3d = np.asarray(points_3d, dtype=float).reshape(-1, 3)
+    if len(points_3d) > max_fiducials:
+        return Decode(reject=CLUTTERED)
     if plane is None:
         plane = plane_from_constellation(points_3d, tolerance_mm)
     if plane is None:

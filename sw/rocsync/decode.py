@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+import numpy as np
+
 # Why a decode attempt produced no board time
 NO_BOARD = "no_board"  # the board is not in view
 NO_CORNERS = "no_corners"  # the board is in view but its corners could not be fitted
@@ -20,6 +22,7 @@ class Decode:
     ring_end: int = 0  # board time in ms at the last lit ring LED
     board_ms: float = 0.0
     exposure_ms: float = -1.0  # -1 on reject, since 0 is a valid exposure
+    aruco_corners: np.ndarray | None = None  # the board's marker in image pixels, if found
 
     @property
     def board_seen(self) -> bool:

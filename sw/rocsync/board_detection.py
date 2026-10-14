@@ -46,36 +46,36 @@ ALWAYS_ON, RING, COUNTER, ANCHOR, EXEMPT = 1, 2, 3, 4, 5
 _MODEL_CACHE = {}
 
 
-def _board_model(board):
+def _board_model(board, camera_type):
     """Layout map, expected always-on count and rotations for a board, built once.
 
     The layout map labels each pixel with the class of LED that belongs there. The ArUco
     marker footprint is exempt, since its white squares blob like LEDs in RGB images.
+    Cached per camera type, since RGB and IR are distinct LED sets.
     """
-    model = _MODEL_CACHE.get(board)
+    model = _MODEL_CACHE.get((board, camera_type))
     if model is None:
-        ir = CameraType.INFRARED
         size = board.board_size
         layout = np.zeros((size, size), dtype=np.uint8)
         cv2.fillConvexPoly(layout, np.rint(board.aruco_corners_coords).astype(np.int32), EXEMPT)
         # Coarsest class first, so finer labels win where tolerance discs overlap
         for label, coords in (
-            (COUNTER, board.counter_led_coords[ir]),
-            (RING, board.ring_led_coords(ir)),
-            (ANCHOR, board.always_on_leds[ir][:4]),
-            (ALWAYS_ON, board.always_on_leds[ir][4:]),
+            (COUNTER, board.counter_led_coords[camera_type]),
+            (RING, board.ring_led_coords(camera_type)),
+            (ANCHOR, board.always_on_leds[camera_type][:4]),
+            (ALWAYS_ON, board.always_on_leds[camera_type][4:]),
         ):
             for x, y in coords:
                 cv2.circle(layout, (round(x), round(y)), board.layout_tol, label, -1)
 
         # rotations[r] maps corners[k] onto corners[(k + r) % 4]
-        corners = board.transform_corners(ir).astype(np.float32)
+        corners = board.transform_corners(camera_type).astype(np.float32)
         rotations = [
             cv2.getPerspectiveTransform(corners, np.roll(corners, -r, axis=0)) for r in range(4)
         ]
-        n_always_on = len(board.always_on_leds[ir]) - 4
+        n_always_on = len(board.always_on_leds[camera_type]) - 4
         model = (layout, n_always_on, rotations)
-        _MODEL_CACHE[board] = model
+        _MODEL_CACHE[(board, camera_type)] = model
     return model
 
 
@@ -248,14 +248,14 @@ def _accept(score, n_always_on, ambiguous):
     )
 
 
-def _locate(points, board, min_diagonal):
+def _locate(points, board, min_diagonal, camera_type=CameraType.INFRARED):
     """The best candidate quad among ``points``, scored against ``board``, or None.
 
     ``None`` only when no candidate quad exists; a rejected quad is returned with
     ``accepted=False``.
     """
-    layout, n_always_on, rotations = _board_model(board)
-    ir_corners = board.transform_corners(CameraType.INFRARED)
+    layout, n_always_on, rotations = _board_model(board, camera_type)
+    target_corners = board.transform_corners(camera_type)
     points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
 
     best_key, best_score, best_corners, ambiguous = None, None, None, False
@@ -265,7 +265,7 @@ def _locate(points, board, min_diagonal):
 
         for quad in quads:
             corners = points[quad].astype(np.float32)
-            homography = cv2.getPerspectiveTransform(corners, ir_corners)
+            homography = cv2.getPerspectiveTransform(corners, target_corners)
             # The corners land on the model by construction, so score the other points only
             others = np.delete(points, quad, axis=0)
             scores = [_score(others, rot @ homography, layout) for rot in rotations]
@@ -291,30 +291,33 @@ def _locate(points, board, min_diagonal):
     )
 
 
-def find_board(points, board, min_diagonal=0.0):
+def find_board(points, board, min_diagonal=0.0, camera_type=CameraType.INFRARED):
     """The board's four corners among ``points``, in ``transform_corners`` order, or None.
 
     ``points`` may be image blobs or a tracker's 2D or projected-3D centroids.
     ``min_diagonal`` is the resolution floor from ``min_board_diagonal`` for points
-    extracted from an image; leave it at 0 for tracker centroids.
+    extracted from an image; leave it at 0 for tracker centroids. ``camera_type`` selects
+    the board's RGB or IR LED layout.
 
     The corners are rotated into correspondence with the model, so the resulting warp
     is upright.
     """
-    fit = _locate(points, board, min_diagonal)
+    fit = _locate(points, board, min_diagonal, camera_type)
     return fit.corners if fit is not None and fit.accepted else None
 
 
-def find_corners_layout(mask, board, frame_number=None, debug_dir=None):
+def find_corners_layout(
+    mask, board, frame_number=None, debug_dir=None, camera_type=CameraType.INFRARED
+):
     """``find_board`` from a binary mask instead of pre-extracted points."""
     points = detect_blobs(mask)
-    fit = _locate(points, board, min_board_diagonal(board))
+    fit = _locate(points, board, min_board_diagonal(board), camera_type)
     if debug_dir:
-        _write_debug(mask, points, fit, board, frame_number, debug_dir)
+        _write_debug(mask, points, fit, board, frame_number, debug_dir, camera_type)
     return fit.corners if fit is not None and fit.accepted else None
 
 
-def _write_debug(mask, points, fit, board, frame_number, debug_dir):
+def _write_debug(mask, points, fit, board, frame_number, debug_dir, camera_type):
     image = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
     for x, y in points:
         cv2.circle(image, (round(x), round(y)), 6, (0, 0, 255), 1)
@@ -323,9 +326,9 @@ def _write_debug(mask, points, fit, board, frame_number, debug_dir):
         corners = fit.corners
         # Model LEDs pulled back into the image show how well the winner actually fits.
         inverse = np.linalg.inv(
-            cv2.getPerspectiveTransform(corners, board.transform_corners(CameraType.INFRARED))
+            cv2.getPerspectiveTransform(corners, board.transform_corners(camera_type))
         )
-        for x, y in _project(board.layout_coords(CameraType.INFRARED), inverse):
+        for x, y in _project(board.layout_coords(camera_type), inverse):
             if np.isfinite(x) and np.isfinite(y):
                 cv2.drawMarker(image, (round(x), round(y)), (255, 128, 0), cv2.MARKER_CROSS, 4)
 

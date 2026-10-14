@@ -123,7 +123,12 @@ void i2c_time_sync_poll(const volatile uint32_t *board_time_ms)
     // it is correct across a plain uint32_t wraparound, except right at the wrap point
     // itself, where it under-counts the elapsed time and triggers one early broadcast --
     // harmless, and rare enough (once per ~29h on REV2) not to warrant extra handling.
-    if (now - last_broadcast_ms < I2C_TIME_SYNC_PERIOD_MS)
+    //
+    // The frame carries the next counter value, so the gate opens one tick before PERIOD
+    // has elapsed: the frame then lands exactly PERIOD after the previous one. A poll that
+    // misses that tick (see i2c_time_sync_poll()'s contract) sends the frame later, not
+    // earlier, and the period restarts from wherever it went out.
+    if (now - last_broadcast_ms < I2C_TIME_SYNC_PERIOD_MS - 1)
         return;
 
     // The frame is sent the moment board_time_ms takes the value it carries, so a follower

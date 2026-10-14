@@ -88,10 +88,11 @@ link quantised to 1ms would be by far the largest error in its chain.
 
 ## Cadence
 
-RocSync broadcasts roughly every 100ms (once per ring rotation). This is sized for fast acquisition
-latency on (re)connection — a module that just powered on gets a usable sample within ~100ms —
-**not** for oscillator-drift compensation; 100ms is far too short a window for crystal drift to
-matter at the precision this system already targets everywhere else.
+RocSync broadcasts every 100ms (once per ring rotation): consecutive frames carry values exactly
+100 apart. This is sized for fast acquisition latency on (re)connection — a module that just
+powered on gets a usable sample within ~100ms — **not** for oscillator-drift compensation; 100ms is
+far too short a window for crystal drift to matter at the precision this system already targets
+everywhere else.
 
 Broadcast cadence jitter is harmless: every broadcast waits for the next increment of
 `board_time_ms` and carries exactly that value. Don't read anything into the spacing between
@@ -195,7 +196,10 @@ RocSync's I2C1 peripheral runs in master mode only, at 100kHz standard mode, on 
 (SCL) — see [`i2c_time_sync.c`](src/i2c_time_sync.c). The broadcast is issued from the main loop
 (not from the SysTick ISR that drives LED timing), as a blocking, timeout-guarded transaction; every
 wait is bounded so the main loop can never wedge. Waiting for the next increment (see
-[Frame timing](#frame-timing)) blocks the loop for up to 1ms more per broadcast.
+[Frame timing](#frame-timing)) blocks the loop for up to 1ms more per broadcast. The main loop
+idles in 100µs slices and polls the broadcast schedule between them: a frame can only be started
+by a poll that lands in the one millisecond before it is due, which a coarser loop could not
+guarantee.
 
 **No follower connected is the normal, expected state**, not a fault — most of the time nothing
 will be plugged in. The general-call address goes unacknowledged in that case; RocSync detects this

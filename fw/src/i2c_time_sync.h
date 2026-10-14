@@ -9,9 +9,13 @@
 void i2c_time_sync_init(uint32_t wrap_ms);
 
 // Call from the main loop with the live board-time counter. Broadcasts a time-sync frame
-// over I2C general call at most once every 100ms, starting it the moment the counter
-// takes the value the frame carries; a cheap no-op otherwise. When a broadcast is due it
-// blocks for up to 1ms, waiting for the next increment.
+// over I2C general call every 100ms, starting it the moment the counter takes the value
+// the frame carries; a cheap no-op otherwise. When a broadcast is due it blocks for up to
+// 1ms, waiting for the next increment.
+//
+// Call it more often than once per ms, with margin (every ~100us): a frame can only be
+// started by a poll that lands in the one ms before it is due, so a coarser call interval
+// delays frames by an amount that depends on how the loop phase falls against the tick.
 void i2c_time_sync_poll(const volatile uint32_t *board_time_ms);
 
 #endif

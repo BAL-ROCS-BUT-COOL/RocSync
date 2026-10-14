@@ -338,7 +338,13 @@ int main()
     while (1)
     {
         poll_buttons();
-        i2c_time_sync_poll(&board_time_ms);
-        Delay_Ms(50);
+
+        // Idle for ~50ms in slices far shorter than the 1ms board-time tick, so the
+        // time-sync poll always runs within the tick before a frame is due.
+        for (int i = 0; i < 500; i++)
+        {
+            i2c_time_sync_poll(&board_time_ms);
+            Delay_Us(100);
+        }
     }
 }

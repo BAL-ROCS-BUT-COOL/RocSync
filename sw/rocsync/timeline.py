@@ -167,12 +167,24 @@ def fit_timeline(
     if threshold is None:
         threshold = measured_residual_threshold_ms(frame_period_ms)
 
-    model = RANSACRegressor(
-        residual_threshold=threshold,  # max one frame deviation
-        max_trials=max_trials,  # more trials for more consistent results
-        random_state=0,  # deterministic results
-    )
-    model.fit(x, y)
+    span = float(np.ptp(x))
+
+    def spread(x_pair, _y_pair):
+        # Two sightings close in time fit their own window but can miss a distant one
+        return abs(x_pair[1, 0] - x_pair[0, 0]) >= span / 2
+
+    # A lone misdecode at either end is in every spread pair, so an unrestricted search runs too
+    candidates = [
+        RANSACRegressor(
+            residual_threshold=threshold,  # max one frame deviation
+            max_trials=max_trials,  # more trials for more consistent results
+            random_state=0,  # deterministic results
+            is_data_valid=is_data_valid,
+        ).fit(x, y)
+        for is_data_valid in (spread, None)
+    ]
+    # More inliers wins; on a tie, the spread search
+    model = max(candidates, key=lambda candidate: int(candidate.inlier_mask_.sum()))
 
     # RANSACRegressor defaults to a LinearRegression base estimator
     estimator = cast(LinearRegression, model.estimator_)

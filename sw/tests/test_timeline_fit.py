@@ -7,6 +7,7 @@ here come from a real ZED recording (5046 frames, one 27.8 s dropout at ~11.2 s)
 where the index fit reported 0.858x and a first frame of -5.593 s.
 """
 
+import numpy as np
 import pytest
 
 from rocsync.timeline import (
@@ -106,6 +107,40 @@ def test_fit_measures_a_drifting_clock():
     frame_times = {i: i * PERIOD for i in range(4000)}
     fit = fit_timeline(frame_times, board_timestamps(frame_times, clock_rate=1.0000086, stride=30))
     assert fit.clock_rate == pytest.approx(1.0000086, abs=1e-9)
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_fit_spans_a_distant_window_with_few_sightings(seed):
+    """Two sightings from the busy window are both inliers, but extrapolate past the other."""
+    period = 1000 / 59.94
+    clock_rate = 1.000025
+    rng = np.random.default_rng(seed)
+    busy = rng.choice(2400, 200, replace=False)  # 40 s window
+    sparse = 92_000 + rng.choice(600, 4, replace=False)  # 10 s window, 25 min later
+    frame_times = {int(k): k * period for k in np.concatenate([busy, sparse])}
+    timestamps = {}
+    for k, pts in frame_times.items():
+        start = clock_rate * pts + 1234.5 + rng.uniform(-2.0, 2.0)  # exposure jitter
+        timestamps[k] = (start, start + 9.0)
+
+    fit = fit_timeline(frame_times, timestamps, frame_period_ms=period)
+
+    assert fit.inlier_mask.all()
+    assert fit.clock_rate == pytest.approx(clock_rate, abs=5e-6)
+
+
+def test_fit_rejects_a_lone_misdecode_far_from_the_board_window():
+    frame_times = {i: i * PERIOD for i in range(1200)}
+    timestamps = board_timestamps(frame_times, stride=5)
+    far = 50_000  # 27 min after the window
+    frame_times[far] = far * PERIOD
+    timestamps[far] = (far * PERIOD + 1234.5 + 5000.0, far * PERIOD + 1234.5 + 5009.0)
+
+    fit = fit_timeline(frame_times, timestamps)
+    rejected = {k for k, ok in zip(fit.order, fit.inlier_mask, strict=True) if not ok}
+
+    assert rejected == {far}
+    assert fit.clock_rate == pytest.approx(1.0, abs=1e-9)
 
 
 def test_median_frame_period_never_returns_zero():

@@ -11,9 +11,9 @@ from matplotlib.ticker import MaxNLocator
 from tqdm import tqdm
 
 from rocsync.clips import MAX_FRAMES_IN_FLIGHT
-from rocsync.printer import errprint, print, printresult, warnprint
+from rocsync.printer import errprint, warnprint
+from rocsync.recording_statistics import print_statistics, warn_about_statistics
 from rocsync.timeline import source_frame_period_ms, summarize_timeline
-from rocsync.video_statistics import VideoStatistics
 from rocsync.vision import CameraType, process_frame
 
 
@@ -325,23 +325,7 @@ def process_video(
             f"presentation timestamp and were excluded from the fit."
         )
 
-    # Warn below 80% inliers
-    if np.sum(fit.inlier_mask) < 0.8 * len(fit.order):
-        warnprint(
-            f"WARNING: Estimated model has fewer than 80% inliers ({np.sum(fit.inlier_mask) / len(fit.order):.2%})."
-        )
-    if abs(fit.clock_rate - 1) > 0.05:
-        warnprint(
-            f"WARNING: Container clock runs at {fit.clock_rate:.4f}x board time; "
-            f"expected approximately 1x."
-        )
-
-    if statistics.n_dropped_frames:
-        warnprint(
-            f"WARNING: {statistics.n_dropped_frames} frames missing from the container in "
-            f"{statistics.n_gaps} gap(s), largest {statistics.largest_gap_ms / 1000:.3f} s."
-        )
-
+    warn_about_statistics(statistics)
     print_statistics(statistics)
 
     if debug_dir:
@@ -361,65 +345,6 @@ def process_video(
         export_frames(video_path, export_dir, fit, n_frames)
 
     return statistics
-
-
-def print_statistics(statistics: VideoStatistics):
-    format_str = "{:<40} {:>30}"
-    print(71 * "-")
-    # TODO: find proper thresholds
-    printresult(
-        "Number of considered frames",
-        statistics.n_considered_frames,
-        statistics.n_considered_frames > 10,
-    )
-    printresult(
-        "Number of rejected outliers",
-        statistics.n_rejected_frames,
-        statistics.n_rejected_frames < 0.1 * statistics.n_frames,
-    )
-    printresult(
-        "R2 (before/after outlier rejection)",
-        f"{statistics.r2_before:.4f}/{statistics.r2_after:.4f}",
-        statistics.r2_after > 0.99,
-    )
-    printresult(
-        "RMSE (before/after outlier rejection)",
-        f"{statistics.rmse_before:.2f}/{statistics.rmse_after:.2f} ms",
-        statistics.rmse_after < 2,
-    )
-    printresult(
-        "Dropped frames",
-        f"{statistics.n_dropped_frames} in {statistics.n_gaps} gap(s), max {statistics.largest_gap_ms / 1000:.3f} s",
-        statistics.n_dropped_frames == 0,
-    )
-    print(format_str.format("First frame:", f"{statistics.first_frame / 1000:.3f} s"))
-    print(format_str.format("Last frame:", f"{statistics.last_frame / 1000:.3f} s"))
-    print(
-        format_str.format(
-            "Framerate (nominal/measured):",
-            f"{statistics.nominal_fps:.3f}/{statistics.measured_fps:.3f} fps",
-        )
-    )
-    print(
-        format_str.format(
-            "Clock rate (board/container):",
-            f"{statistics.clock_rate:.6f}x",
-        )
-    )
-    scope = "analyzed window" if statistics.timeline_windowed else "container"
-    print(
-        format_str.format(
-            f"Duration ({scope}/board):",
-            f"{statistics.container_duration / 1000:.3f}/{statistics.board_duration / 1000:.3f} s (Δ={statistics.board_duration - statistics.container_duration:.2f} ms)",
-        )
-    )
-    print(
-        format_str.format(
-            "Exposure time (mean/min/max/std):",
-            f"{statistics.mean_exposure_time:.2f}/{statistics.min_exposure_time:.2f}/{statistics.max_exposure_time:.2f}/{statistics.std_exposure_time:.2f} ms",
-        )
-    )
-    print(71 * "-")
 
 
 def plot_timechart(

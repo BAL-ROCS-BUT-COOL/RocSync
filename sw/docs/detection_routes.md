@@ -8,11 +8,16 @@ board time was read; otherwise it names the reason.
 | Route | Entry point | Input |
 |---|---|---|
 | Image | `vision.process_frame` | RGB or IR image |
+| 2D points | `blobs.decode_camera` | 2D points, e.g. a tracker's blob centroids |
 
 The RGB and IR image routes differ only in how the board corners are found: via the ArUco
 marker and corner LEDs in RGB, and via `board_detection.find_corners_layout` in IR, where
 the marker is not visible. Both then warp the board upright and read each LED from the
 image intensity at its expected position.
+
+The 2D-point route has no marker to identify the board revision, so the caller supplies
+it, as `--board-version` does for the IR image route. Filtering points by a tracker's
+status flags is also left to the caller.
 
 ## Locating the board among 2D points
 

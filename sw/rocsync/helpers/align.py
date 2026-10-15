@@ -272,6 +272,14 @@ def main():
     succprint(f"Aligned {started} videos into {args.output_dir}")
 
 
+def encoder_args(use_nvenc):
+    """ffmpeg arguments for a near-lossless encode at about the size of a camera's own file."""
+    if use_nvenc:
+        # -crf is ignored by hevc_nvenc, which takes a constant quantiser instead
+        return ["-c:v", "hevc_nvenc", "-rc", "constqp", "-qp", "22", "-preset", "p5"]
+    return ["-c:v", "libx265", "-crf", "20"]
+
+
 def align_command(
     video_path, output_file, start_s, duration_s, tail_s, clock_rate, audio, reencode, use_nvenc
 ):
@@ -294,10 +302,7 @@ def align_command(
     ]
     if reencode:
         command += [
-            "-c:v",
-            "hevc_nvenc" if use_nvenc else "libx265",
-            "-crf",
-            "0",
+            *encoder_args(use_nvenc),
             # B-frames make the encoders reorder and misplace timestamps that are not on a grid
             "-bf",
             "0",

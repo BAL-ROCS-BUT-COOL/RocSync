@@ -119,11 +119,13 @@ rocsync-align output.json --output_dir synced
 | --- | --- |
 | `--output_dir DIR` | Where synchronized videos are written; a relative path is taken inside each video's own folder, an absolute one is used as is (default: `synced`) |
 | `--reencode` | Re-encode the video, so it starts and ends on exact frames without a container edit list; significantly slower |
+| `--fps FPS` | Resample every video to this constant frame rate, so all outputs have the same number of frames; implies `--reencode` |
 | `--jobs N` | Maximum concurrent `ffmpeg` processes, or `0` for no limit (default: `4`) |
 
-Every output keeps its source's frames and frame timing, a variable frame rate included, and
-covers the board-time span that all videos share. It starts on the source frame nearest the
-span's start and ends on the one nearest its end, so each is at most half a source frame off.
+Unless `--fps` is given, every output keeps its source's frames and frame timing, a variable
+frame rate included, and covers the board-time span that all videos share. It starts on the
+source frame nearest the span's start and ends on the one nearest its end, so each is at most
+half a source frame off.
 
 Each timestamp is the board time since that first frame, so the clock drift is gone: the
 videos stay in step to their last frame, and every output starts at time 0. An audio track is
@@ -134,6 +136,10 @@ resampled the same way and stored as AAC at the source's bit rate.
   few frames long when the video has B-frames.
 - With `--reencode`, the video is encoded without B-frames, and cut exactly at the first and
   last frame.
+- With `--fps FPS`, the output frames are on a constant grid from the span's start: frame `k`
+  is the source frame nearest board time `k / FPS` after it, repeated or skipped as the source
+  rate requires, and the audio is cut to the same span. Every video gets the same number of
+  frames, and each shows its nearest source frame, at most half a source frame off.
 
 This needs `ffmpeg` on your `PATH`; `--reencode` uses `hevc_nvenc` when the available `ffmpeg`
 provides it.

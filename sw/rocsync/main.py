@@ -3,6 +3,7 @@ import json
 import math
 import os
 import pathlib
+import sys
 from pathlib import Path
 
 import cv2
@@ -194,7 +195,11 @@ def main():
         parser.error("--ftk-marker-id requires an explicit --board-version")
 
     board = PROFILES_BY_NAME.get(args.board_version) if args.board_version != "auto" else None
-    ftk_marker_ids = {args.ftk_marker_id: board} if args.ftk_marker_id is not None else None
+    ftk_marker_ids = (
+        {args.ftk_marker_id: board}
+        if args.ftk_marker_id is not None and board is not None
+        else None
+    )
 
     # Parse the search windows; they are resolved against the video and merged later
     windows = []
@@ -219,7 +224,7 @@ def main():
             files.add(path_obj.resolve())
         else:
             errprint(f"Invalid path: {path}")
-            return
+            return 1
 
     videos = sorted([f for f in files if f.suffix.lower() in VIDEO_SUFFIXES])
     images = sorted([f for f in files if f.suffix.lower() in [".png", ".jpg", ".jpeg"]])
@@ -258,6 +263,7 @@ def main():
             result = json.load(file)
         print(f"Loaded previous results from {args.output}")
 
+    failed = []
     for file in tqdm(videos + images + ftk_recordings, desc="Processing files", position=0):
         if str(file) in result:
             print(f"\nSkipping {file}, already processed.")
@@ -311,6 +317,7 @@ def main():
             result[str(file)] = {"type": entry_type, **ret}
         else:
             errprint(f"\nError: Unable to time-sync {file}.")
+            failed.append(file)
 
         # Save result to file after every video to avoid data loss
         # Serialized before opening, so a non-finite value can't truncate earlier results
@@ -318,6 +325,14 @@ def main():
         output_path.write_text(text)
         print(f"\nResult written to {args.output}")
 
+    if failed:
+        errprint(
+            f"\nUnable to time-sync {len(failed)} of {len(videos + images + ftk_recordings)} files:"
+        )
+        for file in failed:
+            errprint(f"    {file}")
+        return 1
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

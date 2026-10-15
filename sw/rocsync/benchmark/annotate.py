@@ -1106,7 +1106,9 @@ class AnnotationTool:
         except ValueError:
             idx = -1
         new_id, new_visible = states[(idx + 1) % len(states)]
-        new_board = PROFILES_BY_ARUCO[new_id].rectify() if new_id in PROFILES_BY_ARUCO else self.board
+        new_board = (
+            PROFILES_BY_ARUCO[new_id].rectify() if new_id in PROFILES_BY_ARUCO else self.board
+        )
         self._switch_layout(new_board, self.camera, new_visible, new_id)
 
     def _cycle_camera(self):
@@ -1163,6 +1165,7 @@ class AnnotationTool:
             # center a scaled copy of the board layout on the image, matching the
             # centering a freshly loaded frame gets in `run()`.
             new_corner_pos = corner_led_positions(new_board, new_camera)
+            scale, ox, oy = 1.0, 0.0, 0.0
             if new_ann.homography is None:
                 img_h, img_w = self._current_image.shape[:2]
                 scale = 0.5 * min(img_w, img_h) / new_board.board_size
@@ -1177,7 +1180,9 @@ class AnnotationTool:
                 c["visible"] = False
             self.annotation = new_ann
 
-        self.status_msg = f"Layout changed to {new_board.profile.name}/{new_camera.value} — Esc to undo"
+        self.status_msg = (
+            f"Layout changed to {new_board.profile.name}/{new_camera.value} — Esc to undo"
+        )
         self.mode = Mode.LAYOUT_CONFIRM
         self._needs_redraw = True
 

@@ -228,7 +228,12 @@ def process_ftk_recording(
     timeline_windowed = bool(windows)
     try:
         windows = resolve_windows(
-            windows, lambda: (last_ts - first_ts) * FTK_TICK_S if first_ts is not None else None
+            windows,
+            lambda: (
+                (last_ts - first_ts) * FTK_TICK_S
+                if first_ts is not None and last_ts is not None
+                else None
+            ),
         )
     except ValueError as e:
         errprint(f"Error: Unable to resolve the search windows: {e}")
@@ -252,6 +257,7 @@ def process_ftk_recording(
 
     with open(filename) as file, tqdm(total=total_lines, desc=describe(), position=1) as pbar:
         for ftk_timestamp, markers, fiducials in _iter_frames(file, pbar):
+            assert first_ts is not None  # the scan saw this frame
             # Window times run from the first frame, not from the tracker's boot
             offset_s = (ftk_timestamp - first_ts) * FTK_TICK_S
             while current < len(windows) and offset_s > windows[current][1]:
@@ -308,7 +314,9 @@ def process_ftk_recording(
                 if result.reject is None:
                     n_constellation_decodes += 1
 
-            if fig is not None:
+            if fig is not None and ax is not None:
+                import matplotlib.pyplot as plt
+
                 ax.set_title(f"{frame_board.name} {result.reject or source}")
                 fig.savefig(f"{debug_dir}/{ftk_timestamp}.png", bbox_inches="tight")
                 plt.close(fig)

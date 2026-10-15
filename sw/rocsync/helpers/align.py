@@ -139,6 +139,14 @@ def main():
         "container edit list (significantly slower)",
     )
     parser.add_argument(
+        "--fps",
+        type=int,
+        default=None,
+        help="Resample every video to this constant frame rate: each output frame is the source "
+        "frame nearest its board time, and all outputs get the same number of frames. "
+        "Implies --reencode",
+    )
+    parser.add_argument(
         "--jobs",
         type=int,
         default=4,
@@ -149,6 +157,10 @@ def main():
 
     if args.jobs < 0:
         parser.error("--jobs must be 0 (unlimited) or a positive number")
+    if args.fps is not None and args.fps <= 0:
+        parser.error("--fps must be a positive number")
+    if args.fps:
+        args.reencode = True
 
     with open(args.sync_file) as file:
         stats = json.load(file)
@@ -231,26 +243,43 @@ def main():
                 continue
 
         pts, board = timings[file]
-        clock_rate, _ = affine_from_statistics(statistics)
-        # Each video starts and ends on its frames nearest the common span's ends
-        first = int(np.argmin(np.abs(board - origin_ms)))
-        last = int(np.argmin(np.abs(board - end_ms)))
-        # A re-encode keeps what lies before the cut's end, so that must fall between the
-        # last frame and the next; a stream copy cuts by decode order and keeps it tight
-        next_gap_ms = (
-            pts[last + 1] - pts[last] if last + 1 < len(pts) else median_frame_period(pts, 0.0)
-        )
-        ffmpeg_command = align_command(
-            file,
-            output_file,
-            start_s=seek_base_s(file) + pts[first] / 1000,
-            duration_s=(pts[last] - pts[first]) / 1000,
-            tail_s=next_gap_ms / 2000 if args.reencode else CUT_LEAD_S,
-            clock_rate=clock_rate,
-            audio=audio_stream(file),
-            reencode=args.reencode,
-            use_nvenc=use_nvenc,
-        )
+        clock_rate, clock_offset_ms = affine_from_statistics(statistics)
+        if args.fps:
+            base_s = seek_base_s(file)
+            # Decode from the frame before the one nearest the start, so that frame has a
+            # predecessor to find the midpoint with
+            before = max(int(np.argmin(np.abs(board - origin_ms))) - 1, 0)
+            ffmpeg_command = resample_command(
+                file,
+                output_file,
+                seek_s=base_s + pts[before] / 1000 - CUT_LEAD_S,
+                cut_s=base_s + (origin_ms - clock_offset_ms) / clock_rate / 1000,
+                span_ms=end_ms - origin_ms,
+                clock_rate=clock_rate,
+                frame_rate=args.fps,
+                audio=audio_stream(file),
+                use_nvenc=use_nvenc,
+            )
+        else:
+            # Each video starts and ends on its frames nearest the common span's ends
+            first = int(np.argmin(np.abs(board - origin_ms)))
+            last = int(np.argmin(np.abs(board - end_ms)))
+            # A re-encode keeps what lies before the cut's end, so that must fall between the
+            # last frame and the next; a stream copy cuts by decode order and keeps it tight
+            next_gap_ms = (
+                pts[last + 1] - pts[last] if last + 1 < len(pts) else median_frame_period(pts, 0.0)
+            )
+            ffmpeg_command = align_command(
+                file,
+                output_file,
+                start_s=seek_base_s(file) + pts[first] / 1000,
+                duration_s=(pts[last] - pts[first]) / 1000,
+                tail_s=next_gap_ms / 2000 if args.reencode else CUT_LEAD_S,
+                clock_rate=clock_rate,
+                audio=audio_stream(file),
+                reencode=args.reencode,
+                use_nvenc=use_nvenc,
+            )
 
         # ffmpeg runs in the background, so throttle before starting another one
         while args.jobs and len(running) >= args.jobs:
@@ -323,20 +352,68 @@ def align_command(
             "-bsf:v",
             f"setts=pts=PTS{ticks}:dts=DTS{ticks}:time_base=1/{TIME_BASE_HZ}",
         ]
+    return [*command, *audio_args(audio, clock_rate), "-y", output_file]
+
+
+def audio_args(audio, clock_rate, trim=None):
+    """ffmpeg arguments retiming the audio onto board time and encoding it as AAC.
+
+    `audio` is `audio_stream`'s answer. `trim` is (start_s, duration_s) in board seconds
+    of the retimed audio, for a cut the input options did not make.
+    """
     if audio is None:
-        command += ["-an"]
-    else:
-        sample_rate, bit_rate = audio
-        # Played slower by the clock error, then converted back to the sample rate
-        command += [
-            "-af",
-            f"asetrate={sample_rate}/{clock_rate},aresample={sample_rate}",
-            "-c:a",
-            "aac",
-            "-b:a",
-            str(bit_rate),
-        ]
-    return [*command, "-y", output_file]
+        return ["-an"]
+    sample_rate, bit_rate = audio
+    # Played slower by the clock error, then converted back to the sample rate
+    filters = f"asetrate={sample_rate}/{clock_rate},aresample={sample_rate}"
+    if trim:
+        filters += f",atrim=start={trim[0]:.6f}:duration={trim[1]:.6f},asetpts=PTS-STARTPTS"
+    return ["-af", filters, "-c:a", "aac", "-b:a", str(bit_rate)]
+
+
+def resample_command(
+    video_path,
+    output_file,
+    seek_s,
+    cut_s,
+    span_ms,
+    clock_rate,
+    frame_rate,
+    audio,
+    use_nvenc,
+):
+    """ffmpeg command re-encoding the `span_ms` of board time from `cut_s` at the constant
+    `frame_rate`, each output frame the source frame nearest its board time.
+
+    Both `seek_s`, where decoding starts, and `cut_s` are ffmpeg input seconds. Every output
+    frame within the span is written, so the count follows from the span alone.
+    """
+    lead_s = cut_s - seek_s
+    # fps shows each frame from its timestamp until the next frame's, so stamping a frame at
+    # its midpoint with the previous one makes the frame shown the nearest, however the
+    # frames are spaced. The first frame has no previous one, and keeps its own time.
+    midpoint = "if(isnan(PREV_INPTS)\\,PTS\\,(PTS+PREV_INPTS)/2)"
+    timing = (
+        f"settb=1/{TIME_BASE_HZ},"
+        f"setpts=({midpoint}-{lead_s:.6f}/TB)*{clock_rate},"
+        f"fps={frame_rate}:start_time=0:round=up"
+    )
+    return [
+        "ffmpeg",
+        "-ss",
+        f"{seek_s:.6f}",
+        "-i",
+        video_path,
+        *encoder_args(use_nvenc),
+        "-vf",
+        timing,
+        # Counted rather than timed with -t, which would count in source time
+        "-frames:v",
+        str(int(span_ms * frame_rate / 1000 + 1e-6) + 1),
+        *audio_args(audio, clock_rate, trim=(lead_s * clock_rate, span_ms / 1000)),
+        "-y",
+        output_file,
+    ]
 
 
 if __name__ == "__main__":

@@ -404,10 +404,7 @@ def resample_command(
         f"{seek_s:.6f}",
         "-i",
         video_path,
-        "-c:v",
-        "hevc_nvenc" if use_nvenc else "libx265",
-        "-crf",
-        "0",
+        *encoder_args(use_nvenc),
         "-vf",
         timing,
         # Counted rather than timed with -t, which would count in source time

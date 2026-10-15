@@ -144,7 +144,7 @@ resampled the same way and stored as AAC at the source's bit rate.
 This needs `ffmpeg` on your `PATH`; `--reencode` uses `hevc_nvenc` when the available `ffmpeg`
 provides it.
 
-Re-encoded video is near-lossless, not lossless: constant quality, at about the size of a camera's
+Re-encoded video (`--reencode` and `--fps`) is near-lossless, not lossless: constant quality, at about the size of a camera's
 own file (`libx265 -crf 20`, or `hevc_nvenc -qp 22`). An `ffmpeg` or driver version that ignores
 these settings would change the quality and size, so check a file if either matters.
 

@@ -1,7 +1,7 @@
 """Raw recordings to synced videos on full-length real footage, the way a user runs it.
 
 Per session: `rocsync` on each recording within its board windows, `rocsync-align` on
-the result both by stream copy and with `--compensate-drift`, then `rocsync` again on
+the result by stream copy, with `--reencode` and with `--fps`, then `rocsync` again on
 every synced file. The windows, any further `rocsync` options and how each recording is
 judged come from `e2e_real_samples.json` (see `generate_real_samples_manifest.py`).
 
@@ -50,7 +50,7 @@ pytestmark = [pytest.mark.e2e, requires_ffmpeg]
 
 DATA_DIR_VAR = "ROCSYNC_REAL_SAMPLES_DIR"
 MANIFEST = Path(__file__).with_name("e2e_real_samples.json")
-MODES = {"stream_copy": (), "compensated": ("--compensate-drift",)}
+MODES = {"stream_copy": (), "reencoded": ("--reencode",), "resampled": ("--fps", "30")}
 
 
 def _manifest():
@@ -115,7 +115,7 @@ class SessionRun:
     synced: dict = field(default_factory=dict)  # by mode
 
 
-def output_windows(windows, entry, origin_ms, mode, duration_s, padding_s):
+def output_windows(windows, entry, origin_ms, duration_s, padding_s):
     """[(start, end, sighted)]: a recording's board windows, moved onto its synced file.
 
     Placed by the raw fit and the common start, which only need to be right to well
@@ -123,10 +123,9 @@ def output_windows(windows, entry, origin_ms, mode, duration_s, padding_s):
     cut no deeper than half that padding.
     """
     rate, offset = entry["clock_rate"], entry["clock_offset_ms"]
-    scale = rate if mode == "stream_copy" else 1.0  # a stream copy keeps its own clock
 
     def moved(t):
-        return (rate * t * 1000 + offset - origin_ms) / scale / 1000
+        return (rate * t * 1000 + offset - origin_ms) / 1000
 
     placed = []
     for start, end in windows:
@@ -173,7 +172,7 @@ def session(request, tmp_path_factory):
             synced.files[stem] = path
             duration_s = frame_pts(path)[-1] / 1000
             placed = output_windows(
-                recordings[stem]["windows"], entry, origin_ms, mode, duration_s, padding_s
+                recordings[stem]["windows"], entry, origin_ms, duration_s, padding_s
             )
             # A window at a time, so each fit is judged where it has seen the board
             synced.windows[stem] = []
@@ -203,11 +202,10 @@ def start_estimates(session, mode, stem):
 
     Each window's fit is read at the window's centre, where even a fit whose rate is
     poorly pinned is not extrapolating. Only windows that keep their sightings count: one
-    cut deeper may keep just a few at one edge, far from its centre. Board time
-    runs at the camera's own rate in a stream copy and at board rate in a compensated file.
+    cut deeper may keep just a few at one edge, far from its centre. Every mode puts the
+    file on board time, so its own clock should run at rate 1.
     """
     raw = session.raw[stem]
-    rate = raw["clock_rate"] if mode == "stream_copy" else 1.0
     estimates = []
     for judged in session.synced[mode].windows[stem]:
         fit = judged.fit
@@ -221,13 +219,11 @@ def start_estimates(session, mode, stem):
             fit["rmse_after"] / math.sqrt(fit["n_considered_frames"])
             + rate_stderr * (end_s - start_s) * 500
         )
-        # Carrying a stream copy back to its first frame leans on the raw fit's rate
-        carry_ms = raw["extrapolation_stderr_ms"] if mode == "stream_copy" else 0.0
         estimates.append(
             (
                 judged.window,
-                board_at(fit, centre_ms) - rate * centre_ms,
-                half_frame_ms(raw) + fit_ms + carry_ms,
+                board_at(fit, centre_ms) - centre_ms,
+                half_frame_ms(raw) + fit_ms,
             )
         )
     return estimates
@@ -330,9 +326,10 @@ def test_synced_recordings_start_on_the_same_board_time(session, mode):
     assert not failures, "\n".join(failures)
 
 
-def test_compensated_recordings_run_on_board_time(session):
+@pytest.mark.parametrize("mode", MODES)
+def test_synced_recordings_run_on_board_time(session, mode):
     # Read at windows far apart, one camera's first frame must come out the same
-    estimates = judged(session, "compensated")
+    estimates = judged(session, mode)
     pairs = [
         ((stem, a), (stem, b)) for stem, own in estimates.items() for a, b in combinations(own, 2)
     ]

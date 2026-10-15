@@ -230,9 +230,9 @@ configured skips itself.
 
 | Tier | What it runs | Needs | Takes |
 | --- | --- | --- | --- |
-| `tests/test_e2e_align.py` | `rocsync-align` on synthetic cameras whose clock is known, in stream-copy and `--compensate-drift` mode | `ffmpeg` | under a minute |
+| `tests/test_e2e_align.py` | `rocsync-align` on synthetic cameras whose clock is known, by stream copy, with `--reencode` and with `--fps` | `ffmpeg` | under a minute |
 | `tests/test_e2e_benchmark.py` | `rocsync` on the annotated benchmark videos, scored against their reference clocks | `ROCSYNC_BENCHMARK_DIR` | minutes |
-| `tests/test_e2e_real.py` | `rocsync`, `rocsync-align` in both modes, and `rocsync` again on full-length recordings, whose synced files must then show the same board time | `ROCSYNC_REAL_SAMPLES_DIR`, `ffmpeg` | about half an hour, longer on the first run |
+| `tests/test_e2e_real.py` | `rocsync`, `rocsync-align` by stream copy, with `--reencode` and with `--fps`, and `rocsync` again on full-length recordings, whose synced files must then show the same board time | `ROCSYNC_REAL_SAMPLES_DIR`, `ffmpeg` | about half an hour, longer on the first run |
 
 ```bash
 ROCSYNC_BENCHMARK_DIR=/path/to/validation_data uv run pytest -m e2e tests/test_e2e_benchmark.py

@@ -5,7 +5,7 @@ player displays at any moment of an aligned output follows from the pixels alone
 `board(k) = clock_rate * pts_k + clock_offset_ms`. The sync file is built from
 `RecordingStatistics`, so align reads the schema `rocsync` actually writes.
 
-`--compensate-drift` re-encodes with whichever encoder align picks on this machine.
+`--reencode` and `--fps` encode with whichever encoder align picks on this machine.
 """
 
 import json
@@ -40,6 +40,8 @@ INDEX_BITS = 16
 BLOCK_PX = 10  # blocks sit on a 20 px grid, two rows of eight
 TARGET_FPS = 30
 SLACK_MS = 1e-3  # ffprobe prints times to the microsecond
+RETIME_MS = 0.5  # a retimed timestamp is exact to well under this
+TIE_MS = 0.1  # two frames this close to a slot are equally near, given the source's tick
 
 
 def index_image(k):
@@ -204,16 +206,17 @@ def stream_copy(request, tmp_path_factory):
 
 
 @pytest.mark.parametrize("camera", STREAM_COPY_CAMERAS, ids=lambda c: c.name)
-def test_stream_copy_starts_on_the_common_span_and_keeps_time(stream_copy, camera):
+def test_stream_copy_starts_on_the_common_span_and_runs_on_board_time(stream_copy, camera):
     origin, _ = common_span(STREAM_COPY_CAMERAS)
     times, indices, board = shown(camera, stream_copy[camera.name])
-    tolerance = camera.nearest_ms()
 
     assert np.all(np.diff(indices) > 0), "a stream copy must not repeat or reorder frames"
-    assert abs(board[0] - origin) <= tolerance, f"starts at board {board[0]:.1f}, not {origin:.1f}"
-    # A stream copy keeps the camera's own clock, so board time runs at clock_rate
-    error = board - (origin + camera.clock_rate * times)
-    assert np.max(np.abs(error)) <= tolerance, f"worst frame off by {np.max(np.abs(error)):.1f} ms"
+    assert abs(board[0] - origin) <= camera.nearest_ms(), (
+        f"starts at board {board[0]:.1f}, not {origin:.1f}"
+    )
+    # Retimed onto board time, so a frame's time since the first is its board time since it
+    error = (board - board[0]) - (times - times[0])
+    assert np.max(np.abs(error)) <= RETIME_MS, f"worst frame off by {np.max(np.abs(error)):.2f} ms"
 
 
 @pytest.mark.parametrize(
@@ -258,46 +261,91 @@ def test_rocsync_reads_an_aligned_output_like_a_player(stream_copy, camera):
 
 
 @pytest.fixture(scope="module")
-def compensated(tmp_path_factory):
+def drifting(tmp_path_factory):
+    """(directory, sync file) of the cameras whose clocks are 1 % off."""
     directory = tmp_path_factory.mktemp("align-drift")
     for camera in DRIFTING_CAMERAS:
         write_camera(directory / f"{camera.name}.mp4", camera, gop=30)
-    output_dir = directory / "synced"
-    run_align(
-        write_sync(directory, DRIFTING_CAMERAS),
-        output_dir,
-        "--compensate-drift",
-        "--fps",
-        TARGET_FPS,
-    )
-    return {c.name: shown(c, output_dir / f"{c.name}.mp4") for c in DRIFTING_CAMERAS}
+    return directory, write_sync(directory, DRIFTING_CAMERAS)
+
+
+def aligned(drifting, name, *args):
+    """{camera name: shown(...)} of the drifting cameras aligned with `args`."""
+    directory, sync = drifting
+    run_align(sync, directory / name, *args)
+    return {c.name: shown(c, directory / name / f"{c.name}.mp4") for c in DRIFTING_CAMERAS}
+
+
+@pytest.fixture(scope="module")
+def reencoded(drifting):
+    return aligned(drifting, "reencoded", "--reencode")
+
+
+@pytest.fixture(scope="module")
+def resampled(drifting):
+    return aligned(drifting, "resampled", "--fps", TARGET_FPS)
+
+
+def two_nearest_halves(cameras):
+    """The two largest half frames, which bound how far apart two cameras' frames can be."""
+    halves = sorted(c.nearest_ms() for c in cameras)
+    return halves[-1] + halves[-2]
 
 
 @pytest.mark.parametrize("camera", DRIFTING_CAMERAS, ids=lambda c: c.name)
-def test_compensated_output_runs_on_board_time(compensated, camera):
+def test_reencoded_output_keeps_every_frame_on_board_time(reencoded, camera):
     origin, end = common_span(DRIFTING_CAMERAS)
-    times, _, board = compensated[camera.name]
-    tolerance = camera.nearest_ms()
+    times, indices, board = reencoded[camera.name]
 
-    error = board - (origin + times)
-    assert np.max(np.abs(error)) <= tolerance, f"worst frame off by {np.max(np.abs(error)):.1f} ms"
+    assert np.all(np.diff(indices) == 1), "a re-encode must keep every frame, once"
+    error = (board - board[0]) - (times - times[0])
+    assert np.max(np.abs(error)) <= RETIME_MS, f"worst frame off by {np.max(np.abs(error)):.2f} ms"
+    assert abs(board[0] - origin) <= camera.nearest_ms(), (
+        f"starts at board {board[0]:.1f}, not {origin:.1f}"
+    )
+    assert abs(board[-1] - end) <= camera.nearest_ms(), (
+        f"ends at board {board[-1]:.1f}, not {end:.1f}"
+    )
+
+
+def test_reencoded_outputs_start_and_end_together(reencoded):
+    tolerance = two_nearest_halves(DRIFTING_CAMERAS)
+    for label, ends in (
+        ("start", [board[0] for _, _, board in reencoded.values()]),
+        ("end", [board[-1] for _, _, board in reencoded.values()]),
+    ):
+        assert max(ends) - min(ends) <= tolerance, (
+            f"cameras {label} {max(ends) - min(ends):.1f} ms apart"
+        )
+
+
+@pytest.mark.parametrize("camera", DRIFTING_CAMERAS, ids=lambda c: c.name)
+def test_resampled_output_is_the_nearest_frame_on_a_constant_grid(resampled, camera):
+    origin, end = common_span(DRIFTING_CAMERAS)
+    times, _, board = resampled[camera.name]
+    grid = np.arange(len(times)) * 1000 / TARGET_FPS
+
+    assert np.max(np.abs(times - grid)) <= SLACK_MS, "timestamps must sit on the grid"
+    sources = np.array([camera.board(k) for k in range(camera.n_frames)])
+    nearest = np.min(np.abs(sources[None, :] - (origin + grid)[:, None]), axis=1)
+    worse = np.abs(board - (origin + grid)) - nearest
+    assert np.max(worse) <= TIE_MS, f"a slot shows a frame {np.max(worse):.1f} ms short of nearest"
     # The last output frame is the last one due within the span
+    tolerance = camera.nearest_ms()
     assert -tolerance - 1000 / TARGET_FPS < board[-1] - end <= tolerance, (
         f"ends at board {board[-1]:.1f}, not {end:.1f}"
     )
 
 
-def test_compensated_outputs_agree_frame_by_frame(compensated):
+def test_resampled_outputs_agree_frame_by_frame(resampled):
     origin, end = common_span(DRIFTING_CAMERAS)
-    counts = [len(board) for _, _, board in compensated.values()]
+    counts = [len(board) for _, _, board in resampled.values()]
     due = int((end - origin) * TARGET_FPS / 1000) + 1
     assert counts == [due] * len(counts), f"frame counts {counts}, {due} frames are due"
 
-    boards = np.array([board for _, _, board in compensated.values()])
+    boards = np.array([board for _, _, board in resampled.values()])
     spread = boards.max(axis=0) - boards.min(axis=0)
-    # Each camera within half its own frame, so two within the sum of their halves
-    halves = sorted(c.nearest_ms() for c in DRIFTING_CAMERAS)
-    tolerance = halves[-1] + halves[-2]
+    tolerance = two_nearest_halves(DRIFTING_CAMERAS)
     assert np.max(spread) <= tolerance, f"cameras disagree by up to {np.max(spread):.1f} ms"
 
 

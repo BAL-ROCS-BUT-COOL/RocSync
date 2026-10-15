@@ -373,15 +373,16 @@ def summarize_timeline(
     return statistics, fit, considered, rejected, gaps
 
 
-def run_ffprobe(video_path, *args):
-    """stdout of an ffprobe query about a video's first video stream, or None.
+def run_ffprobe(video_path, *args, stream="v:0"):
+    """stdout of an ffprobe query about one stream of a video, the first video stream
+    unless `stream` selects another, or None.
 
     None means ffprobe is missing or refused the file, which is what makes every caller
     keep a way of its own to answer the question it asked.
     """
     try:
         return subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0", *args, str(video_path)],
+            ["ffprobe", "-v", "error", "-select_streams", stream, *args, str(video_path)],
             capture_output=True,
             text=True,
             check=True,

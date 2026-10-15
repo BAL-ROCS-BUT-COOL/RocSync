@@ -199,6 +199,7 @@ def find_corners_dots(mask, frame_number, board, debug_dir=None):
             dist = np.linalg.norm(blob.pt - target)
             if best is None or dist < best[2]:
                 best = (i, blob, dist)
+        assert best is not None  # an unassigned target remains while the loop runs
         i, blob, dist = best
         assigned[i] = (blob.pt, dist)
         available.remove(blob)

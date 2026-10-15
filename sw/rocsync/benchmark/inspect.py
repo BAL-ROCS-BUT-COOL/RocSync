@@ -175,7 +175,7 @@ def resolve_board(entry):
     every other resolver (`annotate.py`, `evaluate.py`, `common.annotated_board_time`).
     """
     board_id = ((entry or {}).get("aruco") or {}).get("id")
-    profile = PROFILES_BY_ARUCO.get(board_id)
+    profile = None if board_id is None else PROFILES_BY_ARUCO.get(board_id)
     return None if profile is None else profile.rectify(DEFAULT_BOARD_SIZE)
 
 

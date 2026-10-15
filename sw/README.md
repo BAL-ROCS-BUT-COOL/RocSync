@@ -104,8 +104,9 @@ recording started before the board's clock reached zero.
 
 ## Time-syncing videos
 `rocsync-align` turns the JSON that `rocsync` wrote into actually aligned video files. It reads
-each entry's fitted clock and trims every video to a common start, so the outputs can be played
-back side by side. Entries that are not videos are ignored.
+each entry's fitted clock, trims every video to the span they all share and puts its timestamps on
+board time, so the outputs can be played back side by side. Entries that are not videos are
+ignored.
 
 ```bash
 rocsync-align output.json --output_dir synced
@@ -114,32 +115,35 @@ rocsync-align output.json --output_dir synced
 | Option | Description |
 | --- | --- |
 | `--output_dir DIR` | Where synchronized videos are written; a relative path is taken inside each video's own folder, an absolute one is used as is (default: `synced`) |
-| `--compensate-drift` | Compensate clock drift by re-encoding; significantly slower but more accurate |
-| `--fps FPS` | Target frame rate (default: the source rate of the first video) |
+| `--reencode` | Re-encode the video, so it starts and ends on exact frames without a container edit list; significantly slower |
 | `--jobs N` | Maximum concurrent `ffmpeg` processes, or `0` for no limit (default: `4`) |
 
-Every output covers the board-time span that all videos share, and each output frame is the
-source frame nearest its board time, so it is at most half a source frame off.
+Every output keeps its source's frames and frame timing, a variable frame rate included, and
+covers the board-time span that all videos share. It starts on the source frame nearest the
+span's start and ends on the one nearest its end, so each is at most half a source frame off.
 
-- A stream copy, the default, keeps each video's frames and clock. It cuts at a keyframe and
+Each timestamp is the board time since that first frame, so the clock drift is gone: the
+videos stay in step to their last frame, and every output starts at time 0. An audio track is
+resampled the same way and stored as AAC at the source's bit rate.
+
+- A stream copy, the default, leaves the video frames as they are. It cuts at a keyframe and
   leaves the exact start to a container edit list, which some players ignore. Its end can run a
   few frames long when the video has B-frames.
-- With `--compensate-drift`, every output is re-encoded at `--fps` and plays on board time, so
-  the videos stay in step to their last frame and all have the same number of frames.
+- With `--reencode`, the video is encoded without B-frames, and cut exactly at the first and
+  last frame.
 
-This needs `ffmpeg` on your `PATH`; `--compensate-drift` uses `hevc_nvenc` when the available
-`ffmpeg` provides it.
+This needs `ffmpeg` on your `PATH`; `--reencode` uses `hevc_nvenc` when the available `ffmpeg`
+provides it.
 
 ### FFmpeg
 To visually inspect the synchronization you can use FFmpeg to combine the aligned videos side-by-side:
 ```bash
 ffmpeg \
-	-ss 4.2803 -i video1.mp4 \
-	-ss -8.1024 -i video2.mp4 \
-	-filter_complex "[0:v]setpts=PTS*1.000020938577059[v0];[1:v]setpts=PTS*1.000083866934668[v1];[v0][v1]hstack=inputs=2" \
+	-i synced/video1.mp4 \
+	-i synced/video2.mp4 \
+	-filter_complex "hstack=inputs=2" \
 	-c:v h264_nvenc \
 	-preset p1 \
-	-r 30 \
 	synchronized.mp4
 ```
 

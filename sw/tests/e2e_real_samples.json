@@ -1,0 +1,219 @@
+{
+  "sessions": {
+    "chb_dataset": {
+      "ORX_camera.MP4": {
+        "searched": [
+          [
+            0.0,
+            300.0
+          ],
+          [
+            2220.0,
+            2400.0
+          ],
+          [
+            4560.0,
+            4680.0
+          ],
+          [
+            5262.84,
+            5862.84
+          ]
+        ],
+        "windows": [
+          [
+            215.0,
+            255.4
+          ],
+          [
+            2288.0,
+            2386.72
+          ],
+          [
+            4607.0,
+            4642.68
+          ]
+        ],
+        "n_sightings": 500,
+        "arguments": [
+          "--try-hard"
+        ],
+        "check": "frozen",
+        "problems": [
+          "drift +15379 ppm beyond 1000"
+        ],
+        "frozen_clock": {
+          "clock_rate": 1.0153789945650913,
+          "clock_offset_ms": -38383.189041037345,
+          "tolerance_ms": 20.0
+        }
+      },
+      "gopro4.MP4": {
+        "searched": [
+          [
+            0.0,
+            300.0
+          ],
+          [
+            4258.487,
+            4858.487
+          ]
+        ],
+        "windows": [
+          [
+            69.151,
+            112.431
+          ],
+          [
+            4565.776,
+            4602.149
+          ]
+        ],
+        "n_sightings": 433,
+        "check": "round_trip",
+        "problems": []
+      },
+      "gopro8.MP4": {
+        "searched": [
+          [
+            0.0,
+            300.0
+          ],
+          [
+            4238.867,
+            4838.867
+          ]
+        ],
+        "windows": [
+          [
+            140.789,
+            244.329
+          ],
+          [
+            4639.416,
+            4721.936
+          ]
+        ],
+        "n_sightings": 391,
+        "check": "round_trip",
+        "problems": []
+      }
+    },
+    "chc_part_1": {
+      "camera03.MP4": {
+        "searched": [
+          [
+            0.0,
+            300.0
+          ],
+          [
+            1303.101,
+            1903.101
+          ]
+        ],
+        "windows": [
+          [
+            0.0,
+            25.944
+          ],
+          [
+            1823.72,
+            1860.56
+          ]
+        ],
+        "n_sightings": 666,
+        "check": "round_trip",
+        "problems": []
+      },
+      "camera10.MP4": {
+        "searched": [
+          [
+            0.0,
+            300.0
+          ],
+          [
+            1326.341,
+            1926.341
+          ]
+        ],
+        "windows": [
+          [
+            0.0,
+            24.059
+          ],
+          [
+            1846.376,
+            1883.683
+          ]
+        ],
+        "n_sightings": 612,
+        "check": "round_trip",
+        "problems": []
+      }
+    },
+    "chc_part_2": {
+      "camera04.MP4": {
+        "searched": [
+          [
+            0.0,
+            300.0
+          ],
+          [
+            1004.419,
+            1604.419
+          ]
+        ],
+        "windows": [
+          [
+            0.0,
+            44.096
+          ],
+          [
+            1546.126,
+            1602.569
+          ]
+        ],
+        "n_sightings": 463,
+        "check": "round_trip",
+        "problems": []
+      },
+      "camera11.MP4": {
+        "searched": [
+          [
+            0.0,
+            300.0
+          ],
+          [
+            996.428,
+            1596.428
+          ]
+        ],
+        "windows": [
+          [
+            0.0,
+            22.908
+          ],
+          [
+            1561.892,
+            1596.428
+          ]
+        ],
+        "n_sightings": 591,
+        "check": "round_trip",
+        "problems": []
+      }
+    }
+  },
+  "generated": {
+    "commit": "dfa1a0ba4f28f8fdadfbe68c6990dac5141a0a4b",
+    "dirty": true,
+    "date": "2026-09-24T19:25:01+00:00",
+    "downscale_height": 540,
+    "head_s": 300.0,
+    "tail_s": 600.0,
+    "edge_s": 15.0,
+    "extend_s": 120.0,
+    "padding_s": 15.0,
+    "gap_s": 60.0
+  }
+}

@@ -64,7 +64,7 @@ rocsync -c ir --board-version v2 ir_recording.mp4
 | Option | Description |
 | --- | --- |
 | `-c, --camera_type {rgb,ir}` | Type of camera (default: `rgb`) |
-| `-s, --stride N` | Scan every N-th frame only (default: same as framerate, videos only) |
+| `-i, --interval SECONDS` | Analyze at least one frame every SECONDS, placed relative to keyframes so skipped frames need not be decoded (default: `1`; `0` = every frame; videos only) |
 | `-e, --export_frames DIRECTORY` | Directory to store all raw frames as PNGs with timestamp (videos only) |
 | `-o, --output FILE` | JSON file to store results (default: `output.json`) |
 | `-y, --yes` | Do not ask for confirmation when processing multiple files |
@@ -74,6 +74,9 @@ rocsync -c ir --board-version v2 ir_recording.mp4
 | `--recurse_in_dir` | Recursively search for videos and images in directories |
 
 Run `rocsync -h` for the authoritative list.
+
+Results for the inputs that could be time-synced are written either way; the exit status is
+non-zero if any input could not be, so a script can tell.
 
 
 ## Example
@@ -104,8 +107,9 @@ recording started before the board's clock reached zero.
 
 ## Time-syncing videos
 `rocsync-align` turns the JSON that `rocsync` wrote into actually aligned video files. It reads
-each entry's fitted clock and trims every video to a common start, so the outputs can be played
-back side by side. Entries that are not videos are ignored.
+each entry's fitted clock, trims every video to the span they all share and puts its timestamps on
+board time, so the outputs can be played back side by side. Entries that are not videos are
+ignored.
 
 ```bash
 rocsync-align output.json --output_dir synced
@@ -113,24 +117,46 @@ rocsync-align output.json --output_dir synced
 
 | Option | Description |
 | --- | --- |
-| `--output_dir DIR` | Where synchronized videos are written (default: `synced`) |
-| `--compensate-drift` | Compensate clock drift by re-encoding; significantly slower but more accurate |
-| `--fps FPS` | Target frame rate (default: the source rate of the first video) |
+| `--output_dir DIR` | Where synchronized videos are written; a relative path is taken inside each video's own folder, an absolute one is used as is (default: `synced`) |
+| `--reencode` | Re-encode the video, so it starts and ends on exact frames without a container edit list; significantly slower |
+| `--fps FPS` | Resample every video to this constant frame rate, so all outputs have the same number of frames; implies `--reencode` |
 | `--jobs N` | Maximum concurrent `ffmpeg` processes, or `0` for no limit (default: `4`) |
 
-This needs `ffmpeg` on your `PATH`; `--compensate-drift` uses `hevc_nvenc` when the available
-`ffmpeg` provides it.
+Unless `--fps` is given, every output keeps its source's frames and frame timing, a variable
+frame rate included, and covers the board-time span that all videos share. It starts on the
+source frame nearest the span's start and ends on the one nearest its end, so each is at most
+half a source frame off.
+
+Each timestamp is the board time since that first frame, so the clock drift is gone: the
+videos stay in step to their last frame, and every output starts at time 0. An audio track is
+resampled the same way and stored as AAC at the source's bit rate.
+
+- A stream copy, the default, leaves the video frames as they are. It cuts at a keyframe and
+  leaves the exact start to a container edit list, which some players ignore. Its end can run a
+  few frames long when the video has B-frames.
+- With `--reencode`, the video is encoded without B-frames, and cut exactly at the first and
+  last frame.
+- With `--fps FPS`, the output frames are on a constant grid from the span's start: frame `k`
+  is the source frame nearest board time `k / FPS` after it, repeated or skipped as the source
+  rate requires, and the audio is cut to the same span. Every video gets the same number of
+  frames, and each shows its nearest source frame, at most half a source frame off.
+
+This needs `ffmpeg` on your `PATH`; `--reencode` uses `hevc_nvenc` when the available `ffmpeg`
+provides it.
+
+Re-encoded video (`--reencode` and `--fps`) is near-lossless, not lossless: constant quality, at about the size of a camera's
+own file (`libx265 -crf 20`, or `hevc_nvenc -qp 22`). An `ffmpeg` or driver version that ignores
+these settings would change the quality and size, so check a file if either matters.
 
 ### FFmpeg
 To visually inspect the synchronization you can use FFmpeg to combine the aligned videos side-by-side:
 ```bash
 ffmpeg \
-	-ss 4.2803 -i video1.mp4 \
-	-ss -8.1024 -i video2.mp4 \
-	-filter_complex "[0:v]setpts=PTS*1.000020938577059[v0];[1:v]setpts=PTS*1.000083866934668[v1];[v0][v1]hstack=inputs=2" \
+	-i synced/video1.mp4 \
+	-i synced/video2.mp4 \
+	-filter_complex "hstack=inputs=2" \
 	-c:v h264_nvenc \
 	-preset p1 \
-	-r 30 \
 	synchronized.mp4
 ```
 
@@ -178,6 +204,7 @@ environment without activating it.
 | Task | Command |
 | --- | --- |
 | Run the test suite | `uv run pytest` |
+| Run the end-to-end tests | `uv run pytest -m e2e` (see below) |
 | Format the code | `uv run ruff format .` |
 | Check formatting only | `uv run ruff format --check .` |
 | Lint | `uv run ruff check .` |
@@ -194,3 +221,36 @@ not installed. Install `ffmpeg` to run the full suite.
 
 To add or change a dependency, edit `pyproject.toml` and run `uv sync`, then commit the updated
 `uv.lock` alongside it.
+
+### End-to-end tests
+
+The default suite leaves out the tests marked `e2e`, which run the installed command-line tools
+on whole videos and take minutes to hours. Select them with `-m e2e`; a tier whose data is not
+configured skips itself.
+
+| Tier | What it runs | Needs | Takes |
+| --- | --- | --- | --- |
+| `tests/test_e2e_align.py` | `rocsync-align` on synthetic cameras whose clock is known, by stream copy, with `--reencode` and with `--fps` | `ffmpeg` | under a minute |
+| `tests/test_e2e_benchmark.py` | `rocsync` on the annotated benchmark videos, scored against their reference clocks | `ROCSYNC_BENCHMARK_DIR` | minutes |
+| `tests/test_e2e_real.py` | `rocsync`, `rocsync-align` by stream copy, with `--reencode` and with `--fps`, and `rocsync` again on full-length recordings, whose synced files must then show the same board time | `ROCSYNC_REAL_SAMPLES_DIR`, `ffmpeg` | about half an hour, longer on the first run |
+
+```bash
+ROCSYNC_BENCHMARK_DIR=/path/to/validation_data uv run pytest -m e2e tests/test_e2e_benchmark.py
+```
+
+The real-sample tier runs on copies of the recordings downscaled to 540 lines, which keep every
+frame's timestamp. They are made on first use and kept in `~/.cache/rocsync/e2e`, or wherever
+`ROCSYNC_E2E_CACHE_DIR` points.
+
+Where each recording shows the board, and how its result is judged, comes from
+`tests/e2e_real_samples.json`. To build that manifest, the generator searches the first 5 and
+last 10 minutes of every copy. It widens a search that ends while the board is still in view.
+`--search START END` adds a span for a board shown mid-recording. `--try-hard` searches, fits,
+and later tests with rocsync's `--try-hard`, for a board too small to be found otherwise.
+Regenerate it after adding recordings, review the table it prints, and commit it:
+
+```bash
+uv run python -m tests.generate_real_samples_manifest /path/to/real_samples [--only SESSION]
+uv run python -m tests.generate_real_samples_manifest /path/to/real_samples \
+    --only SESSION/FILE --search 0:37:00 0:40:00 --try-hard
+```

@@ -3,8 +3,10 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 
 import cv2
+import numpy as np
 
 from rocsync.printer import errprint, succprint, warnprint
 from rocsync.recording_statistics import (
@@ -13,7 +15,17 @@ from rocsync.recording_statistics import (
     drift_ppm,
     rate_uncertainty_limit_ms,
 )
-from rocsync.timeline import affine_from_statistics, per_frame_times
+from rocsync.timeline import (
+    affine_from_statistics,
+    frame_pts,
+    median_frame_period,
+    parse_ratio,
+    run_ffprobe,
+)
+
+CUT_LEAD_S = 1e-4  # a cut this far ahead of a frame's pts keeps that frame
+TIME_BASE_HZ = 90000  # ticks per second of an output's video timestamps, finer than any source's
+DEFAULT_AUDIO_BIT_RATE = 192000
 
 
 def hevc_nvenc_available() -> bool:
@@ -43,7 +55,40 @@ def reap(running: list[tuple[str, subprocess.Popen]], failed: list[str], block: 
             errprint(f"ffmpeg exited with {returncode} for {path}")
 
 
-def warn_about_clock(file, statistics, compensate_drift):
+def seek_base_s(video_path) -> float:
+    """Seconds from where ffmpeg's -ss counts, the file's start, to the video stream's start."""
+
+    def start_time(section):
+        output = run_ffprobe(video_path, "-show_entries", f"{section}=start_time", "-of", "csv=p=0")
+        return parse_ratio((output or "").strip().rstrip(","))
+
+    stream_start, file_start = start_time("stream"), start_time("format")
+    if stream_start is None or file_start is None:
+        return 0.0
+    return stream_start - file_start
+
+
+def audio_stream(video_path):
+    """(sample rate in Hz, bit rate in bit/s) of a video's first audio stream, None if it has none."""
+    output = run_ffprobe(
+        video_path,
+        "-show_entries",
+        "stream=sample_rate,bit_rate",
+        "-of",
+        "default=noprint_wrappers=1",
+        stream="a:0",
+    )
+    fields: dict[str, str] = {}
+    for line in (output or "").splitlines():
+        name, _, value = line.partition("=")
+        fields[name] = value
+    sample_rate = parse_ratio(fields.get("sample_rate"))
+    if not sample_rate:
+        return None
+    return int(sample_rate), int(parse_ratio(fields.get("bit_rate")) or DEFAULT_AUDIO_BIT_RATE)
+
+
+def warn_about_clock(file, statistics):
     """Warn about a clock fit that may misplace this video; aligning proceeds regardless."""
     if "extrapolation_stderr_ms" not in statistics:
         warnprint(f"{file}: sync entry has no clock-rate uncertainty; re-run rocsync to assess it.")
@@ -62,10 +107,9 @@ def warn_about_clock(file, statistics, compensate_drift):
     clock_rate, _ = affine_from_statistics(statistics)
     ppm = drift_ppm(clock_rate)
     if abs(ppm) > CLOCK_DRIFT_BAD_PPM:
-        rescale = " Drift compensation will rescale it substantially." if compensate_drift else ""
         warnprint(
             f"{file}: video clock runs {ppm:+.0f} ppm off board time; that is not drift, "
-            f"something is wrong with the fit.{rescale}"
+            "something is wrong with the fit. Retiming will rescale it substantially."
         )
     elif abs(ppm) > CLOCK_DRIFT_WARN_PPM:
         warnprint(f"{file}: video clock runs {ppm:+.0f} ppm off board time.")
@@ -85,18 +129,22 @@ def main():
         "--output_dir",
         type=str,
         default="synced",
-        help="Output directory where synchronized videos will be saved (default: synced)",
+        help="Output directory for the synchronized videos; a relative path is taken inside "
+        "each video's own folder, an absolute one is used as is (default: synced)",
     )
     parser.add_argument(
-        "--compensate-drift",
+        "--reencode",
         action="store_true",
-        help="Enable video drift compensation via re-encoding (significantly slower but more accurate)",
+        help="Re-encode the video so it starts and ends on exact frames without relying on a "
+        "container edit list (significantly slower)",
     )
     parser.add_argument(
         "--fps",
         type=int,
         default=None,
-        help="Target frame rate for synchronized videos. If not specified, uses the source frame rate of the first video",
+        help="Resample every video to this constant frame rate: each output frame is the source "
+        "frame nearest its board time, and all outputs get the same number of frames. "
+        "Implies --reencode",
     )
     parser.add_argument(
         "--jobs",
@@ -111,6 +159,8 @@ def main():
         parser.error("--jobs must be 0 (unlimited) or a positive number")
     if args.fps is not None and args.fps <= 0:
         parser.error("--fps must be a positive number")
+    if args.fps:
+        args.reencode = True
 
     with open(args.sync_file) as file:
         stats = json.load(file)
@@ -128,39 +178,36 @@ def main():
     if skipped:
         print(f"Ignoring {skipped} non-video entries in {args.sync_file}")
 
-    nominal_fps = (
-        round(next(iter(videos.values()))["nominal_fps"]) if args.fps is None else args.fps
-    )
-    print(f"Syncing {len(videos)} videos to {nominal_fps} FPS")
-
-    use_nvenc = args.compensate_drift and hevc_nvenc_available()
-    if args.compensate_drift and not use_nvenc:
+    use_nvenc = args.reencode and hevc_nvenc_available()
+    if args.reencode and not use_nvenc:
         warnprint(
-            "hevc_nvenc not available, encoding will be very slow. Install NVIDIA drivers and ffmpeg with nvenc support or disable drift compensation."
+            "hevc_nvenc not available, encoding will be very slow. Install NVIDIA drivers and ffmpeg with nvenc support or drop --reencode."
         )
-    if not args.compensate_drift:
+    if not args.reencode:
         warnprint(
             "Stream copy can only cut at a keyframe; the rest is left to a container "
-            "edit list. Use --compensate-drift for a frame-exact start."
+            "edit list, which some players ignore, and a video with B-frames can end a few "
+            "frames late. Use --reencode for exact cuts."
         )
 
     # first_frame/last_frame only cover the analyzed frames, so measure the files
-    spans = {}
+    timings = {}
     for file, statistics in videos.items():
         try:
-            board_times = per_frame_times(file, statistics)
+            pts = np.asarray(frame_pts(file))
+            clock_rate, clock_offset_ms = affine_from_statistics(statistics)
         except (OSError, KeyError) as e:
             errprint(f"Cannot determine the board-time span of {file}: {e}")
             return 1
-        if not board_times:
+        if not pts.size:
             errprint(f"No frames found in {file}; cannot align it.")
             return 1
-        spans[file] = (board_times[0], board_times[-1])
-        warn_about_clock(file, statistics, args.compensate_drift)
+        timings[file] = (pts, clock_rate * pts + clock_offset_ms)
+        warn_about_clock(file, statistics)
 
     # Window covered by every video, in board time
-    origin_ms = max(start for start, _ in spans.values())
-    end_ms = min(end for _, end in spans.values())
+    origin_ms = max(board[0] for _, board in timings.values())
+    end_ms = min(board[-1] for _, board in timings.values())
     if origin_ms >= end_ms:
         errprint(
             f"The videos have no common time span: the latest start "
@@ -195,30 +242,53 @@ def main():
                 print(f"Skipping {file}, already synced.")
                 continue
 
-        # -ss and -t are container time, so map the window through this video's fit
+        pts, board = timings[file]
         clock_rate, clock_offset_ms = affine_from_statistics(statistics)
-        cut_time = (origin_ms - clock_offset_ms) / clock_rate / 1000
-        duration = (end_ms - origin_ms) / clock_rate / 1000
+        if args.fps:
+            base_s = seek_base_s(file)
+            # Decode from the frame before the one nearest the start, so that frame has a
+            # predecessor to find the midpoint with
+            before = max(int(np.argmin(np.abs(board - origin_ms))) - 1, 0)
+            ffmpeg_command = resample_command(
+                file,
+                output_file,
+                seek_s=base_s + pts[before] / 1000 - CUT_LEAD_S,
+                cut_s=base_s + (origin_ms - clock_offset_ms) / clock_rate / 1000,
+                span_ms=end_ms - origin_ms,
+                clock_rate=clock_rate,
+                frame_rate=args.fps,
+                audio=audio_stream(file),
+                use_nvenc=use_nvenc,
+            )
+        else:
+            # Each video starts and ends on its frames nearest the common span's ends
+            first = int(np.argmin(np.abs(board - origin_ms)))
+            last = int(np.argmin(np.abs(board - end_ms)))
+            # A re-encode keeps what lies before the cut's end, so that must fall between the
+            # last frame and the next; a stream copy cuts by decode order and keeps it tight
+            next_gap_ms = (
+                pts[last + 1] - pts[last] if last + 1 < len(pts) else median_frame_period(pts, 0.0)
+            )
+            ffmpeg_command = align_command(
+                file,
+                output_file,
+                start_s=seek_base_s(file) + pts[first] / 1000,
+                duration_s=(pts[last] - pts[first]) / 1000,
+                tail_s=next_gap_ms / 2000 if args.reencode else CUT_LEAD_S,
+                clock_rate=clock_rate,
+                audio=audio_stream(file),
+                reencode=args.reencode,
+                use_nvenc=use_nvenc,
+            )
 
         # ffmpeg runs in the background, so throttle before starting another one
         while args.jobs and len(running) >= args.jobs:
             reap(running, failed, block=True)
 
-        running.append(
-            (
-                file,
-                sync_video(
-                    file,
-                    cut_time,
-                    duration,
-                    clock_rate,
-                    output_file=output_file,
-                    frame_rate=nominal_fps,
-                    compensate_drift=args.compensate_drift,
-                    use_nvenc=use_nvenc,
-                ),
-            )
-        )
+        # No shell: the arguments go to ffmpeg verbatim, so paths containing spaces
+        # survive. shlex.join only builds the human-readable echo of the command.
+        print(shlex.join(ffmpeg_command))
+        running.append((file, subprocess.Popen(ffmpeg_command)))
         started += 1
 
     while running:
@@ -231,55 +301,120 @@ def main():
     succprint(f"Aligned {started} videos into {args.output_dir}")
 
 
-def sync_video(
-    video_path: str,
-    cut_time: float,
-    duration: float,
-    clock_rate: float,
-    output_file: str = "synced.mp4",
-    frame_rate: int = 30,
-    compensate_drift: bool = True,
-    use_nvenc: bool = False,
-) -> subprocess.Popen:
-    """Cut `duration` seconds starting `cut_time` seconds into the video, both in
-    container time, rescaling by `clock_rate` if drift is compensated."""
-    ffmpeg_command = [
+def encoder_args(use_nvenc):
+    """ffmpeg arguments for a near-lossless encode at about the size of a camera's own file."""
+    if use_nvenc:
+        # -crf is ignored by hevc_nvenc, which takes a constant quantiser instead
+        return ["-c:v", "hevc_nvenc", "-rc", "constqp", "-qp", "22", "-preset", "p5"]
+    return ["-c:v", "libx265", "-crf", "20"]
+
+
+def align_command(
+    video_path, output_file, start_s, duration_s, tail_s, clock_rate, audio, reencode, use_nvenc
+):
+    """ffmpeg command keeping the frames from `start_s` to `start_s + duration_s` (both
+    ffmpeg input seconds, ends included) and timing them on board time.
+
+    Every timestamp is scaled by `clock_rate`, the cut being time zero, so the source
+    frames and their spacing stay as they were. `tail_s` is how far past the last frame
+    the cut may run. `audio` is `audio_stream`'s answer.
+    """
+    # -t as an input option cuts video and audio alike, before any retiming
+    command = [
         "ffmpeg",
         "-ss",
-        f"{cut_time:.6f}",
+        f"{start_s - CUT_LEAD_S:.6f}",
+        "-t",
+        f"{duration_s + CUT_LEAD_S + tail_s:.6f}",
         "-i",
         video_path,
-        "-t",
-        f"{duration:.6f}",
     ]
-
-    if compensate_drift:
-        ffmpeg_command += [
-            "-c:v",
-            "hevc_nvenc" if use_nvenc else "libx265",
-            "-crf",
+    if reencode:
+        command += [
+            *encoder_args(use_nvenc),
+            # B-frames make the encoders reorder and misplace timestamps that are not on a grid
+            "-bf",
             "0",
-            "-filter_complex",
-            f"setpts=PTS*{clock_rate}",
-            "-r",
-            str(frame_rate),
+            # settb first: setpts rounds to the filter's time base, which can be as coarse as 1 ms
+            "-vf",
+            f"settb=1/{TIME_BASE_HZ},setpts=PTS*{clock_rate}",
+            "-fps_mode",
+            "passthrough",
+            "-enc_time_base",
+            f"1/{TIME_BASE_HZ}",
         ]
     else:
-        ffmpeg_command += [
+        # setts leaves its values as they are when it changes the time base, so convert here
+        ticks = f"*TB*{clock_rate}*{TIME_BASE_HZ}"
+        command += [
             "-c:v",
             "copy",
+            "-bsf:v",
+            f"setts=pts=PTS{ticks}:dts=DTS{ticks}:time_base=1/{TIME_BASE_HZ}",
         ]
-    ffmpeg_command += [
+    return [*command, *audio_args(audio, clock_rate), "-y", output_file]
+
+
+def audio_args(audio, clock_rate, trim=None):
+    """ffmpeg arguments retiming the audio onto board time and encoding it as AAC.
+
+    `audio` is `audio_stream`'s answer. `trim` is (start_s, duration_s) in board seconds
+    of the retimed audio, for a cut the input options did not make.
+    """
+    if audio is None:
+        return ["-an"]
+    sample_rate, bit_rate = audio
+    # Played slower by the clock error, then converted back to the sample rate
+    filters = f"asetrate={sample_rate}/{clock_rate},aresample={sample_rate}"
+    if trim:
+        filters += f",atrim=start={trim[0]:.6f}:duration={trim[1]:.6f},asetpts=PTS-STARTPTS"
+    return ["-af", filters, "-c:a", "aac", "-b:a", str(bit_rate)]
+
+
+def resample_command(
+    video_path,
+    output_file,
+    seek_s,
+    cut_s,
+    span_ms,
+    clock_rate,
+    frame_rate,
+    audio,
+    use_nvenc,
+):
+    """ffmpeg command re-encoding the `span_ms` of board time from `cut_s` at the constant
+    `frame_rate`, each output frame the source frame nearest its board time.
+
+    Both `seek_s`, where decoding starts, and `cut_s` are ffmpeg input seconds. Every output
+    frame within the span is written, so the count follows from the span alone.
+    """
+    lead_s = cut_s - seek_s
+    # fps shows each frame from its timestamp until the next frame's, so stamping a frame at
+    # its midpoint with the previous one makes the frame shown the nearest, however the
+    # frames are spaced. The first frame has no previous one, and keeps its own time.
+    midpoint = "if(isnan(PREV_INPTS)\\,PTS\\,(PTS+PREV_INPTS)/2)"
+    timing = (
+        f"settb=1/{TIME_BASE_HZ},"
+        f"setpts=({midpoint}-{lead_s:.6f}/TB)*{clock_rate},"
+        f"fps={frame_rate}:start_time=0:round=up"
+    )
+    return [
+        "ffmpeg",
+        "-ss",
+        f"{seek_s:.6f}",
+        "-i",
+        video_path,
+        *encoder_args(use_nvenc),
+        "-vf",
+        timing,
+        # Counted rather than timed with -t, which would count in source time
+        "-frames:v",
+        str(int(span_ms * frame_rate / 1000 + 1e-6) + 1),
+        *audio_args(audio, clock_rate, trim=(lead_s * clock_rate, span_ms / 1000)),
         "-y",
         output_file,
     ]
 
-    # No shell: the arguments go to ffmpeg verbatim, so paths containing spaces
-    # survive. shlex.join only builds the human-readable echo of the command.
-    print(shlex.join(ffmpeg_command))
-
-    return subprocess.Popen(ffmpeg_command)
-
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -19,8 +19,9 @@ from dataclasses import dataclass, field
 from itertools import pairwise
 from typing import cast
 
-import cv2
+import av
 import numpy as np
+from av.error import FFmpegError
 from sklearn.linear_model import LinearRegression, RANSACRegressor
 from sklearn.metrics import root_mean_squared_error
 
@@ -183,12 +184,24 @@ def fit_timeline(
     if threshold is None:
         threshold = measured_residual_threshold_ms(frame_period_ms)
 
-    model = RANSACRegressor(
-        residual_threshold=threshold,  # max one frame deviation
-        max_trials=max_trials,  # more trials for more consistent results
-        random_state=0,  # deterministic results
-    )
-    model.fit(x, y)
+    span = float(np.ptp(x))
+
+    def spread(x_pair, _y_pair):
+        # Two sightings close in time fit their own window but can miss a distant one
+        return abs(x_pair[1, 0] - x_pair[0, 0]) >= span / 2
+
+    # A lone misdecode at either end is in every spread pair, so an unrestricted search runs too
+    candidates = [
+        RANSACRegressor(
+            residual_threshold=threshold,  # max one frame deviation
+            max_trials=max_trials,  # more trials for more consistent results
+            random_state=0,  # deterministic results
+            is_data_valid=is_data_valid,
+        ).fit(x, y)
+        for is_data_valid in (spread, None)
+    ]
+    # More inliers wins; on a tie, the spread search
+    model = max(candidates, key=lambda candidate: int(candidate.inlier_mask_.sum()))
 
     # RANSACRegressor defaults to a LinearRegression base estimator
     estimator = cast(LinearRegression, model.estimator_)
@@ -373,15 +386,16 @@ def summarize_timeline(
     return statistics, fit, considered, rejected, gaps
 
 
-def run_ffprobe(video_path, *args):
-    """stdout of an ffprobe query about a video's first video stream, or None.
+def run_ffprobe(video_path, *args, stream="v:0"):
+    """stdout of an ffprobe query about one stream of a video, the first video stream
+    unless `stream` selects another, or None.
 
     None means ffprobe is missing or refused the file, which is what makes every caller
     keep a way of its own to answer the question it asked.
     """
     try:
         return subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0", *args, str(video_path)],
+            ["ffprobe", "-v", "error", "-select_streams", stream, *args, str(video_path)],
             capture_output=True,
             text=True,
             check=True,
@@ -428,7 +442,14 @@ def parse_ratio(text):
 
 
 def frame_pts(video_path):
-    """Presentation timestamp in ms of every frame, indexed by frame number.
+    """Presentation timestamp in ms of every frame, indexed by frame number (see
+    `frame_index`)."""
+    return frame_index(video_path)[0]
+
+
+def frame_index(video_path):
+    """(pts, keyframes): the presentation timestamp in ms of every frame, indexed by frame
+    number, and the ascending indices of the frames decoding can start at.
 
     Read off the container's packets, so no frame is decoded -- which is what makes this
     cheap enough to run before picking frames out of a video. Decoding the whole file,
@@ -447,15 +468,23 @@ def frame_pts(video_path):
     output = run_ffprobe(
         video_path,
         "-show_entries",
-        "stream=time_base,start_pts:packet=pts",
+        "stream=time_base,start_pts:packet=pts,flags",
         "-of",
         "default=noprint_wrappers=1",
     )
-    ticks, stream = [], {}
+    ticks, key_ticks, stream = [], set(), {}
+    pts = None  # a packet's pts, held until its flags say whether it is shown
     for line in (output or "").splitlines():
         name, _, value = line.partition("=")
-        if name == "pts" and _is_float(value):
-            ticks.append(float(value))
+        if name == "pts":
+            pts = float(value) if _is_float(value) else None
+        elif name == "flags":
+            # 'D' marks a packet an edit list cuts away: decoded, but never displayed
+            if pts is not None and "D" not in value:
+                ticks.append(pts)
+                if "K" in value:
+                    key_ticks.add(pts)
+            pts = None
         elif value and value != "N/A":
             stream[name] = value
 
@@ -464,8 +493,9 @@ def frame_pts(video_path):
         # Packets arrive in decode order, which B-frames make differ from display order
         ticks.sort()
         start = float(stream.get("start_pts", ticks[0]))
-        return [(t - start) * time_base * 1000 for t in ticks]
-    return _decoded_frame_pts(video_path)
+        pts_ms = [(t - start) * time_base * 1000 for t in ticks]
+        return pts_ms, [i for i, t in enumerate(ticks) if t in key_ticks]
+    return _decoded_frame_index(video_path)
 
 
 def source_frame_period_ms(video_path):
@@ -498,19 +528,35 @@ def source_frame_period_ms(video_path):
         return None  # a file that will not open has no period to report
 
 
-def _decoded_frame_pts(video_path):
-    """`frame_pts` the slow way, for a file ffprobe could not read the packets of."""
-    cap = cv2.VideoCapture(str(video_path), cv2.CAP_FFMPEG)
-    if not cap.isOpened():
-        raise OSError(f"Could not open video: {video_path}")
+def stream_time_base(stream, video_path):
+    """A PyAV stream's time base as the float `frame_index` scales ticks by."""
+    if stream.time_base is None:
+        raise OSError(f"Video stream without a time base: {video_path}")
+    return float(stream.time_base.numerator) / float(stream.time_base.denominator)
 
-    pts = []
+
+def _decoded_frame_index(video_path):
+    """`frame_index` the slow way, for a file ffprobe could not read the packets of."""
     try:
-        while cap.grab():
-            pts.append(cap.get(cv2.CAP_PROP_POS_MSEC))
-    finally:
-        cap.release()
-    return pts
+        container = av.open(str(video_path))
+    except FFmpegError as e:
+        raise OSError(f"Could not open video: {video_path}") from e
+    with container:
+        if not container.streams.video:
+            raise OSError(f"No video stream in: {video_path}")
+        stream = container.streams.video[0]
+        time_base = stream_time_base(stream, video_path)
+        start = stream.start_time
+        pts, keyframes = [], []
+        for frame in container.decode(stream):
+            if frame.pts is None:
+                continue
+            if start is None:
+                start = frame.pts
+            if frame.key_frame:
+                keyframes.append(len(pts))
+            pts.append((frame.pts - float(start)) * time_base * 1000)
+    return pts, keyframes
 
 
 def affine_from_statistics(statistics):

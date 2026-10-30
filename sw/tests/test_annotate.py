@@ -49,7 +49,9 @@ def board_error(H, board, indices):
 def test_too_few_corners_have_no_fit(name):
     """Three points leave a projective map undetermined, so no fit is offered."""
     board = BOARDS[name]
-    assert fit_corner_homography(annotation_corners(board, {0, 1, 2}), board, CameraType.RGB) is None
+    assert (
+        fit_corner_homography(annotation_corners(board, {0, 1, 2}), board, CameraType.RGB) is None
+    )
 
 
 @pytest.mark.parametrize("name", sorted(BOARDS))

@@ -173,7 +173,7 @@ def run_benchmark(frames, ground_truth=None, debug_dir=None, try_hard=False):
             entry = images.get(source_key(ref.key, retimed))
             camera = annotation_camera(entry) if entry is not None else CameraType.RGB
             aruco_id = entry.get("aruco", {}).get("id") if entry is not None else None
-            profile = PROFILES_BY_ARUCO.get(aruco_id)
+            profile = None if aruco_id is None else PROFILES_BY_ARUCO.get(aruco_id)
 
             stats = {}
             decode = process_frame(
@@ -186,7 +186,10 @@ def run_benchmark(frames, ground_truth=None, debug_dir=None, try_hard=False):
                 stats=stats,
             )
 
-            result_board = profile or PROFILES_BY_ARUCO.get(stats.get("aruco_id"))
+            stats_id = stats.get("aruco_id")
+            result_board = profile or (
+                None if stats_id is None else PROFILES_BY_ARUCO.get(stats_id)
+            )
             result = extract_pipeline_result(stats, camera, result_board)
             timing = extract_pipeline_timing(stats)
 
